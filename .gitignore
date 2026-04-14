@@ -1,0 +1,12 @@
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.thumbs/
+**/Thumbs.db
+**/.DS_Store
+**/*~
+**/*.tmp
+**/*.bak
+**/*.swp
+**/*.swo
+temp/
