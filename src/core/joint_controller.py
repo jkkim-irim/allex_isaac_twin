@@ -39,8 +39,13 @@ class ALLEXJointController:
             config_path = os.getenv('ALLEX_JOINT_CONFIG')
 
         if not config_path or not os.path.exists(config_path):
-            print(f"Config file not found: {config_path}")
-            return
+            # 환경변수 미설정 시 extension 내부 기본 경로로 폴백
+            default_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "joint_config.json")
+            if os.path.exists(default_path):
+                config_path = default_path
+            else:
+                print(f"[ALLEX] Joint config not found: {config_path} (default: {default_path})")
+                return
 
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)

@@ -2,6 +2,8 @@
 ROS2 통신 관련 설정
 """
 
+import os
+
 
 class ROS2Topics:
     """ROS2 토픽 이름들"""
@@ -17,8 +19,8 @@ class ROS2Config:
     """ROS2 통신 전반적인 설정"""
     NODE_NAME = 'isaac_sim_integrated_ros2'
     BRIDGE_EXTENSION = "isaacsim.ros2.bridge"
-    DOMAIN_ID = 77
-    RMW_IMPLEMENTATION = "rmw_fastrtps_cpp"
+    DOMAIN_ID = int(os.environ.get('ROS_DOMAIN_ID', '77'))
+    RMW_IMPLEMENTATION = os.environ.get('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp')
 
     INIT_TIMEOUT = 5.0
     SHUTDOWN_TIMEOUT = 1.0

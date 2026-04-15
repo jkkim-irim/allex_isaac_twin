@@ -62,6 +62,7 @@ class UIConfig:
     """UI 전반적인 설정"""
     WORLD_CONTROLS_COLLAPSED = True
     JOINT_CONTROL_COLLAPSED = True
+    VISUALIZER_COLLAPSED = True
 
     PHYSICS_DT = 1 / 50.0
     RENDERING_DT = 1 / 50.0
