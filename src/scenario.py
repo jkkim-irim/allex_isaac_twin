@@ -16,6 +16,7 @@ class ALLEXDigitalTwin:
         self._simulation_loop = ALLEXSimulationLoop()
         self._articulation = None
         self._ros2_manager = None
+        self._trajectory_player = None
 
     def setup(self): 
         """시나리오 초기 설정 — 카메라 뷰 + coupled joint config 로드"""
@@ -78,14 +79,24 @@ class ALLEXDigitalTwin:
         self._initializer.initialize_joint_positions(self._articulation)
 
         def get_target_positions():
+            # Trajectory playback takes priority when active.
+            if self._trajectory_player is not None and self._trajectory_player.is_active():
+                traj_target = self._trajectory_player.get_current_target()
+                if traj_target is not None:
+                    return traj_target.tolist()
+
             ros2_positions = self._joint_controller.get_unified_target_positions()
             if ros2_positions and any(pos != 0.0 for pos in ros2_positions):
                 return ros2_positions
             return self._initializer.target_joint_positions
 
+        def _traj_active():
+            return self._trajectory_player is not None and self._trajectory_player.is_active()
+
         generator = self._joint_controller.create_joint_control_generator(
             articulation=self._articulation,
             get_target_positions_func=get_target_positions,
+            is_external_active_fn=_traj_active,
         )
         self._simulation_loop.set_script_generator(generator)
 
@@ -94,6 +105,18 @@ class ALLEXDigitalTwin:
     # ========================================
     def set_ros2_manager(self, ros2_manager):
         self._ros2_manager = ros2_manager
+
+    def set_trajectory_player(self, player):
+        """Install a TrajectoryPlayer; replaces any existing one."""
+        if self._trajectory_player is not None:
+            try:
+                self._trajectory_player.stop()
+            except Exception:
+                pass
+        self._trajectory_player = player
+
+    def get_trajectory_player(self):
+        return self._trajectory_player
 
     def get_robot_info(self):
         return self._asset_manager.get_joint_info()

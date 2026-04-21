@@ -6,6 +6,7 @@ from .ui_components import UIComponentFactory
 from .ui_styles import ButtonStyleManager
 from .world_controls import WorldControls
 from .ros2_controls import ROS2Controls
+from .traj_studio import TrajStudioControls
 from .visualizer_controls import VisualizerControls
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     'ButtonStyleManager',
     'WorldControls',
     'ROS2Controls',
+    'TrajStudioControls',
     'VisualizerControls',
 ]
