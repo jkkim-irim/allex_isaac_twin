@@ -26,7 +26,10 @@ class UIBuilder:
         if self._world_controls is None:
             self._world_controls = WorldControls(self)
         if self._visualizer is None:
-            self._visualizer = VisualizerControls()
+            self._visualizer = VisualizerControls(scenario=self._scenario)
+        else:
+            # stage reload 시 scenario 재주입
+            self._visualizer.attach_scenario(self._scenario)
 
         if self._ros2_controls is None:
             self._ros2_controls = ROS2Controls(self)

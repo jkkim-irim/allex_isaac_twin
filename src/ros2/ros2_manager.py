@@ -60,6 +60,7 @@ class ROS2IntegratedManager:
         # ROS2 노드 생성 — joint_controller에 직접 콜백 연결
         self._ros2_node = create_allex_ros2_node(
             joint_callback=self._joint_controller.on_joint_data_received,
+            torque_callback=self._joint_controller.on_torque_data_received,
         )
 
         if self._ros2_node:

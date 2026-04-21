@@ -1,5 +1,9 @@
 """
 Visualizer Controls — ALLEX model visualization options
+
+- Force Visualizer 토글: off ↔ 직전 모드 (real/sim/both)
+- Viz Mode ComboBox: real / sim / both 전환
+- Torque Rings 토글: 링 가시성
 """
 
 import omni.ui as ui
@@ -10,28 +14,36 @@ from .ui_components import UIComponentFactory
 from ..config import UIConfig
 from ..config.ui_config import UILayout
 
+_MODE_OFF = "off"
+_MODE_REAL = "real"
+_MODE_SIM = "sim"
+_MODE_BOTH = "both"
+_MODE_CHOICES = [_MODE_REAL, _MODE_SIM, _MODE_BOTH]
+
 
 class VisualizerControls:
     """Visualizer section — model visualization options"""
 
-    _FORCE_VIZ_PRIM_PATHS = [
-        "/ALLEX/L_Palm_Link/visuals/force_viz",
-        "/ALLEX/L_Thumb_Distal_Link/visuals/force_viz",
-        "/ALLEX/L_Index_Distal_Link/visuals/force_viz",
-        "/ALLEX/L_Middle_Distal_Link/visuals/force_viz",
-        "/ALLEX/L_Ring_Distal_Link/visuals/force_viz",
-        "/ALLEX/L_Little_Distal_Link/visuals/force_viz",
-        "/ALLEX/R_Palm_Link/visuals/force_viz",
-        "/ALLEX/R_Thumb_Distal_Link/visuals/force_viz",
-        "/ALLEX/R_Index_Distal_Link/visuals/force_viz",
-        "/ALLEX/R_Middle_Distal_Link/visuals/force_viz",
-        "/ALLEX/R_Ring_Distal_Link/visuals/force_viz",
-        "/ALLEX/R_Little_Distal_Link/visuals/force_viz",
-    ]
+    def __init__(self, scenario=None):
+        self._scenario = scenario
 
-    def __init__(self):
-        self._force_viz_enabled = False
+        # 상태 — visualizer 와 기본값 동기화 (기본 OFF, 사용자 토글 시 표시)
+        self._force_viz_enabled: bool = False
+        self._viz_mode: str = _MODE_BOTH
+        self._torque_viz_enabled: bool = False
+        self._torque_viz_mode: str = _MODE_BOTH
+
+        # UI refs
         self._force_viz_status_label = None
+        self._mode_combo = None
+        self._torque_mode_combo = None
+        self._torque_viz_status_label = None
+
+    # ========================================
+    # scenario 주입 지연 허용
+    # ========================================
+    def attach_scenario(self, scenario):
+        self._scenario = scenario
 
     # ========================================
     # UI Build
@@ -53,32 +65,162 @@ class VisualizerControls:
                     height=UILayout.BUTTON_HEIGHT,
                 )
 
+                # Mode ComboBox
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Viz Mode:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._mode_combo = ui.ComboBox(
+                        _MODE_CHOICES.index(self._viz_mode),
+                        *[m.capitalize() for m in _MODE_CHOICES],
+                    )
+                    try:
+                        model = self._mode_combo.model.get_item_value_model()
+                        model.add_value_changed_fn(self._on_mode_change)
+                    except Exception:
+                        pass
+
                 self._force_viz_status_label = UIComponentFactory.create_status_label(
                     "Force Viz: OFF", UILayout.LABEL_WIDTH_LARGE,
                 )
 
+                ui.Separator(height=4)
+
+                UIComponentFactory.create_styled_button(
+                    "Torque Rings",
+                    callback=self._toggle_torque_rings,
+                    color_scheme='blue',
+                    height=UILayout.BUTTON_HEIGHT,
+                )
+
+                # Torque Mode ComboBox
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Torque Mode:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._torque_mode_combo = ui.ComboBox(
+                        _MODE_CHOICES.index(self._torque_viz_mode),
+                        *[m.capitalize() for m in _MODE_CHOICES],
+                    )
+                    try:
+                        model = self._torque_mode_combo.model.get_item_value_model()
+                        model.add_value_changed_fn(self._on_torque_mode_change)
+                    except Exception:
+                        pass
+
+                self._torque_viz_status_label = UIComponentFactory.create_status_label(
+                    "Torque Viz: OFF", UILayout.LABEL_WIDTH_LARGE,
+                )
+
     # ========================================
-    # Force Visualizer
+    # Toggle — Force Visualizer
     # ========================================
     def _toggle_force_viz(self):
-        import omni.usd
-        from pxr import UsdGeom
+        # scenario 가 없거나 visualizer 가 없으면 legacy fallback (real 화살표 직접 토글)
+        visualizer = self._get_visualizer()
+        prev_enabled = self._force_viz_enabled
+        self._force_viz_enabled = not self._force_viz_enabled
 
-        stage = omni.usd.get_context().get_stage()
-        if stage is None:
+        if visualizer is None:
+            self._force_viz_enabled = prev_enabled
+            if self._force_viz_status_label:
+                self._force_viz_status_label.text = "Force Viz: NOT READY"
             return
 
-        self._force_viz_enabled = not self._force_viz_enabled
-        imageable_token = UsdGeom.Tokens.inherited if self._force_viz_enabled else UsdGeom.Tokens.invisible
+        mode = self._viz_mode if self._force_viz_enabled else _MODE_OFF
+        try:
+            visualizer.set_mode(mode)
+        except Exception as e:
+            self._force_viz_enabled = prev_enabled
+            print(f"[Visualizer] set_mode failed: {e}")
+            if self._force_viz_status_label:
+                self._force_viz_status_label.text = "Force Viz: ERROR"
+            return
 
-        for prim_path in self._FORCE_VIZ_PRIM_PATHS:
-            prim = stage.GetPrimAtPath(prim_path)
-            if not prim.IsValid():
-                print(f"[Visualizer] Prim not found: {prim_path}")
-                continue
-            UsdGeom.Imageable(prim).GetVisibilityAttr().Set(imageable_token)
-
-        status = "ON" if self._force_viz_enabled else "OFF"
+        # S5: mode 표시 포함
+        if self._force_viz_enabled:
+            status_text = f"Force Viz: ON ({self._viz_mode})"
+        else:
+            status_text = "Force Viz: OFF"
         if self._force_viz_status_label:
-            self._force_viz_status_label.text = f"Force Viz: {status}"
-        print(f"[Visualizer] Force Viz: {status}")
+            self._force_viz_status_label.text = status_text
+        print(f"[Visualizer] {status_text}")
+
+    # ========================================
+    # Mode change
+    # ========================================
+    def _on_mode_change(self, model):
+        try:
+            idx = model.as_int
+        except Exception:
+            return
+        if idx < 0 or idx >= len(_MODE_CHOICES):
+            return
+        self._viz_mode = _MODE_CHOICES[idx]
+        visualizer = self._get_visualizer()
+        if visualizer is not None and self._force_viz_enabled:
+            try:
+                visualizer.set_mode(self._viz_mode)
+            except Exception as e:
+                print(f"[Visualizer] set_mode failed: {e}")
+        # S5: status label 에도 현재 mode 반영
+        if self._force_viz_status_label and self._force_viz_enabled:
+            self._force_viz_status_label.text = f"Force Viz: ON ({self._viz_mode})"
+        print(f"[Visualizer] Mode -> {self._viz_mode}")
+
+    # ========================================
+    # Torque rings
+    # ========================================
+    def _toggle_torque_rings(self):
+        visualizer = self._get_visualizer()
+        prev_enabled = self._torque_viz_enabled
+        self._torque_viz_enabled = not self._torque_viz_enabled
+
+        if visualizer is None:
+            self._torque_viz_enabled = prev_enabled
+            if self._torque_viz_status_label:
+                self._torque_viz_status_label.text = "Torque Viz: NOT READY"
+            return
+
+        mode = self._torque_viz_mode if self._torque_viz_enabled else _MODE_OFF
+        try:
+            visualizer.set_torque_mode(mode)
+        except Exception as e:
+            self._torque_viz_enabled = prev_enabled
+            print(f"[Visualizer] set_torque_mode failed: {e}")
+            if self._torque_viz_status_label:
+                self._torque_viz_status_label.text = "Torque Viz: ERROR"
+            return
+
+        if self._torque_viz_enabled:
+            status_text = f"Torque Viz: ON ({self._torque_viz_mode})"
+        else:
+            status_text = "Torque Viz: OFF"
+        if self._torque_viz_status_label:
+            self._torque_viz_status_label.text = status_text
+        print(f"[Visualizer] {status_text}")
+
+    def _on_torque_mode_change(self, model):
+        try:
+            idx = model.as_int
+        except Exception:
+            return
+        if idx < 0 or idx >= len(_MODE_CHOICES):
+            return
+        self._torque_viz_mode = _MODE_CHOICES[idx]
+        visualizer = self._get_visualizer()
+        if visualizer is not None and self._torque_viz_enabled:
+            try:
+                visualizer.set_torque_mode(self._torque_viz_mode)
+            except Exception as e:
+                print(f"[Visualizer] set_torque_mode failed: {e}")
+        if self._torque_viz_status_label and self._torque_viz_enabled:
+            self._torque_viz_status_label.text = f"Torque Viz: ON ({self._torque_viz_mode})"
+        print(f"[Visualizer] Torque Mode -> {self._torque_viz_mode}")
+
+    # ========================================
+    # Helpers
+    # ========================================
+    def _get_visualizer(self):
+        if self._scenario is None:
+            return None
+        getter = getattr(self._scenario, "get_visualizer", None)
+        if getter is not None:
+            return getter()
+        return getattr(self._scenario, "_visualizer", None)

@@ -93,15 +93,12 @@ class WorldControls:
     # ========================================
     def _setup_scene(self):
         from isaacsim.core.utils.stage import create_new_stage, add_reference_to_stage
-        from isaacsim.core.utils.nucleus import get_assets_root_path
+        from isaacsim.storage.native import get_assets_root_path
         from isaacsim.core.api.world import World
         import omni.usd
         from pxr import Sdf, UsdLux
 
         create_new_stage()
-
-        from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
-        _set_lighting_mode(lighting_mode="Stage Lights")
 
         assets_root = get_assets_root_path()
         add_reference_to_stage(
@@ -111,6 +108,9 @@ class WorldControls:
         stage = omni.usd.get_context().get_stage()
         dome_light = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
         dome_light.CreateIntensityAttr(1000)
+
+        from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
+        _set_lighting_mode(lighting_mode="Stage Lights")
 
         loaded_objects = self._ui._scenario.load_example_assets()
 
@@ -137,7 +137,7 @@ class WorldControls:
             self._scenario_state_btn.reset()
             self._scenario_state_btn.enabled = True
 
-    def _update_scenario(self, step: float):
+    def _update_scenario(self, step: float, context=None):
         self._physics_step_count += 1
 
         if (not self._articulation_initialized

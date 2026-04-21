@@ -102,6 +102,35 @@ class ROS2Config:
         "theOne_neck": ["NP", "NY"],
     }
 
+    # ========================================
+    # Torque 토픽 (real2sim 토크 시각화용)
+    # TODO: rosbag torque 토픽 패턴 확정 시 채울 것.
+    #       형식은 OUTBOUND_TOPIC_TO_JOINTS 와 동일하게
+    #         { "<topic_key>": ["R11", "R12", ...], ... } 로 두면
+    #       ros2_node 의 enable_torque_subscribers() 가 자동으로 subscribe 한다.
+    # ========================================
+    OUTBOUND_TORQUE_TOPIC_TO_JOINTS: dict = {}
+
+    @classmethod
+    def get_torque_topics(cls):
+        """Real torque 토픽 목록 반환.
+
+        OUTBOUND_TORQUE_TOPIC_TO_JOINTS 가 비어있으면 빈 리스트.
+        각 원소는 (topic_full_name, {joint_names, group_name}) 튜플.
+        """
+        if not cls.OUTBOUND_TORQUE_TOPIC_TO_JOINTS:
+            return []
+
+        entries = []
+        for group_name, joint_names in cls.OUTBOUND_TORQUE_TOPIC_TO_JOINTS.items():
+            # TODO: 실제 토픽 네임스페이스/suffix 확정 시 아래 규칙 수정.
+            topic = f"/robot_outbound_data/{group_name}/joint_torque"
+            entries.append((topic, {
+                'joint_names': joint_names,
+                'group_name': group_name,
+            }))
+        return entries
+
     @classmethod
     def get_outbound_topics_by_mode(cls, topic_mode):
         """특정 모드에 맞는 14개 outbound 토픽 반환"""

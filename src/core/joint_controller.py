@@ -4,6 +4,7 @@ ALLEX Digital Twin 관절 제어
 
 import json
 import os
+import threading
 import numpy as np
 from isaacsim.core.utils.types import ArticulationAction
 from ..config.ros2_config import ROS2Config
@@ -30,6 +31,32 @@ class ALLEXJointController:
         self.Waist_desired = [0.0] * len(ROS2Config.WAIST_JOINT_INDICES)
         self.Neck_current = [0.0] * len(ROS2Config.NECK_JOINT_INDICES)
         self.Neck_desired = [0.0] * len(ROS2Config.NECK_JOINT_INDICES)
+
+        # ----- Real torque buffers (position 과 동일 shape) -----
+        # 실제 로봇도 motor current 기반으로 slave torque 를 계산/로깅한다는 전제.
+        # slave abbr 자리도 포함되어 있어 master→slave 폴백 없이 그대로 매핑된다.
+        self.Hand_R_torque = [0.0] * len(ROS2Config.R_HAND_JOINT_INDICES)
+        self.Hand_L_torque = [0.0] * len(ROS2Config.L_HAND_JOINT_INDICES)
+        self.Arm_R_torque = [0.0] * len(ROS2Config.R_ARM_JOINT_INDICES)
+        self.Arm_L_torque = [0.0] * len(ROS2Config.L_ARM_JOINT_INDICES)
+        self.Waist_torque = [0.0] * len(ROS2Config.WAIST_JOINT_INDICES)
+        self.Neck_torque = [0.0] * len(ROS2Config.NECK_JOINT_INDICES)
+
+        # Torque write/read 동기화용 Lock (ROS2 executor thread 와 physics thread 간)
+        self._torque_lock = threading.Lock()
+
+        # persistent snapshot dict — get_torque_snapshot 호출마다 재할당 피함
+        self._torque_snapshot: dict = {}
+        for names in (
+            ROS2Config.R_HAND_JOINT_NAMES,
+            ROS2Config.L_HAND_JOINT_NAMES,
+            ROS2Config.R_ARM_JOINT_NAMES,
+            ROS2Config.L_ARM_JOINT_NAMES,
+            ROS2Config.WAIST_JOINT_NAMES,
+            ROS2Config.NECK_JOINT_NAMES,
+        ):
+            for abbr in names:
+                self._torque_snapshot[abbr] = 0.0
 
     # ========================================
     # 설정
@@ -214,3 +241,96 @@ class ALLEXJointController:
 
     def get_coupled_joints_info(self):
         return dict(self._coupled_joints)
+
+    # ========================================
+    # Torque (real) 수신 처리
+    # ========================================
+    def on_torque_data_received(self, values, joint_names, group_name):
+        """Real torque 토픽 수신 콜백.
+
+        joint_names 는 약어(L11 …) 리스트. group_name 은 OUTBOUND_TORQUE_TOPIC_TO_JOINTS 의 key.
+        실제 로봇은 master/slave 구분 없이 motor current 기반 slave torque 를 로깅하므로
+        해당 그룹 버퍼에 그대로 저장한다 (mimic 폴백 없음).
+        ROS2 executor thread 에서 호출되므로 Lock 으로 보호.
+        """
+        target_group = self._determine_joint_group(group_name)
+        if target_group is None:
+            return
+        with self._torque_lock:
+            self._update_torque_group(target_group, list(values), joint_names)
+
+    def _update_torque_group(self, group_name, torque_values, joint_names):
+        """position 의 update_joint_group 과 대칭인 torque 저장 로직."""
+        # 손가락 세부 그룹
+        if group_name.startswith('hand_'):
+            parts = group_name.split('_')
+            if len(parts) >= 3:
+                hand_side = parts[1]
+                finger_name = parts[2]
+                self._update_hand_finger_torque(hand_side, finger_name, torque_values)
+                return
+
+        group_attr_mapping = {
+            'right_hand': 'Hand_R_torque',
+            'left_hand': 'Hand_L_torque',
+            'right_arm': 'Arm_R_torque',
+            'left_arm': 'Arm_L_torque',
+            'waist': 'Waist_torque',
+            'neck': 'Neck_torque',
+        }
+        if group_name in group_attr_mapping:
+            setattr(self, group_attr_mapping[group_name], torque_values)
+
+    def _update_hand_finger_torque(self, hand_side, finger_name, torque_values):
+        finger_mapping = {
+            'thumb': [0, 5, 10],
+            'index': [1, 6, 11],
+            'middle': [2, 7, 12],
+            'ring': [3, 8, 13],
+            'little': [4, 9, 14],
+        }
+        if finger_name not in finger_mapping:
+            return
+        if hand_side == 'right':
+            buf = self.Hand_R_torque
+        elif hand_side == 'left':
+            buf = self.Hand_L_torque
+        else:
+            return
+        indices = finger_mapping[finger_name]
+        for i, idx in enumerate(indices):
+            if i < len(torque_values) and idx < len(buf):
+                buf[idx] = torque_values[i]
+
+    def get_torque_snapshot(self):
+        """약어(L11 …) → torque 값 dict 를 반환.
+
+        visualizer 는 HAND_JOINT_TORQUE_RING_MAP 의 dof_abbr 로 조회한다.
+        모든 abbr(40개 hand + arm/waist/neck 포함) 가 항상 dict key 에 존재.
+        실제 torque 토픽이 아직 없는 abbr 는 0.0 으로 유지된다.
+
+        master/slave 구분 없이 그룹 버퍼를 그대로 반환한다 — slave abbr 은
+        실제 로봇 측에서 motor current 기반으로 계산된 값이 해당 그룹에
+        채워져 있다는 전제.
+
+        반환 dict 는 persistent buffer 이며, 호출자는 per-key 단일 float 조회만
+        수행한다고 가정한다 (Python dict 의 per-key read 는 GIL 하에서 atomic).
+        dict 전체 스냅샷이 필요하면 호출자가 `dict(snapshot)` 으로 복사할 것.
+        """
+        groups = [
+            (ROS2Config.R_HAND_JOINT_NAMES, self.Hand_R_torque),
+            (ROS2Config.L_HAND_JOINT_NAMES, self.Hand_L_torque),
+            (ROS2Config.R_ARM_JOINT_NAMES, self.Arm_R_torque),
+            (ROS2Config.L_ARM_JOINT_NAMES, self.Arm_L_torque),
+            (ROS2Config.WAIST_JOINT_NAMES, self.Waist_torque),
+            (ROS2Config.NECK_JOINT_NAMES, self.Neck_torque),
+        ]
+        snapshot = self._torque_snapshot
+        with self._torque_lock:
+            for names, values in groups:
+                for i, abbr in enumerate(names):
+                    if i < len(values):
+                        snapshot[abbr] = float(values[i])
+                    else:
+                        snapshot[abbr] = 0.0
+        return snapshot
