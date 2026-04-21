@@ -231,10 +231,22 @@ class ALLEXJointController:
     # ========================================
     # 시뮬레이션 루프 제너레이터
     # ========================================
-    def create_joint_control_generator(self, articulation, get_target_positions_func):
-        """관절 제어 제너레이터 — 매 physics step마다 목표 위치 적용"""
+    def create_joint_control_generator(self, articulation, get_target_positions_func,
+                                        is_external_active_fn=None):
+        """관절 제어 제너레이터 — 매 physics step마다 목표 위치 적용.
+
+        is_external_active_fn: optional callable returning True when an external
+        driver (e.g. trajectory playback) wants to push targets even if the ROS2
+        subscriber is off.
+        """
         while True:
-            if articulation is not None and self._ros2_subscriber_active:
+            active = self._ros2_subscriber_active
+            if not active and is_external_active_fn is not None:
+                try:
+                    active = bool(is_external_active_fn())
+                except Exception:
+                    active = False
+            if articulation is not None and active:
                 target_positions = get_target_positions_func()
                 articulation.apply_action(ArticulationAction(target_positions))
             yield

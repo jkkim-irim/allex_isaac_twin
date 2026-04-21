@@ -93,7 +93,7 @@ class WorldControls:
     # ========================================
     def _setup_scene(self):
         from isaacsim.core.utils.stage import create_new_stage, add_reference_to_stage
-        from isaacsim.storage.native import get_assets_root_path
+        from isaacsim.storage.native.nucleus import get_assets_root_path
         from isaacsim.core.api.world import World
         import omni.usd
         from pxr import Sdf, UsdLux

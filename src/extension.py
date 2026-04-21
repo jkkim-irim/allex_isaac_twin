@@ -9,13 +9,14 @@
 
 import asyncio
 import gc
+from pathlib import Path
 
 import omni
 import omni.kit.commands
-import omni.physx as _physx
 import omni.timeline
 import omni.ui as ui
 import omni.usd
+from isaacsim.core.simulation_manager import SimulationEvent, SimulationManager
 from isaacsim.gui.components.element_wrappers import ScrollingWindow
 from isaacsim.gui.components.menu import MenuItemDescription
 from omni.kit.menu.utils import add_menu_items, remove_menu_items
@@ -90,13 +91,20 @@ class Extension(omni.ext.IExt):
 
         # Events
         self._usd_context = omni.usd.get_context()
-        self._physxIFace = _physx.get_physx_interface()
-        self._physx_subscription = None
+        self._physics_step_sub = None
         self._stage_event_sub = None
         self._timeline = omni.timeline.get_timeline_interface()
 
+        # Newton: inject MJCF equality constraints before finalize.
+        from .core import newton_bridge
+        joint_config = Path(__file__).parent / "joint_config.json"
+        newton_bridge.install(joint_config)
+
     def on_shutdown(self):
         self._models = {}
+        self._deregister_physics_step()
+        from .core import newton_bridge
+        newton_bridge.uninstall()
         remove_menu_items(self._menu_items, EXTENSION_TITLE)
 
         action_registry = omni.kit.actions.core.get_action_registry()
@@ -153,20 +161,31 @@ class Extension(omni.ext.IExt):
 
     def _on_timeline_event(self, event):
         if event.type == int(omni.timeline.TimelineEventType.PLAY):
-            if not self._physx_subscription:
-                self._physx_subscription = self._physxIFace.subscribe_physics_step_events(self._on_physics_step)
+            if self._physics_step_sub is None:
+                self._physics_step_sub = SimulationManager.register_callback(
+                    self._on_physics_step,
+                    event=SimulationEvent.PHYSICS_POST_STEP,
+                )
         elif event.type == int(omni.timeline.TimelineEventType.STOP):
-            self._physx_subscription = None
+            self._deregister_physics_step()
 
         self.ui_builder.on_timeline_event(event)
 
-    def _on_physics_step(self, step):
-        self.ui_builder.on_physics_step(step)
+    def _deregister_physics_step(self):
+        if self._physics_step_sub is not None:
+            try:
+                SimulationManager.deregister_callback(self._physics_step_sub)
+            except Exception:
+                pass
+            self._physics_step_sub = None
+
+    def _on_physics_step(self, step_dt, context):
+        self.ui_builder.on_physics_step(step_dt)
 
     def _on_stage_event(self, event):
         if event.type == int(StageEventType.OPENED) or event.type == int(StageEventType.CLOSED):
             # stage was opened or closed, cleanup
-            self._physx_subscription = None
+            self._deregister_physics_step()
             self.ui_builder.cleanup()
 
             # ← 추가: 창이 열려있다면 UI 즉시 재구축

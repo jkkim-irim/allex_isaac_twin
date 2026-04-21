@@ -35,18 +35,15 @@ class ROS2IntegratedManager:
         os.environ['ROS_DOMAIN_ID'] = str(ROS2Config.DOMAIN_ID)
         os.environ['RMW_IMPLEMENTATION'] = ROS2Config.RMW_IMPLEMENTATION
 
-        # 시스템 ROS2 경로 충돌 방지 (Isaac Sim 내장 ROS2 사용을 위해 시스템 ROS2 경로 제거)
-        import sys
-        ros_root = os.environ.get('AMENT_PREFIX_PATH', os.environ.get('ROS_ROOT', ''))
-        if ros_root:
-            ros_base_paths = [os.path.dirname(p) for p in ros_root.split(os.pathsep) if p]
-            sys.path = [p for p in sys.path if not any(p.startswith(base) for base in ros_base_paths)]
-
+        # Enable Isaac Sim's ROS2 DDS bridge extension; rclpy itself is provided
+        # by the system ROS2 install (e.g. /opt/ros/jazzy). Isaac Sim 6.0.0 does
+        # not bundle rclpy — do not purge system paths here.
         from isaacsim.core.utils.extensions import enable_extension
         enable_extension(ROS2Config.BRIDGE_EXTENSION)
 
         import rclpy
         from rclpy.executors import SingleThreadedExecutor
+        print(f"[ALLEX][ROS2] using rclpy from: {getattr(rclpy, '__file__', '<unknown>')}")
 
         if not rclpy.ok():
             rclpy.init()

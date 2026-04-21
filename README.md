@@ -4,19 +4,49 @@ Real2Sim digital twin extension for ALLEX humanoid robot. Subscribes to joint po
 
 ## Requirements
 
-- NVIDIA Isaac Sim 5.1.0+
+- NVIDIA Isaac Sim 6.0.0 (pip install via conda env, Python 3.12)
 - ROS2 (uses Isaac Sim built-in bridge — no separate ROS2 install needed)
 
 > **Do NOT** `source /opt/ros/*/setup.bash` before launching Isaac Sim.  
-> System ROS2 (Python 3.12) conflicts with Isaac Sim (Python 3.11) and causes a core dump.
+> System ROS2 may conflict with Isaac Sim's bundled ROS2 bridge and cause a core dump.
 
 ## Installation
 
-1. Copy this folder into Isaac Sim's `extsUser/` directory:
+1. Install Isaac Sim **6.0.0** into a conda env (Python 3.12):
+   ```bash
+   conda create -n isaacsim python=3.12 -y
+   conda activate isaacsim
+   pip install isaacsim==6.0.0.0 --extra-index-url https://pypi.nvidia.com
    ```
-   <isaac-sim-root>/extsUser/ALLEX_IsaacTwin/
+2. Copy this folder into Isaac Sim's `extsUser/` directory:
    ```
-2. Launch Isaac Sim → `Window > Extensions` → search `ALLEX` → enable
+   $CONDA_PREFIX/lib/python3.12/site-packages/isaacsim/extsUser/allex_isaac_twin/
+   ```
+3. Launch Isaac Sim → `Window > Extensions` → search `ALLEX` → enable
+
+### Convenience: `cdisaac` alias
+
+A conda activate/deactivate hook provides a `cdisaac` shortcut that jumps to the Isaac Sim root inside the active env:
+
+```bash
+cdisaac   # → $CONDA_PREFIX/lib/python3.12/site-packages/isaacsim
+```
+
+The alias is registered automatically on `conda activate isaacsim` and removed on deactivate. To set it up manually:
+
+```bash
+# activate hook
+cat > "$CONDA_PREFIX/etc/conda/activate.d/aliases.sh" <<'EOF'
+alias cdisaac='cd "$CONDA_PREFIX/lib/python3.12/site-packages/isaacsim"'
+EOF
+
+# deactivate hook
+cat > "$CONDA_PREFIX/etc/conda/deactivate.d/aliases.sh" <<'EOF'
+unalias cdisaac 2>/dev/null
+EOF
+```
+
+Reactivate the env (`conda deactivate && conda activate isaacsim`) for the alias to load.
 
 ## Usage
 
