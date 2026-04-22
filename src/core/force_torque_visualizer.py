@@ -9,8 +9,9 @@ ForceTorqueVisualizer — Real/Sim 토크 링 + 힘 화살표 겹침 시각화
    slave 도 `get_measured_joint_efforts()` 결과에 포함된다 → master/slave 구분 없이 40 링 통일.)
 - Force 화살표 (12개): 기존 `<link>/visuals/force_viz` 를 real 역할로 그대로 사용하고,
   동일 부모 (`<link>/visuals/`) 아래에 `force_viz_sim` 신규 prim 을 추가.
-  sim 은 `articulation.get_measured_joint_forces()` 의 해당 link incoming joint row
-  의 선형 힘 크기를 사용. real 은 현재 데이터 없음 → 0.
+  sim force 는 미구현 (항상 0): joint constraint force ≠ link 에 실제 작용하는 힘.
+  동역학 수식으로 직접 계산하는 방식으로 추후 구현 예정.
+  real 은 현재 데이터 없음 → 0.
 - Visibility 는 set_mode("off"/"real"/"sim"/"both") + set_torque_mode("off"/"real"/"sim"/"both") 로 제어.
 
 pxr 은 Isaac Sim 런타임에만 존재하므로 import 는 메서드 내부에서 lazy 로.
@@ -114,14 +115,17 @@ class ForceTorqueVisualizer:
         # dof_abbr → articulation dof idx (lazy build)
         self._abbr_to_dof_idx: dict = {}
 
-        # link_path → measured_joint_forces row (= joint_idx + 1) LUT
-        self._link_to_force_row: dict = {}
+        # sim force 미구현 — 추후 동역학 수식으로 직접 계산
+        self._link_to_force_row: dict = {}  # reserved, unused
 
         # prim path → UsdGeom.XformOp(scale) 캐시 (B5)
         self._scale_op_cache: dict = {}
 
         # prim path → 직전에 Set 한 scale 값 (B5 dead-band)
         self._last_scale_cache: dict = {}
+
+        # Newton backend 여부 (lazy 감지). True이면 joint_efforts/forces API 미구현
+        self._newton_backend: bool | None = None
 
         self._prims_initialized = False
 
@@ -153,7 +157,6 @@ class ForceTorqueVisualizer:
         # dof/force row LUT 재구축
         try:
             self._build_abbr_to_dof_idx()
-            self._build_link_to_force_row()
         except Exception as e:
             logger.warning(f"[viz] attach_articulation LUT build failed: {e}")
 
@@ -162,7 +165,7 @@ class ForceTorqueVisualizer:
         self._articulation = None
         self._joint_controller = None
         self._abbr_to_dof_idx.clear()
-        self._link_to_force_row.clear()
+
 
     # ========================================
     # Public API
@@ -184,7 +187,6 @@ class ForceTorqueVisualizer:
         if self._articulation is not None:
             try:
                 self._build_abbr_to_dof_idx()
-                self._build_link_to_force_row()
             except Exception as e:
                 logger.warning(f"[viz] ensure_initialized LUT build failed: {e}")
 
@@ -202,14 +204,21 @@ class ForceTorqueVisualizer:
         if self._articulation is None or self._joint_controller is None:
             return
 
+        # Newton backend 감지 (lazy, 한 번만). Newton은 joint_efforts/forces API 미구현.
+        if self._newton_backend is None:
+            self._newton_backend = self._detect_newton_backend()
+
         # --- sim torque ---
+        # get_applied_joint_efforts() → Articulation._physics_view.get_dof_actuation_forces()
+        # Newton/PhysX 모두 동일 공개 API 경로 사용.
         sim_torques = None
         try:
-            if self._articulation is not None:
-                sim_torques = self._articulation.get_measured_joint_efforts()
+            sim_torques = self._articulation.get_applied_joint_efforts()
+            if sim_torques is not None and hasattr(sim_torques, "shape"):
+                if len(sim_torques.shape) == 2:
+                    sim_torques = sim_torques[0]
         except Exception as e:
-            logger.debug(f"[viz] get_measured_joint_efforts failed: {e}")
-            sim_torques = None
+            logger.debug(f"[viz] get_applied_joint_efforts failed: {e}")
 
         # --- real torque (dict by abbr) ---
         real_snapshot = {}
@@ -219,14 +228,6 @@ class ForceTorqueVisualizer:
             except Exception as e:
                 logger.debug(f"[viz] torque snapshot failed: {e}")
 
-        # --- sim joint forces (N+1, 6) ---
-        sim_forces = None
-        try:
-            if self._articulation is not None and hasattr(self._articulation, "get_measured_joint_forces"):
-                sim_forces = self._articulation.get_measured_joint_forces()
-        except Exception as e:
-            logger.debug(f"[viz] get_measured_joint_forces failed: {e}")
-            sim_forces = None
 
         # --- torque rings (평탄화된 튜플 순회 — N3) ---
         update_sim_torque = self._torque_mode in ("sim", "both")
@@ -260,19 +261,8 @@ class ForceTorqueVisualizer:
             if not pair:
                 continue
 
-            sim_mag = 0.0
-            if sim_forces is not None:
-                # sim_forces shape: (num_joint + 1, 6). row = joint_idx + 1.
-                row = self._link_to_force_row.get(link_path)
-                if row is not None and 0 <= row < len(sim_forces):
-                    try:
-                        f = sim_forces[row]
-                        # 첫 3성분이 선형 힘
-                        fx, fy, fz = float(f[0]), float(f[1]), float(f[2])
-                        sim_mag = math.sqrt(fx * fx + fy * fy + fz * fz)
-                    except Exception:
-                        sim_mag = 0.0
-            self._apply_force_scale(pair.get("sim"), sim_mag, FORCE_GAIN,
+            # sim force 미구현 — 동역학 수식으로 추후 계산 예정
+            self._apply_force_scale(pair.get("sim"), 0.0, FORCE_GAIN,
                                     FORCE_MIN_SCALE, FORCE_MAX_SCALE)
 
             # real force 는 현재 데이터 없음. 0 으로 표기.
@@ -306,6 +296,27 @@ class ForceTorqueVisualizer:
         """하위호환 — True → both, False → off."""
         self.set_torque_mode("both" if visible else "off")
 
+    def _detect_newton_backend(self) -> bool:
+        """Newton physics backend 여부를 감지. get_measured_joint_efforts 호출 전 1회 실행."""
+        try:
+            from isaacsim.physics.newton import acquire_stage as _acq
+            if _acq() is not None:
+                logger.info("[viz] Newton backend detected — joint_efforts/forces API skipped")
+                return True
+        except Exception:
+            pass
+        # SimulationManager 로 확인 (fallback)
+        try:
+            from isaacsim.core.simulation_manager import SimulationManager
+            backend = getattr(SimulationManager, "get_physics_backend", None)
+            if backend is not None:
+                name = str(backend()).lower()
+                if "newton" in name:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def cleanup(self):
         """생성한 prim 들을 stage 에서 **제거**하고 캐시 해제 (B7).
 
@@ -329,7 +340,7 @@ class ForceTorqueVisualizer:
         self._force_viz_prims.clear()
         self._created_prim_paths.clear()
         self._abbr_to_dof_idx.clear()
-        self._link_to_force_row.clear()
+
         self._scale_op_cache.clear()
         self._last_scale_cache.clear()
         self._force_length_cache.clear()
@@ -1134,77 +1145,6 @@ class ForceTorqueVisualizer:
         if missing:
             logger.warning(
                 f"[viz] {len(missing)} hand joint(s) not found in dof_names: {missing[:5]}..."
-            )
-
-    def _build_link_to_force_row(self):
-        """link_path → get_measured_joint_forces row index LUT.
-
-        row = joint_idx + 1  (row 0 은 base link incoming joint).
-        joint_idx 는 articulation metadata 의 joint_indices 에서 조회.
-
-        공식 Isaac Sim 예제에도 `prim._articulation_view._metadata.joint_indices`
-        접근법이 소개되어 있으므로 사실상 semi-public. 실패 시 fallback 으로
-        `articulation.body_names` 순서를 활용 시도.
-        """
-        self._link_to_force_row.clear()
-        if self._articulation is None:
-            return
-
-        joint_name_to_idx = {}
-        try:
-            view = getattr(self._articulation, "_articulation_view", None)
-            meta = getattr(view, "_metadata", None) if view is not None else None
-            if meta is not None:
-                ji = getattr(meta, "joint_indices", None)
-                if ji:
-                    joint_name_to_idx = dict(ji)
-        except Exception as e:
-            logger.debug(f"[viz] _metadata.joint_indices access failed: {e}")
-
-        # Fallback: joint name 이 articulation.dof_names 순서와 일치하는 경우에만 유용.
-        # (fixed joint 가 섞여 있으면 부정확하므로 실패 시 None 처리.)
-        if not joint_name_to_idx:
-            try:
-                dof_names = list(self._articulation.dof_names or [])
-                if dof_names:
-                    joint_name_to_idx = {n: i for i, n in enumerate(dof_names)}
-                    print(
-                        "[viz] fallback: using dof_names as joint_indices for force row LUT "
-                        "(may be inaccurate if fixed joints are interleaved)."
-                    )
-            except Exception:
-                pass
-
-        if not joint_name_to_idx:
-            logger.warning("[viz] could not build link_to_force_row LUT — sim force will be 0")
-            return
-
-        # HAND entry 기반: child_link_path → usd_joint_name → joint_idx → row
-        link_to_row = {}
-        for entry in HAND_JOINT_TORQUE_RING_MAP:
-            jn = entry["usd_joint_name"]
-            idx = joint_name_to_idx.get(jn)
-            if idx is not None:
-                link_to_row[entry["child_link_path"]] = idx + 1
-
-        # FORCE_VIZ_PARENT_LINKS 중 Palm 은 HAND entry 에 없음 → 정책: 0 으로 둠.
-        # TODO: Palm 에 매핑할 wrist joint 결정되면 여기에 추가.
-        #       예: "/ALLEX/L_Palm_Link" → "L_Wrist_Pitch_Joint" 등.
-        for entry in FORCE_VIZ_PARENT_LINKS:
-            lp = entry["link_path"]
-            if lp not in link_to_row:
-                # Palm 류: row 없음 → 조회 시 None → sim_mag=0
-                continue
-
-        self._link_to_force_row = link_to_row
-        missing_force_links = [
-            e["link_path"] for e in FORCE_VIZ_PARENT_LINKS
-            if e["link_path"] not in link_to_row
-        ]
-        if missing_force_links:
-            print(
-                f"[viz] {len(missing_force_links)} force-viz link(s) without joint row "
-                f"(Palm etc.): {missing_force_links}"
             )
 
     def _apply_scale(self, prim, raw_value, gain, lo, hi):

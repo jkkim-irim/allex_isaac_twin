@@ -100,10 +100,16 @@ class WorldControls:
 
         create_new_stage()
 
-        assets_root = get_assets_root_path()
-        add_reference_to_stage(
-            assets_root + "/Isaac/Environments/Grid/default_environment.usd", "/FlatGrid",
-        )
+        try:
+            assets_root = get_assets_root_path()
+            if assets_root:
+                add_reference_to_stage(
+                    assets_root + "/Isaac/Environments/Grid/default_environment.usd", "/FlatGrid",
+                )
+            else:
+                print("[ALLEX] assets_root empty — skipping FlatGrid")
+        except Exception as _e:
+            print(f"[ALLEX] FlatGrid load skipped (Nucleus unavailable): {_e}")
 
         stage = omni.usd.get_context().get_stage()
         dome_light = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
