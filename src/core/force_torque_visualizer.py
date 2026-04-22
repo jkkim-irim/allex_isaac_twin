@@ -28,6 +28,7 @@ import carb
 from ..config.viz_config import (
     REAL_COLOR, SIM_COLOR,
     TORQUE_GAIN, TORQUE_MIN_SCALE, TORQUE_MAX_SCALE,
+    TORQUE_GAIN_SHOULDER, TORQUE_GAIN_ELBOW, TORQUE_GAIN_WRIST, TORQUE_GAIN_FINGER,
     FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE,
     FORCE_VIZ_REAL_NAME, FORCE_VIZ_SIM_NAME,
     TORQUE_RING_REAL_NAME, TORQUE_RING_SIM_NAME,
@@ -246,12 +247,14 @@ class ForceTorqueVisualizer:
                             sim_val = float(sim_torques[idx])
                         except Exception:
                             sim_val = 0.0
-                    self._apply_scale(pair.get("sim"), sim_val, TORQUE_GAIN,
+                    self._apply_scale(pair.get("sim"), sim_val,
+                                      self._torque_gain_for(abbr),
                                       TORQUE_MIN_SCALE, TORQUE_MAX_SCALE)
 
                 if update_real_torque:
                     real_val = float(real_snapshot.get(abbr, 0.0))
-                    self._apply_scale(pair.get("real"), real_val, TORQUE_GAIN,
+                    self._apply_scale(pair.get("real"), real_val,
+                                      self._torque_gain_for(abbr),
                                       TORQUE_MIN_SCALE, TORQUE_MAX_SCALE)
 
         # --- force arrows ---
@@ -1146,6 +1149,20 @@ class ForceTorqueVisualizer:
             logger.warning(
                 f"[viz] {len(missing)} hand joint(s) not found in dof_names: {missing[:5]}..."
             )
+
+    @staticmethod
+    def _torque_gain_for(abbr: str) -> float:
+        """dof_abbr 로 그룹별 gain 반환. viz_config.py 에서 조절."""
+        suffix = abbr[1:]  # 'L'/'R' 제거 → 'SP', 'WP', '11', ...
+        if suffix in ("SP", "SR", "SY"):
+            return TORQUE_GAIN_SHOULDER
+        if suffix == "EP":
+            return TORQUE_GAIN_ELBOW
+        if suffix in ("WY", "WR", "WP"):
+            return TORQUE_GAIN_WRIST
+        if suffix[:1].isdigit():  # '11'~'54' 형태
+            return TORQUE_GAIN_FINGER
+        return TORQUE_GAIN  # fallback
 
     def _apply_scale(self, prim, raw_value, gain, lo, hi):
         """캐시된 scale op 에 직접 Set. dead-band 통과 시에만 write (B5)."""

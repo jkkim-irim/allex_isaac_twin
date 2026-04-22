@@ -64,7 +64,7 @@ pd_scale = 0.017453292519943295  # π / 180
 # Common NewtonConfig fields (uncomment to override):
 # num_substeps = 1
 # debug_mode = false
-# use_cuda_graph = true                  # CUDA graph capture for physics step
+use_cuda_graph = false                 # RTX 5080 (sm_100): CUDA graph capture 불안정 → 비활성화
 # time_step_app = true
 # physics_frequency = 600.0              # Hz (null/absent = use USD timeStepsPerSecond)
 # update_fabric = true
