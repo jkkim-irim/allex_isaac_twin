@@ -37,9 +37,9 @@ TORQUE_MAX_SCALE = 3.0
 # gain 을 낮추면 링이 작아지고, 높이면 커진다.
 # ========================================
 TORQUE_GAIN_SHOULDER = 0.03   # 어깨 — 토크가 커서 기본값보다 줄임
-TORQUE_GAIN_ELBOW    = 0.06   # 팔꿈치
+TORQUE_GAIN_ELBOW    = 0.04   # 팔꿈치
 TORQUE_GAIN_WRIST    = 0.20   # 손목 — 토크가 작아서 기본값보다 키움
-TORQUE_GAIN_FINGER   = 0.30   # 손가락 — 토크가 매우 작음
+TORQUE_GAIN_FINGER   = 0.20   # 손가락 — 토크가 매우 작음
 
 
 # ========================================

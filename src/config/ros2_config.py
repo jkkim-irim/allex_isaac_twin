@@ -42,13 +42,17 @@ class ROS2Config:
         TOPIC_MODE_DESIRED: 'Desired',
     }
 
-    # 관절 인덱스
-    R_HAND_JOINT_INDICES = [24, 25, 26, 27, 28, 34, 35, 36, 37, 38, 44, 45, 46, 47, 48]
-    L_HAND_JOINT_INDICES = [19, 20, 21, 22, 23, 29, 30, 31, 32, 33, 39, 40, 41, 42, 43]
-    R_ARM_JOINT_INDICES = [4, 7, 10, 12, 14, 16, 18]
-    L_ARM_JOINT_INDICES = [3, 5, 8, 11, 13, 15, 17]
-    WAIST_JOINT_INDICES = [0, 1]
-    NECK_JOINT_INDICES = [6, 9]
+    # 관절 인덱스 (dof_names 순서 기준, 2026-04-22 확인)
+    # passive joints (제어 안 함): [2]=Waist_Upper_Pitch, [59]=Waist_Pitch_Dummy,
+    #   L DIP: 13,17,21,25,29 / R DIP: 42,46,50,54,58
+    L_ARM_JOINT_INDICES  = [3, 4, 5, 6, 7, 8, 9]    # LSP,LSR,LSY,LEP,LWY,LWR,LWP
+    R_ARM_JOINT_INDICES  = [32, 33, 34, 35, 36, 37, 38]  # RSP,RSR,RSY,REP,RWY,RWR,RWP
+    WAIST_JOINT_INDICES  = [0, 1]                    # WY, WP(Lower_Pitch)
+    NECK_JOINT_INDICES   = [30, 31]                  # NP, NY
+    # L_HAND 순서: L11,L21,L31,L41,L51, L12,L22,L32,L42,L52, L13,L23,L33,L43,L53
+    L_HAND_JOINT_INDICES = [26, 10, 18, 22, 14,  27, 11, 19, 23, 15,  28, 12, 20, 24, 16]
+    # R_HAND 순서: R11,R21,R31,R41,R51, R12,R22,R32,R42,R52, R13,R23,R33,R43,R53
+    R_HAND_JOINT_INDICES = [55, 39, 47, 51, 43,  56, 40, 48, 52, 44,  57, 41, 49, 53, 45]
 
     # 관절 이름
     R_HAND_JOINT_NAMES = [

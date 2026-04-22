@@ -191,8 +191,8 @@ class ALLEXJointController:
     # 통합 목표 위치 계산
     # ========================================
     def get_unified_target_positions(self):
-        """모든 관절 그룹을 통합한 59-joint 목표 위치 반환"""
-        target_positions = [0.0] * 59
+        """모든 관절 그룹을 통합한 60-joint 목표 위치 반환"""
+        target_positions = [0.0] * 60
 
         data_suffix = 'current' if self._topic_mode == ROS2Config.TOPIC_MODE_CURRENT else 'desired'
 
@@ -214,7 +214,7 @@ class ALLEXJointController:
             if i < len(group_values) and idx < len(target_positions):
                 target_positions[idx] = np.radians(group_values[i])
 
-    def apply_coupled_joints(self, joint_positions, total_joints=59):
+    def apply_coupled_joints(self, joint_positions, total_joints=60):
         """Coupled Joint 값 계산 — master joint에서 slave joint 도출"""
         extended = list(joint_positions)
         while len(extended) < total_joints:
