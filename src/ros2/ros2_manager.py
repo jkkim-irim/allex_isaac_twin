@@ -106,8 +106,22 @@ class ROS2IntegratedManager:
 
     def _start_executor_thread(self):
         def safe_spin():
+            import rclpy
+            import time
             try:
-                self._executor.spin()
+                # 고주파 bag replay (1kHz×14=14k msg/s) 에서 GIL 독점 방지.
+                # - spin_once(timeout=0) 은 즉시 리턴하므로 busy loop 이 됨
+                # - time.sleep 으로 명시적 GIL 해제 → Isaac Sim 메인 스레드 실행 보장
+                # - 1 iteration 당 여러 메시지 batch 처리하여 처리율 확보
+                #   (1ms × batch 5 = 5000 msg/s → 2800 msg/s 입력 전부 소화, drop 없음)
+                # BATCH = 5
+                # while rclpy.ok():
+                #     for _ in range(BATCH):
+                #         self._executor.spin_once(timeout_sec=0.0)
+                #     time.sleep(0.001)
+                while rclpy.ok():
+                    self._executor.spin_once(timeout_sec=0.0)
+                    time.sleep(0.001)
             except Exception as e:
                 print(f"ROS2 Executor error: {e}")
 
