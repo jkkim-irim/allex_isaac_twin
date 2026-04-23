@@ -23,11 +23,15 @@ from .joint_name_map import ALLEX_CSV_JOINT_NAMES
 
 class TrajectoryPlayer:
     def __init__(self, csv_dir: Path, articulation, hz: float = 200.0,
-                 seed_pose: "np.ndarray | list[float] | None" = None):
+                 seed_pose: "np.ndarray | list[float] | None" = None,
+                 raw_mode: bool = False):
         self._csv_dir = Path(csv_dir)
         self._articulation = articulation
         self._hz = float(hz)
         self._seed_pose_override = seed_pose
+        # raw_mode=True: CSV via point 을 그대로 (zero-order hold) 재생.
+        # rosbag 에서 이미 spline 적용된 1kHz target 을 재샘플링 없이 재생할 때 사용.
+        self._raw_mode = bool(raw_mode)
 
         self._active: bool = False
         self._finished: bool = False
@@ -55,7 +59,11 @@ class TrajectoryPlayer:
         # 1) explicit override wins
         if self._seed_pose_override is not None:
             try:
-                arr = np.asarray(self._seed_pose_override, dtype=np.float32).reshape(-1)
+                src = self._seed_pose_override
+                # torch tensor (GPU/CPU) → numpy
+                if hasattr(src, "detach"):
+                    src = src.detach().cpu().numpy()
+                arr = np.asarray(src, dtype=np.float32).reshape(-1)
                 if arr.size >= n:
                     return arr[:n].copy()
                 if arr.size > 0:
@@ -132,7 +140,14 @@ class TrajectoryPlayer:
                 )
                 continue
 
-            _, pos_interp = generate_trajectory(t_via, pos_via, hz=self._hz, duration=max_dur)
+            if self._raw_mode:
+                # Zero-order hold: t_out 각 시점에 대해 t_via <= t_out 의 가장 큰 idx 사용.
+                t_out = np.arange(n_steps + 1, dtype=np.float64) * dt
+                idx_arr = np.searchsorted(t_via, t_out, side="right") - 1
+                idx_arr = np.clip(idx_arr, 0, len(t_via) - 1)
+                pos_interp = pos_via[idx_arr]  # (n_steps+1, n_cols_csv)
+            else:
+                _, pos_interp = generate_trajectory(t_via, pos_via, hz=self._hz, duration=max_dur)
             # pos_interp shape: (n_steps+1, n_cols_csv)
             for j, jname in enumerate(joint_names):
                 idx = self._name_to_idx.get(jname)

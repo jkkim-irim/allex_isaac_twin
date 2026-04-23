@@ -30,6 +30,7 @@ class TrajStudioControls:
         self._combo: ui.ComboBox | None = None
         self._items: list[str] = []
         self._status_label: ui.Label | None = None
+        self._raw_checkbox: ui.CheckBox | None = None
 
     # ------------------------------------------------------------------
     # UI build
@@ -50,6 +51,12 @@ class TrajStudioControls:
                         color_scheme="blue",
                         height=UILayout.BUTTON_HEIGHT,
                     )
+
+                # Raw mode: CSV via point 을 Hermite spline 없이 zero-order hold 로 재생.
+                # rosbag 에서 뽑은 CSV (이미 1kHz spline 적용된 target) 재생 시 유용.
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Raw mode (no spline):", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._raw_checkbox = ui.CheckBox()
 
                 UIComponentFactory.create_separator(UILayout.SEPARATOR_HEIGHT)
 
@@ -169,9 +176,18 @@ class TrajStudioControls:
         except Exception as exc:
             print(f"[ALLEX][Traj] physics_frequency query failed: {exc}; using hz={hz}")
 
+        raw_mode = False
+        if self._raw_checkbox is not None:
+            try:
+                raw_mode = bool(self._raw_checkbox.model.get_value_as_bool())
+            except Exception:
+                raw_mode = False
+
         csv_dir = _TRAJECTORY_DIR / group
-        player = TrajectoryPlayer(csv_dir, articulation, hz=hz, seed_pose=seed_pose)
-        self._set_status(f"Status: loading '{group}' @ {hz:.1f} Hz ...")
+        player = TrajectoryPlayer(csv_dir, articulation, hz=hz, seed_pose=seed_pose,
+                                  raw_mode=raw_mode)
+        mode_tag = "raw" if raw_mode else "spline"
+        self._set_status(f"Status: loading '{group}' @ {hz:.1f} Hz [{mode_tag}] ...")
         if not player.is_ready():
             self._set_status(f"Status: no usable CSVs in {group}")
             return
@@ -180,7 +196,7 @@ class TrajStudioControls:
         player.start()
         self._set_status(
             f"Status: Playing '{group}' ({player.duration_s:.2f}s, "
-            f"{len(player.groups_used)} group(s))"
+            f"{len(player.groups_used)} group(s), {mode_tag})"
         )
 
     def _on_stop(self) -> None:
