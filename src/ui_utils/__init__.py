@@ -8,6 +8,7 @@ from .world_controls import WorldControls
 from .ros2_controls import ROS2Controls
 from .traj_studio import TrajStudioControls
 from .visualizer_controls import VisualizerControls
+from .torque_plotter import TorquePlotter
 
 __all__ = [
     'UIComponentFactory',
@@ -16,4 +17,5 @@ __all__ = [
     'ROS2Controls',
     'TrajStudioControls',
     'VisualizerControls',
+    'TorquePlotter',
 ]

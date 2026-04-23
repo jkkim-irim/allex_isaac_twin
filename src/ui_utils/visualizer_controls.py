@@ -41,12 +41,19 @@ class VisualizerControls:
         self._opacity_enabled: bool = False
         self._opacity_backup: dict = {}  # path -> {attr_name -> original_value}
 
+        # Torque plot 상태
+        self._torque_plot_body_running: bool = False
+        self._torque_plot_hand_running: bool = False
+
         # UI refs
         self._force_viz_status_label = None
         self._mode_combo = None
         self._torque_mode_combo = None
         self._torque_viz_status_label = None
         self._opacity_status_label = None
+        self._torque_plot_body_label = None
+        self._torque_plot_hand_label = None
+        self._plot_hz_model = None
 
     # ========================================
     # scenario 주입 지연 허용
@@ -128,6 +135,40 @@ class VisualizerControls:
 
                 self._opacity_status_label = UIComponentFactory.create_status_label(
                     "Opacity: OFF", UILayout.LABEL_WIDTH_LARGE,
+                )
+
+                ui.Separator(height=4)
+
+                # ---- Torque plotter (matplotlib Tk 별도 window) ----
+                ui.Label("Realtime joint torque plot (separate Tk window).",
+                         height=UILayout.LABEL_HEIGHT)
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Plot Hz:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._plot_hz_model = ui.SimpleIntModel(50)
+                    ui.IntField(self._plot_hz_model)
+                    self._plot_hz_model.add_end_edit_fn(
+                        lambda _m: self._apply_plot_hz()
+                    )
+
+                UIComponentFactory.create_styled_button(
+                    "Torque Plot (Body)",
+                    callback=lambda: self._toggle_torque_plot("body"),
+                    color_scheme='yellow',
+                    height=UILayout.BUTTON_HEIGHT,
+                )
+                self._torque_plot_body_label = UIComponentFactory.create_status_label(
+                    "Torque Plot (Body): OFF", UILayout.LABEL_WIDTH_LARGE,
+                )
+
+                UIComponentFactory.create_styled_button(
+                    "Torque Plot (Hand)",
+                    callback=lambda: self._toggle_torque_plot("hand"),
+                    color_scheme='blue',
+                    height=UILayout.BUTTON_HEIGHT,
+                )
+                self._torque_plot_hand_label = UIComponentFactory.create_status_label(
+                    "Torque Plot (Hand): OFF", UILayout.LABEL_WIDTH_LARGE,
                 )
 
     # ========================================
@@ -327,6 +368,87 @@ class VisualizerControls:
             inp.Set(value)
         except Exception as e:
             print(f"[Opacity] {path_str} / {attr_name}: {e}")
+
+    # ========================================
+    # Torque Plotter (matplotlib Tk)
+    # ========================================
+    def _get_torque_plotter(self, subset: str):
+        if self._scenario is None:
+            return None
+        getter = getattr(self._scenario, "get_torque_plotter", None)
+        if getter is None:
+            return None
+        try:
+            return getter(subset)
+        except Exception as exc:
+            print(f"[TorquePlot] get_torque_plotter({subset}) failed: {exc}")
+            return None
+
+    def _torque_plot_label(self, subset: str):
+        return (self._torque_plot_body_label if subset == "body"
+                else self._torque_plot_hand_label)
+
+    def _apply_plot_hz(self):
+        if self._plot_hz_model is None:
+            return
+        try:
+            hz = int(self._plot_hz_model.as_int)
+        except Exception:
+            return
+        hz = max(1, min(hz, 500))
+        for subset in ("body", "hand"):
+            plotter = self._get_torque_plotter(subset)
+            if plotter is None:
+                continue
+            try:
+                plotter.set_plot_hz(float(hz))
+            except Exception as exc:
+                print(f"[TorquePlot] set_plot_hz({subset}) failed: {exc}")
+        print(f"[TorquePlot] plot_hz -> {hz}")
+
+    def _toggle_torque_plot(self, subset: str):
+        plotter = self._get_torque_plotter(subset)
+        label = self._torque_plot_label(subset)
+        if plotter is None:
+            if label:
+                label.text = f"Torque Plot ({subset.capitalize()}): NOT READY (press RUN first)"
+            return
+
+        try:
+            running = plotter.is_running()
+        except Exception:
+            running = bool(getattr(self, f"_torque_plot_{subset}_running", False))
+
+        if running:
+            try:
+                plotter.stop()
+            except Exception as exc:
+                print(f"[TorquePlot] stop({subset}) failed: {exc}")
+            setattr(self, f"_torque_plot_{subset}_running", False)
+            if label:
+                label.text = f"Torque Plot ({subset.capitalize()}): OFF"
+            return
+
+        try:
+            ok = plotter.start()
+        except Exception as exc:
+            print(f"[TorquePlot] start({subset}) failed: {exc}")
+            if label:
+                label.text = f"Torque Plot ({subset.capitalize()}): ERROR"
+            return
+        if ok:
+            setattr(self, f"_torque_plot_{subset}_running", True)
+            if label:
+                label.text = f"Torque Plot ({subset.capitalize()}): ON"
+        else:
+            # start() False 의 대표적 원인: (1) 선택된 joint 없음
+            # (2) tkinter/matplotlib 를 가진 외부 python 탐지 실패
+            has_joints = bool(getattr(plotter, "_plot_indices", None))
+            if label:
+                if has_joints:
+                    label.text = f"Torque Plot ({subset.capitalize()}): Install python3-tk"
+                else:
+                    label.text = f"Torque Plot ({subset.capitalize()}): NO JOINTS"
 
     # ========================================
     # Helpers

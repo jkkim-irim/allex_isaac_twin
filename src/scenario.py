@@ -11,6 +11,7 @@ from .core import (
     ALLEXSimulationLoop,
     ForceTorqueVisualizer,
 )
+from .ui_utils.torque_plotter import TorquePlotter, register_singleton
 
 
 logger = logging.getLogger("allex.scenario")
@@ -28,6 +29,10 @@ class ALLEXDigitalTwin:
         self._ros2_manager = None
         self._trajectory_player = None
         self._visualizer = None
+        # Torque plotters (body = arm+waist+neck, hand = fingers).
+        # Dormant until .start() is called from the UI or python console.
+        self._torque_plotter_body: TorquePlotter | None = None
+        self._torque_plotter_hand: TorquePlotter | None = None
 
     def setup(self):
         """시나리오 초기 설정 — 카메라 뷰 + coupled joint config 로드"""
@@ -84,6 +89,9 @@ class ALLEXDigitalTwin:
 
     def reset(self):
         """시스템 리셋 — prim 은 유지, articulation 재초기화 시점에 재-attach 만 수행."""
+        # 기존 plotter subprocess 는 articulation 재바인딩 전에 반드시 정리.
+        self._stop_torque_plotters()
+
         self._initializer.reset(self._articulation)
         self._simulation_loop.reset()
 
@@ -178,12 +186,89 @@ class ALLEXDigitalTwin:
         def _traj_active():
             return self._trajectory_player is not None and self._trajectory_player.is_active()
 
+        # Build / rebuild torque plotters against the current articulation
+        # so they pick up the fresh dof_names list. Plotters stay dormant
+        # until start() is called (UI button or python console).
+        self._setup_torque_plotters()
+
+        # Per-step dt for plotter time axis — falls back to UIConfig PHYSICS_DT.
+        try:
+            from .config.ui_config import UIConfig as _UICfg
+            _plot_dt = float(_UICfg.PHYSICS_DT)
+        except Exception:
+            _plot_dt = 1.0 / 200.0
+
+        def _push_torque_sample():
+            body = self._torque_plotter_body
+            hand = self._torque_plotter_hand
+            if body is not None and body.is_running():
+                body.apply_step(_plot_dt)
+            if hand is not None and hand.is_running():
+                hand.apply_step(_plot_dt)
+
         generator = self._joint_controller.create_joint_control_generator(
             articulation=self._articulation,
             get_target_positions_func=get_target_positions,
             is_external_active_fn=_traj_active,
+            torque_plot_fn=_push_torque_sample,
         )
         self._simulation_loop.set_script_generator(generator)
+
+    def _stop_torque_plotters(self):
+        """Tear down any running plotter subprocesses.
+
+        Safe to call even when plotters were never created. Used on reset
+        and on extension shutdown so we never leave orphan Python Tk
+        windows behind.
+        """
+        for attr in ("_torque_plotter_body", "_torque_plotter_hand"):
+            old = getattr(self, attr, None)
+            if old is None:
+                continue
+            try:
+                old.stop()
+            except Exception as exc:
+                logger.debug(f"torque plotter stop warn: {exc}")
+            setattr(self, attr, None)
+
+    def _setup_torque_plotters(self):
+        """(Re)create TorquePlotter instances for body + hand subsets.
+
+        If plotters were already running when articulation is reinitialized
+        (e.g. after Stop/Play), we tear them down first so the new instance
+        binds to the fresh articulation view.
+        """
+        if self._articulation is None:
+            return
+
+        ff_provider = None
+        if self._gain_ff_controller is not None:
+            ff_provider = self._gain_ff_controller.get_last_applied_ff
+
+        # Stop any previous plotter subprocesses cleanly before rebuilding.
+        self._stop_torque_plotters()
+
+        try:
+            self._torque_plotter_body = TorquePlotter(
+                articulation=self._articulation,
+                ff_provider=ff_provider,
+                subset="body",
+            )
+            register_singleton("body", self._torque_plotter_body)
+        except Exception as exc:
+            logger.warning(f"TorquePlotter(body) init failed: {exc}")
+            self._torque_plotter_body = None
+
+        try:
+            self._torque_plotter_hand = TorquePlotter(
+                articulation=self._articulation,
+                ff_provider=ff_provider,
+                subset="hand",
+            )
+            register_singleton("hand", self._torque_plotter_hand)
+        except Exception as exc:
+            logger.warning(f"TorquePlotter(hand) init failed: {exc}")
+            self._torque_plotter_hand = None
 
     # ========================================
     # Public API
@@ -203,6 +288,14 @@ class ALLEXDigitalTwin:
     def get_trajectory_player(self):
         return self._trajectory_player
 
+    # ========================================
+    # Torque plotter accessors (UI uses these)
+    # ========================================
+    def get_torque_plotter(self, subset: str = "body"):
+        if subset == "hand":
+            return self._torque_plotter_hand
+        return self._torque_plotter_body
+
     def get_robot_info(self):
         return self._asset_manager.get_joint_info()
 
@@ -211,3 +304,11 @@ class ALLEXDigitalTwin:
 
     def stop_simulation(self):
         self._simulation_loop.stop()
+
+    def shutdown(self):
+        """Extension reload / window close hook.
+
+        Ensures all plotter subprocesses are terminated so we do not leave
+        orphan Tk windows around after the Kit extension is unloaded.
+        """
+        self._stop_torque_plotters()

@@ -65,6 +65,13 @@ class UIBuilder:
         self._visualizer.build()
 
     def cleanup(self):
+        # Tear down plotter subprocesses before other controllers to avoid
+        # leaking Tk windows across extension reload / stage reopen.
+        if self._scenario is not None:
+            try:
+                self._scenario.shutdown()
+            except Exception as exc:
+                print(f"[ALLEX] scenario shutdown warn: {exc}")
         self._world_controls.cleanup()
         self._ros2_controls.cleanup()
         self._traj_studio.cleanup()

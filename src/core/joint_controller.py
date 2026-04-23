@@ -232,7 +232,8 @@ class ALLEXJointController:
     # 시뮬레이션 루프 제너레이터
     # ========================================
     def create_joint_control_generator(self, articulation, get_target_positions_func,
-                                        is_external_active_fn=None):
+                                        is_external_active_fn=None,
+                                        torque_plot_fn=None):
         """관절 제어 제너레이터 — 매 physics step마다 목표 위치 적용.
 
         is_external_active_fn: optional callable returning True when an external
@@ -249,6 +250,11 @@ class ALLEXJointController:
             if articulation is not None and active:
                 target_positions = get_target_positions_func()
                 articulation.apply_action(ArticulationAction(target_positions))
+            if torque_plot_fn is not None:
+                try:
+                    torque_plot_fn()
+                except Exception as exc:
+                    print(f"[ALLEX][TorquePlot] hook failed: {exc}")
             yield
 
     def get_coupled_joints_info(self):
