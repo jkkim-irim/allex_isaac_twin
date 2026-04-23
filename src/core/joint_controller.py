@@ -233,14 +233,30 @@ class ALLEXJointController:
     # ========================================
     def create_joint_control_generator(self, articulation, get_target_positions_func,
                                         is_external_active_fn=None,
+                                        runtime_gain_ff_fn=None,
                                         torque_plot_fn=None):
         """관절 제어 제너레이터 — 매 physics step마다 목표 위치 적용.
 
         is_external_active_fn: optional callable returning True when an external
         driver (e.g. trajectory playback) wants to push targets even if the ROS2
         subscriber is off.
+        runtime_gain_ff_fn: optional no-arg callable invoked at the start of
+        every iteration *before* the position target is applied. Used to
+        inject per-step PD gain overrides and feedforward torques. Keeping
+        this callback first ensures that when the FF path writes directly
+        into ``control.joint_f``, the subsequent ``apply_action`` (which only
+        touches joint_target_pos) does not clobber it.
+        torque_plot_fn: optional no-arg callable invoked *after* the position
+        target has been applied so the kp/kd/FF snapshot reflects the state
+        that will be integrated on the next Newton step. Used by
+        ``TorquePlotter.apply_step`` (wrapped to supply dt).
         """
         while True:
+            if runtime_gain_ff_fn is not None:
+                try:
+                    runtime_gain_ff_fn()
+                except Exception as exc:
+                    print(f"[ALLEX][GainFF] runtime hook failed: {exc}")
             active = self._ros2_subscriber_active
             if not active and is_external_active_fn is not None:
                 try:

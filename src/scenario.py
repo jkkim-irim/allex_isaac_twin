@@ -10,6 +10,8 @@ from .core import (
     ALLEXJointController,
     ALLEXSimulationLoop,
     ForceTorqueVisualizer,
+    RuntimeGainFFController,
+    FeedforwardTorqueManager,
 )
 from .ui_utils.torque_plotter import TorquePlotter, register_singleton
 
@@ -29,6 +31,17 @@ class ALLEXDigitalTwin:
         self._ros2_manager = None
         self._trajectory_player = None
         self._visualizer = None
+        self._gain_ff_controller = None
+        self._gain_ff_reader = None
+        # Fallback step counter used when the currently active trajectory
+        # player has no sample index (e.g. ROS2-driven target stream).
+        self._gain_ff_step_counter = 0
+
+        # General-purpose feedforward torque manager (control.joint_f 쓰기 +
+        # 최근 값 보관). Newton 이 qfrc_applied 를 expose 하지 않아 쓴 값
+        # 되읽는 공식 API 가 없어 이 매니저가 사실상 ground truth 역할.
+        self._ff_manager = FeedforwardTorqueManager()
+
         # Torque plotters (body = arm+waist+neck, hand = fingers).
         # Dormant until .start() is called from the UI or python console.
         self._torque_plotter_body: TorquePlotter | None = None
@@ -127,6 +140,10 @@ class ALLEXDigitalTwin:
     def get_visualizer(self):
         return self._visualizer
 
+    def get_ff_manager(self) -> "FeedforwardTorqueManager":
+        """General-purpose FF torque manager (control.joint_f 주입 + 보관)."""
+        return self._ff_manager
+
     def _create_visualizer_prims(self):
         """1단계: articulation 없이 stage 기반 prim 만 생성."""
         if self._visualizer is not None:
@@ -157,6 +174,14 @@ class ALLEXDigitalTwin:
         except Exception as e:
             logger.warning(f"ForceTorqueVisualizer attach failed: {e}")
 
+        # FF manager 버퍼를 articulation dof 수에 맞춤.
+        try:
+            ndof = int(getattr(self._articulation, "num_dof", 0) or 0)
+            if ndof > 0:
+                self._ff_manager.set_num_dof(ndof)
+        except Exception as e:
+            logger.warning(f"FeedforwardTorqueManager resize failed: {e}")
+
     # 호환용 shim — 예전 코드 경로에서 호출되는 경우 대비
     def _setup_visualizer(self):
         if self._visualizer is None:
@@ -186,6 +211,28 @@ class ALLEXDigitalTwin:
         def _traj_active():
             return self._trajectory_player is not None and self._trajectory_player.is_active()
 
+        # Build runtime gain/FF controller + reader against the currently
+        # installed trajectory (if any). Whether apply_step is called is
+        # decided every step based on reader readiness.
+        self._setup_runtime_gain_ff()
+
+        def _pull_gain_ff():
+            ctrl = self._gain_ff_controller
+            reader = self._gain_ff_reader
+            if ctrl is None or reader is None or not reader.is_ready():
+                return
+            # Prefer the trajectory player's sample counter so gain_ff.csv
+            # stays phase-locked with trajectory CSVs at the same hz.
+            sample_idx = None
+            tp = self._trajectory_player
+            if tp is not None and tp.is_active():
+                sample_idx = getattr(tp, "_sample_idx", None)
+            if sample_idx is None:
+                sample_idx = self._gain_ff_step_counter
+                self._gain_ff_step_counter += 1
+            sample = reader.get_sample(int(sample_idx))
+            ctrl.apply_step(sample)
+
         # Build / rebuild torque plotters against the current articulation
         # so they pick up the fresh dof_names list. Plotters stay dormant
         # until start() is called (UI button or python console).
@@ -210,6 +257,7 @@ class ALLEXDigitalTwin:
             articulation=self._articulation,
             get_target_positions_func=get_target_positions,
             is_external_active_fn=_traj_active,
+            runtime_gain_ff_fn=_pull_gain_ff,
             torque_plot_fn=_push_torque_sample,
         )
         self._simulation_loop.set_script_generator(generator)
@@ -270,6 +318,59 @@ class ALLEXDigitalTwin:
             logger.warning(f"TorquePlotter(hand) init failed: {exc}")
             self._torque_plotter_hand = None
 
+    def _setup_runtime_gain_ff(self):
+        """Instantiate RuntimeGainFFController + GainFFCsvReader.
+
+        The controller is always built when the articulation is ready. Whether
+        it actually modifies gains / injects torque at runtime is decided
+        per-step by ``reader.is_ready()`` — if the trajectory's csv_dir has
+        no gain_ff.csv (or it has no relevant columns), apply_step is skipped.
+        """
+        self._gain_ff_step_counter = 0
+        self._gain_ff_reader = None
+
+        if self._articulation is None:
+            self._gain_ff_controller = None
+            return
+
+        try:
+            dof_names = list(self._articulation.dof_names or [])
+        except Exception:
+            dof_names = []
+        if not dof_names:
+            print("[ALLEX][GainFF] articulation has no dof_names yet; skipping setup")
+            self._gain_ff_controller = None
+            return
+
+        try:
+            self._gain_ff_controller = RuntimeGainFFController(
+                articulation=self._articulation,
+                dof_names=dof_names,
+            )
+        except Exception as exc:
+            print(f"[ALLEX][GainFF] controller init failed: {exc}")
+            self._gain_ff_controller = None
+            return
+
+        # CSV is driven by the currently installed trajectory player's csv_dir.
+        tp = self._trajectory_player
+        csv_dir = getattr(tp, "_csv_dir", None) if tp is not None else None
+        if csv_dir is None:
+            # No active trajectory yet; reader stays None. apply_step becomes
+            # a no-op until set_trajectory_player rebuilds the reader.
+            return
+        from pathlib import Path
+        csv_path = Path(csv_dir) / "gain_ff.csv"
+        try:
+            from .trajectory import GainFFCsvReader
+            self._gain_ff_reader = GainFFCsvReader(
+                csv_path=csv_path,
+                dof_names=dof_names,
+            )
+        except Exception as exc:
+            print(f"[ALLEX][GainFF] reader init failed: {exc}")
+            self._gain_ff_reader = None
+
     # ========================================
     # Public API
     # ========================================
@@ -284,6 +385,10 @@ class ALLEXDigitalTwin:
             except Exception:
                 pass
         self._trajectory_player = player
+        # Re-bind gain/FF reader against the new trajectory's csv_dir so that
+        # gain_ff.csv shipped alongside the trajectory takes effect immediately.
+        if self._articulation is not None:
+            self._setup_runtime_gain_ff()
 
     def get_trajectory_player(self):
         return self._trajectory_player
