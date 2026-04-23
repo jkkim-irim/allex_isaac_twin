@@ -284,6 +284,13 @@ class VisualizerControls:
             self._set_attr(prim, path, "inputs:opacity_constant", Sdf.ValueTypeNames.Float, opacity)
 
     def _restore_opacity(self, stage):
+        # OmniPBR MDL default: enable_opacity=False, opacity_constant=1.0
+        # backup 에 원본 값이 있으면 그것으로, 없으면 MDL default 로 명시 세팅.
+        # Clear() 만으로는 MDL 파라미터 복구가 안 되는 경우가 있어 explicit set.
+        _MDL_DEFAULTS = {
+            "enable_opacity": False,
+            "opacity_constant": 1.0,
+        }
         from pxr import UsdShade
         for path_str, attrs in self._opacity_backup.items():
             prim = stage.GetPrimAtPath(path_str)
@@ -293,13 +300,14 @@ class VisualizerControls:
             for attr_name, original in attrs.items():
                 input_name = attr_name.removeprefix("inputs:")
                 try:
+                    value = original if original is not None else _MDL_DEFAULTS.get(input_name)
+                    if value is None:
+                        continue
                     inp = shader.GetInput(input_name)
-                    if original is None:
-                        inp.GetAttr().Clear()
-                    else:
-                        inp.Set(original)
-                except Exception:
-                    pass
+                    if inp:
+                        inp.Set(value)
+                except Exception as exc:
+                    print(f"[Opacity restore] {path_str}/{attr_name}: {exc}")
         self._opacity_backup.clear()
 
     def _set_attr(self, prim, path_str, attr_name, vtype, value):
