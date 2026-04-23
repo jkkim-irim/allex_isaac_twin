@@ -66,6 +66,33 @@ _MJCF_DRIVE_GAINS: dict[str, tuple[float, float]] = {
 }
 
 
+def get_default_gains_vec(articulation) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Return current per-DOF (kp, kd) vectors from the articulation view.
+
+    Shape is (num_dof,) numpy float32. Returns None on failure.
+    """
+    try:
+        view = articulation._articulation_view
+        kps, kds = view.get_gains()
+    except Exception as exc:
+        print(f"[ALLEX][Gains] get_gains failed: {exc}")
+        return None
+
+    def _to_np(t):
+        if t is None:
+            return None
+        if hasattr(t, "detach"):
+            t = t.detach().cpu().numpy()
+        arr = np.asarray(t, dtype=np.float32).reshape(-1)
+        return arr
+
+    kp_vec = _to_np(kps)
+    kd_vec = _to_np(kds)
+    if kp_vec is None or kd_vec is None:
+        return None
+    return kp_vec, kd_vec
+
+
 def _override_drive_gains(articulation) -> int:
     """Replace per-DOF drive stiffness/damping with MJCF-intended SI values."""
     try:
