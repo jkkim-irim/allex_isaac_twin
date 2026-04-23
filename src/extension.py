@@ -61,15 +61,14 @@ class Extension(omni.ext.IExt):
         self._usd_context = omni.usd.get_context()
 
         # Build Window
-        self._window = ui.Window(
-            title=EXTENSION_TITLE, 
-            width=400, 
-            height=500, 
-            visible=False, 
+        self._window = ScrollingWindow(
+            title=EXTENSION_TITLE,
+            width=400,
+            height=500,
+            visible=False,
             flags=ui.WINDOW_FLAGS_NO_COLLAPSE | ui.WINDOW_FLAGS_NO_RESIZE,
             padding_x=10,
             padding_y=10,
-            #dockPreference=ui.DockPreference.LEFT_BOTTOM
         )
         self._window.set_visibility_changed_fn(self._on_window)
 
