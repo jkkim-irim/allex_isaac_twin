@@ -391,8 +391,11 @@ class ForceTorqueVisualizer:
             real_path = f"{parent_path}/{TORQUE_RING_REAL_NAME}"
             sim_path = f"{parent_path}/{TORQUE_RING_SIM_NAME}"
 
-            # Ring 의 local +Z 축을 joint rotation axis 에 정렬
-            translate, orient_quat = self._compute_ring_transform(stage, entry["usd_joint_name"])
+            # Ring 의 local +Z 축을 joint rotation axis 에 정렬.
+            # entry["ring_offset_along_axis"] (m) 값이 0 아니면 axis 방향으로 translate.
+            translate, orient_quat = self._compute_ring_transform(
+                stage, entry["usd_joint_name"], entry=entry
+            )
             base_scale = entry.get("base_scale", (1, 1, 1))
 
             # Real ring — REAL_COLOR
@@ -770,11 +773,13 @@ class ForceTorqueVisualizer:
         except Exception as e:
             logger.debug(f"[viz] bind_omni_pbr_to_force_vec warn ({prim_path}): {e}")
 
-    def _compute_ring_transform(self, stage, joint_name):
+    def _compute_ring_transform(self, stage, joint_name, entry=None):
         """Joint prim 을 읽어 torque ring 의 local translate + orient(quat) 계산.
 
         Ring USD (torque_viz.usd) 는 local +Z 축이 회전 대칭축.
         - translate: joint 의 localPos1 (body1=child_link 기준 joint 원점 위치)
+                     + entry.get("ring_offset_along_axis", 0.0) * axis_body1
+                     (회전축 방향 offset, viz_config.py 에서 튜닝 가능)
         - orient:  +Z → axis_in_body1 으로 회전하는 quaternion.
                    axis_in_body1 = localRot1 · (axis_joint)
                    axis_joint = joint 의 axis attribute (X/Y/Z)
@@ -826,6 +831,12 @@ class ForceTorqueVisualizer:
                 orient = Gf.Quatd(0.0, Gf.Vec3d(1, 0, 0))
             else:
                 orient = Gf.Rotation(from_vec, axis_body1).GetQuat()
+
+            # Axis 방향 추가 offset (entry 에 지정된 값, 단위 m).
+            if entry is not None:
+                off = float(entry.get("ring_offset_along_axis", 0.0) or 0.0)
+                if abs(off) > 1e-9:
+                    translate = translate + axis_body1 * off
 
             return (translate, orient)
         except Exception as e:

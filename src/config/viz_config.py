@@ -43,6 +43,38 @@ TORQUE_GAIN_FINGER   = 0.40   # 손가락 — 토크가 매우 작음
 
 
 # ========================================
+# Torque ring 위치 offset — **ring 회전축 방향** (+/-) m 단위
+#
+# 기본 위치는 joint.localPos1 (child link 원점 기준 joint 좌표).
+# 여기에 axis 방향으로 추가 offset 을 줘서 ring 을 link 안쪽/바깥쪽으로
+# 밀 수 있음. 양수 = 회전축 +방향 (joint axis 방향), 음수 = 반대.
+#
+# Per-joint override 테이블. dict 에 없는 joint 는 **0.0** (offset 없음).
+# 좌우 비대칭 튜닝이 필요하면 L_* / R_* 를 각각 다르게 세팅하면 됨.
+# 키: `usd_joint_name` (예: "L_Shoulder_Pitch_Joint", "R_Elbow_Joint",
+#                        "L_Thumb_MCP_Joint" …)
+# ========================================
+RING_OFFSET_ALONG_AXIS_BY_JOINT: dict[str, float] = {
+    # --- Shoulder ---
+    "L_Shoulder_Pitch_Joint": 0.01,
+    "L_Shoulder_Roll_Joint":  -0.035,
+    "L_Shoulder_Yaw_Joint":   0.07,
+    "R_Shoulder_Pitch_Joint": -0.01,
+    "R_Shoulder_Roll_Joint":  -0.035,
+    "R_Shoulder_Yaw_Joint":   0.07,
+    # --- Elbow ---
+    "L_Elbow_Joint": 0.06,
+    "R_Elbow_Joint": -0.06,
+    # --- Wrist / Finger --- 필요 시 추가 (없으면 0.0 적용)
+}
+
+
+def _ring_offset_for(joint_name: str) -> float:
+    """Lookup offset. Missing joints default to 0.0."""
+    return float(RING_OFFSET_ALONG_AXIS_BY_JOINT.get(joint_name, 0.0))
+
+
+# ========================================
 # Force 화살표 스케일
 # ========================================
 FORCE_GAIN = 0.1
@@ -127,11 +159,13 @@ def _hand_side_entries(side):
     ]
     out = []
     for joint_stem, link_name, abbr_suffix in specs:
+        joint_name = f"{prefix}{joint_stem}_Joint"
         out.append({
-            "usd_joint_name": f"{prefix}{joint_stem}_Joint",
+            "usd_joint_name": joint_name,
             "child_link_path": f"/ALLEX/{prefix}{link_name}",
             "dof_abbr": f"{abbr_prefix}{abbr_suffix}",
             "base_scale": (1, 1, 1),
+            "ring_offset_along_axis": _ring_offset_for(joint_name),
         })
     return out
 
@@ -151,11 +185,13 @@ def _arm_side_entries(side):
     ]
     out = []
     for joint_name, link_name, dof_abbr in specs:
+        full_joint_name = f"{prefix}{joint_name}"
         out.append({
-            "usd_joint_name": f"{prefix}{joint_name}",
+            "usd_joint_name": full_joint_name,
             "child_link_path": f"/ALLEX/{prefix}{link_name}",
             "dof_abbr": dof_abbr,
             "base_scale": (1, 1, 1),
+            "ring_offset_along_axis": _ring_offset_for(full_joint_name),
         })
     return out
 
