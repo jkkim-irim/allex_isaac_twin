@@ -2,10 +2,11 @@
 ALLEX Digital Twin 에셋 관리
 """
 
+import json
 from pathlib import Path
 import numpy as np
 import omni.usd
-from pxr import UsdGeom, Gf
+from pxr import UsdGeom, Gf, Sdf
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.stage import add_reference_to_stage
 
@@ -147,6 +148,101 @@ def _override_drive_gains(articulation) -> int:
     return changed
 
 
+def _load_joint_friction_map() -> dict:
+    """Read joint_friction dict from src/joint_config.json. Empty dict on failure."""
+    cfg_path = Path(__file__).parent.parent / "joint_config.json"
+    try:
+        with cfg_path.open("r") as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        print(f"[ALLEX][Friction] cannot read joint_config.json: {exc}")
+        return {}
+    raw = cfg.get("joint_friction", {}) or {}
+    # Strip meta keys (underscore-prefixed) so users can keep _comment / _example
+    return {k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, dict)}
+
+
+def _apply_joint_frictions(articulation, friction_map: dict) -> int:
+    """Write per-joint static/dynamic/viscous friction onto USD at load time.
+
+    Newton has no runtime friction API (see project memory). The USD values
+    are read by Newton when the stage is loaded / physics engine switched,
+    so this must run *before or during* articulation initialize — calling
+    from ``initialize_articulation`` is fine because Newton re-reads the
+    stage on PLAY.
+    """
+    if not friction_map:
+        return 0
+    try:
+        names = list(articulation.dof_names or [])
+        view = articulation._articulation_view
+        dof_paths = view.dof_paths
+    except Exception as exc:
+        print(f"[ALLEX][Friction] cannot read dof_paths: {exc}")
+        return 0
+    if not dof_paths or not dof_paths[0]:
+        print("[ALLEX][Friction] dof_paths empty; skip")
+        return 0
+    joint_paths = list(dof_paths[0])
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return 0
+
+    changed = 0
+    for i, jname in enumerate(names):
+        spec = friction_map.get(jname)
+        if spec is None:
+            continue
+        if i >= len(joint_paths):
+            continue
+        prim = stage.GetPrimAtPath(joint_paths[i])
+        if not prim or not prim.IsValid():
+            continue
+        type_name = prim.GetTypeName()
+        if type_name == "PhysicsRevoluteJoint":
+            token = "angular"
+        elif type_name == "PhysicsPrismaticJoint":
+            token = "linear"
+        else:
+            print(f"[ALLEX][Friction] {jname}: unsupported joint type {type_name}; skip")
+            continue
+
+        static = spec.get("static")
+        dynamic = spec.get("dynamic")
+        viscous = spec.get("viscous")
+        if static is not None and dynamic is not None and float(static) < float(dynamic):
+            print(f"[ALLEX][Friction] {jname}: static({static}) < dynamic({dynamic}); skip")
+            continue
+
+        # PhysX path: PhysxJointAxisAPI attributes (used only by PhysX backend)
+        prim.ApplyAPI("PhysxJointAxisAPI", token)
+        base = f"physxJointAxis:{token}"
+
+        def _set(attr_name, value, vtype=Sdf.ValueTypeNames.Float):
+            if value is None:
+                return
+            attr = prim.GetAttribute(attr_name)
+            if not attr:
+                attr = prim.CreateAttribute(attr_name, vtype)
+            attr.Set(float(value))
+
+        _set(f"{base}:staticFrictionEffort", static)
+        _set(f"{base}:dynamicFrictionEffort", dynamic)
+        _set(f"{base}:viscousFrictionCoefficient", viscous)
+
+        # Newton path: write newton:friction (Model.joint_friction →
+        # MuJoCo dof_frictionloss). Newton reads this at stage load /
+        # engine switch. Use 'dynamic' (Coulomb dry friction) as the
+        # single-scalar value; fall back to 'static' if dynamic missing.
+        newton_val = dynamic if dynamic is not None else static
+        _set("newton:friction", newton_val)
+
+        changed += 1
+
+    print(f"[ALLEX][Friction] applied friction on {changed}/{len(names)} joint(s)")
+    return changed
+
+
 class ALLEXAssetManager:
     """ALLEX 디지털 트윈 에셋 로딩 및 관리를 담당하는 클래스"""
     
@@ -255,6 +351,10 @@ class ALLEXAssetManager:
                     print(f"   gain[{i:3d}] kp={kp} kd={kd}  ({n})")
             except Exception as exc:
                 print(f"[ALLEX][Art] gains dump failed: {exc}")
+            try:
+                _apply_joint_frictions(self._articulation, _load_joint_friction_map())
+            except Exception as exc:
+                print(f"[ALLEX][Friction] apply failed: {exc}")
             return True
         except Exception:
             return False

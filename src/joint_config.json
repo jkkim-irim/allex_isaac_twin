@@ -286,5 +286,25 @@
       "label": "R_Little_DIP_Joint__R_Little_PIP_Joint"
     }
   ],
-  "coupled_joints": {}
+  "coupled_joints": {},
+  "_joint_friction": {
+    "_comment": "DISABLED for testing — rename key back to 'joint_friction' to re-enable. Loader (_load_friction) only looks at 'joint_friction'; any other key name is auto-skipped. Fields: static/dynamic (N·m for revolute / N for prismatic, Coulomb dry friction), viscous (N·m/(rad/s) or N/(m/s)). Newton uses 'dynamic' only (→ Model.joint_friction → MuJoCo dof_frictionloss). static/viscous are PhysX-only and ignored under Newton. Keys starting with '_' are metadata.",
+    "_example_L_Elbow_Joint": { "static": 0.5, "dynamic": 0.3, "viscous": 0.01 },
+
+    "L_Shoulder_Pitch_Joint": { "dynamic": 0.9867 },
+    "L_Shoulder_Roll_Joint":  { "dynamic": 2.4082 },
+    "L_Shoulder_Yaw_Joint":   { "dynamic": 0.9308 },
+    "L_Elbow_Joint":          { "dynamic": 1.4460 },
+    "L_Wrist_Yaw_Joint":      { "dynamic": 1.2059 },
+    "L_Wrist_Roll_Joint":     { "dynamic": 0.3077 },
+    "L_Wrist_Pitch_Joint":    { "dynamic": 0.2755 },
+
+    "R_Shoulder_Pitch_Joint": { "dynamic": 0.9867 },
+    "R_Shoulder_Roll_Joint":  { "dynamic": 2.4082 },
+    "R_Shoulder_Yaw_Joint":   { "dynamic": 0.9308 },
+    "R_Elbow_Joint":          { "dynamic": 1.4460 },
+    "R_Wrist_Yaw_Joint":      { "dynamic": 1.2059 },
+    "R_Wrist_Roll_Joint":     { "dynamic": 0.3077 },
+    "R_Wrist_Pitch_Joint":    { "dynamic": 0.2755 }
+  }
 }

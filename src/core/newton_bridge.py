@@ -17,6 +17,7 @@ import carb
 _orig_finalize = None
 _patched = False
 _equality_table: list[tuple[str, str, list[float], str]] = []
+_friction_table: dict[str, float] = {}
 
 _orig_on_post_reset = None
 _articulation_patched = False
@@ -33,6 +34,63 @@ def _load_equality(joint_config_path: Path) -> list[tuple[str, str, list[float],
             (e["follower"], e["master"], list(e["polycoef"]), e.get("label", ""))
         )
     return out
+
+
+def _load_friction(joint_config_path: Path) -> dict[str, float]:
+    """joint_friction 섹션에서 {short_joint_name: dynamic_value} 반환.
+
+    Newton Model.joint_friction 은 per-DOF single scalar → 'dynamic' 을 선호,
+    없으면 'static' 폴백. 메타 키(언더스코어 시작)와 dict 아닌 값은 제외.
+    """
+    with open(joint_config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    raw = cfg.get("joint_friction", {}) or {}
+    out: dict[str, float] = {}
+    for name, spec in raw.items():
+        if name.startswith("_") or not isinstance(spec, dict):
+            continue
+        val = spec.get("dynamic")
+        if val is None:
+            val = spec.get("static")
+        if val is None:
+            continue
+        try:
+            out[name] = float(val)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _inject_friction(builder) -> None:
+    """builder.joint_friction[qd_start] 를 joint_config.json 기반으로 덮어씀.
+
+    Newton 이 finalize 시점에 이 리스트를 wp.array 로 할당하므로,
+    finalize 호출 직전에 수정되어야 Model.joint_friction 에 반영된다.
+    USD newton:friction 경로는 Newton importer 가 가끔 깨우지 못해
+    이 훅으로 강제 주입이 가장 결정적.
+    """
+    if not _friction_table:
+        return
+    joint_labels = list(builder.joint_label or [])
+    joint_qd_start = list(getattr(builder, "joint_qd_start", []) or [])
+    joint_fric = getattr(builder, "joint_friction", None)
+    if joint_fric is None or not joint_labels or not joint_qd_start:
+        print("[ALLEX][Friction] builder missing joint_friction / label / qd_start; skip")
+        return
+
+    applied = 0
+    for ji, label in enumerate(joint_labels):
+        short = label.rsplit("/", 1)[-1]
+        val = _friction_table.get(short)
+        if val is None:
+            continue
+        if ji >= len(joint_qd_start):
+            continue
+        qd = int(joint_qd_start[ji])
+        if 0 <= qd < len(joint_fric):
+            joint_fric[qd] = val
+            applied += 1
+    print(f"[ALLEX][Friction] injected friction on {applied}/{len(_friction_table)} joint(s) at builder level")
 
 
 def _find_joint_idx(builder, short_name: str) -> int | None:
@@ -363,7 +421,7 @@ def _configure_newton_from_toml() -> None:
 
 
 def install(joint_config_path: Path) -> None:
-    global _orig_finalize, _patched, _equality_table
+    global _orig_finalize, _patched, _equality_table, _friction_table
     _install_articulation_reset_patch()
     _configure_newton_from_toml()
     if _patched:
@@ -382,6 +440,13 @@ def install(joint_config_path: Path) -> None:
     print(
         f"[ALLEX] loaded {len(_equality_table)} equality entries from {joint_config_path}"
     )
+    try:
+        _friction_table = _load_friction(joint_config_path)
+    except Exception as exc:
+        print(f"[ALLEX] failed to load friction table: {exc}")
+        _friction_table = {}
+    print(f"[ALLEX] loaded {len(_friction_table)} friction entries from {joint_config_path}")
+
     _orig_finalize = newton.ModelBuilder.finalize
 
     def _patched_finalize(self, *args, **kwargs):
@@ -389,6 +454,10 @@ def install(joint_config_path: Path) -> None:
             _inject(self)
         except Exception as exc:
             print(f"[ALLEX] equality injection raised: {exc}")
+        try:
+            _inject_friction(self)
+        except Exception as exc:
+            print(f"[ALLEX] friction injection raised: {exc}")
         model = _orig_finalize(self, *args, **kwargs)
         try:
             _dump_model_equality_state(model)
