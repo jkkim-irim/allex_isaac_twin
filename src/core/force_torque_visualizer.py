@@ -128,6 +128,12 @@ class ForceTorqueVisualizer:
         # Newton backend 여부 (lazy 감지). True이면 joint_efforts/forces API 미구현
         self._newton_backend: bool | None = None
 
+        # 사용자 정의 custom force vector 테이블
+        # name -> {"prim": Usd.Prim, "translate_op", "orient_op", "parent_path",
+        #           "last_pose": (tx, ty, tz, qw, qx, qy, qz) or None,
+        #           "last_vec": (fx, fy, fz) or None}
+        self._custom_force_prims: dict = {}
+
         self._prims_initialized = False
 
         # stage 가 바로 사용 가능하면 prim 을 즉시 생성한다 (articulation 불필요).
@@ -201,29 +207,32 @@ class ForceTorqueVisualizer:
             if not self._prims_initialized:
                 return
 
-        # articulation 이 없으면 scale 업데이트를 건너뛴다 (prim 과 visibility 는 유지).
-        if self._articulation is None or self._joint_controller is None:
-            return
+        # articulation 유무와 무관하게 force test 는 항상 동작해야 한다.
+        # torque ring 쪽만 articulation 이 필요하므로 섹션별로 gating.
+        have_articulation = (
+            self._articulation is not None and self._joint_controller is not None
+        )
 
         # Newton backend 감지 (lazy, 한 번만). Newton은 joint_efforts/forces API 미구현.
-        if self._newton_backend is None:
+        if have_articulation and self._newton_backend is None:
             self._newton_backend = self._detect_newton_backend()
 
         # --- sim torque ---
         # get_applied_joint_efforts() → Articulation._physics_view.get_dof_actuation_forces()
         # Newton/PhysX 모두 동일 공개 API 경로 사용.
         sim_torques = None
-        try:
-            sim_torques = self._articulation.get_applied_joint_efforts()
-            if sim_torques is not None and hasattr(sim_torques, "shape"):
-                if len(sim_torques.shape) == 2:
-                    sim_torques = sim_torques[0]
-        except Exception as e:
-            logger.debug(f"[viz] get_applied_joint_efforts failed: {e}")
+        if have_articulation:
+            try:
+                sim_torques = self._articulation.get_applied_joint_efforts()
+                if sim_torques is not None and hasattr(sim_torques, "shape"):
+                    if len(sim_torques.shape) == 2:
+                        sim_torques = sim_torques[0]
+            except Exception as e:
+                logger.debug(f"[viz] get_applied_joint_efforts failed: {e}")
 
         # --- real torque (dict by abbr) ---
         real_snapshot = {}
-        if self._joint_controller is not None:
+        if have_articulation:
             try:
                 real_snapshot = self._joint_controller.get_torque_snapshot() or {}
             except Exception as e:
@@ -233,7 +242,7 @@ class ForceTorqueVisualizer:
         # --- torque rings (평탄화된 튜플 순회 — N3) ---
         update_sim_torque = self._torque_mode in ("sim", "both")
         update_real_torque = self._torque_mode in ("real", "both")
-        if self._torque_mode != "off":
+        if have_articulation and self._torque_mode != "off":
             for abbr, _usd_joint_name, _child_link_path in HAND_JOINT_TORQUE_RING_TUPLES:
                 pair = self._torque_ring_prims.get(abbr)
                 if not pair:
@@ -273,6 +282,9 @@ class ForceTorqueVisualizer:
             self._apply_force_scale(pair.get("real"), 0.0, FORCE_GAIN,
                                     FORCE_MIN_SCALE, FORCE_MAX_SCALE)
 
+        # --- custom user-defined force vectors ---
+        self._update_custom_force_vectors()
+
     def set_mode(self, mode: str):
         """mode in {off, real, sim, both}."""
         if mode not in ("off", "real", "sim", "both"):
@@ -298,6 +310,194 @@ class ForceTorqueVisualizer:
     def set_torque_visibility(self, visible: bool):
         """하위호환 — True → both, False → off."""
         self.set_torque_mode("both" if visible else "off")
+
+    # ========================================
+    # Custom force vector — 임의 위치·방향·크기 화살표 API
+    # ========================================
+    CUSTOM_FORCE_ROOT = "/World/AllexForceViz"
+
+    def add_custom_force_vector(
+        self,
+        name: str,
+        position=(0.0, 0.0, 0.0),
+        vector=(0.0, 0.0, 0.1),
+        color=None,
+        parent_path: str | None = None,
+    ):
+        """임의 위치에 force vector 화살표 prim 을 새로 만든다.
+
+        name          : 고유 식별자. set_/remove_ 호출 시 이 key 사용.
+        position      : (x, y, z) translate. parent_path 기준 (None 이면 world).
+        vector        : (fx, fy, fz). 길이 = magnitude, 방향 = orient.
+                         force_vec.usda 는 local +Z 화살표라 +Z → vector 로 회전.
+        color         : (r, g, b) 0~1. None 이면 REAL_COLOR.
+        parent_path   : 생성할 부모 prim 경로. None 이면 CUSTOM_FORCE_ROOT 아래에
+                         /World/AllexForceViz/<name> 으로 생성 (world 공간 floating).
+                         링크 추종이 필요하면 `/ALLEX/<link>` 같은 경로를 지정.
+
+        Returns: 성공 시 prim path (str), 실패 시 None.
+        동일 name 이 이미 존재하면 기존 prim 재사용하고 pose/vector 만 갱신.
+        """
+        if not name:
+            logger.warning("[viz] add_custom_force_vector: name required")
+            return None
+
+        if name in self._custom_force_prims:
+            # 이미 있으면 갱신만 수행
+            self.set_custom_force_vector(name, position=position, vector=vector)
+            return self._custom_force_prims[name]["prim"].GetPath().pathString
+
+        stage = self._get_stage()
+        if stage is None:
+            logger.warning("[viz] add_custom_force_vector: stage unavailable")
+            return None
+
+        if not os.path.exists(FORCE_VIZ_USD_PATH):
+            logger.warning(f"[viz] force_vec.usda missing: {FORCE_VIZ_USD_PATH}")
+            return None
+
+        from pxr import Gf, UsdGeom, Sdf
+
+        parent = parent_path or self.CUSTOM_FORCE_ROOT
+        prim_path = f"{parent}/{name}"
+
+        # parent 가 없으면 session 에 Xform 으로 생성
+        with self._session_edit():
+            parent_prim = stage.GetPrimAtPath(parent)
+            if not parent_prim or not parent_prim.IsValid():
+                stage.DefinePrim(parent, "Xform")
+
+        # 초기 orient: +Z 를 vector 방향으로 회전
+        fx, fy, fz = float(vector[0]), float(vector[1]), float(vector[2])
+        mag = math.sqrt(fx * fx + fy * fy + fz * fz)
+        if mag < 1e-9:
+            orient_q = Gf.Quatd(1.0, 0.0, 0.0, 0.0)
+        else:
+            inv = 1.0 / mag
+            f_hat = Gf.Vec3d(fx * inv, fy * inv, fz * inv)
+            from_vec = Gf.Vec3d(0, 0, 1)
+            d = Gf.Dot(from_vec, f_hat)
+            if d > 1.0 - 1e-9:
+                orient_q = Gf.Quatd(1.0, 0.0, 0.0, 0.0)
+            elif d < -1.0 + 1e-9:
+                orient_q = Gf.Quatd(0.0, Gf.Vec3d(1.0, 0.0, 0.0))
+            else:
+                orient_q = Gf.Rotation(from_vec, f_hat).GetQuat()
+                if not isinstance(orient_q, Gf.Quatd):
+                    im = orient_q.GetImaginary()
+                    orient_q = Gf.Quatd(
+                        float(orient_q.GetReal()),
+                        Gf.Vec3d(float(im[0]), float(im[1]), float(im[2])),
+                    )
+
+        prim = self._create_force_ref_xform(
+            stage, prim_path, FORCE_VIZ_USD_PATH,
+            tuple(float(c) for c in position), orient_q, (1, 1, 1),
+            color if color is not None else REAL_COLOR,
+        )
+        if prim is None:
+            return None
+        self._cache_force_length_ops(prim, prim_path)
+
+        self._custom_force_prims[name] = {
+            "prim": prim,
+            "prim_path": prim_path,
+            "parent_path": parent,
+        }
+
+        # 최초 크기 적용
+        self._apply_force_vector(prim, fx, fy, fz,
+                                 FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE)
+
+        # custom prim 은 기본으로 보이게
+        self._set_visible(prim, True)
+        return prim_path
+
+    def set_custom_force_vector(self, name, position=None, vector=None):
+        """기존 custom vector 의 translate / 방향+크기 갱신.
+
+        position : None 이면 translate 유지. 아니면 (x, y, z) 로 교체.
+        vector   : None 이면 length+orient 유지. 아니면 (fx, fy, fz) 적용.
+        """
+        rec = self._custom_force_prims.get(name)
+        if rec is None:
+            logger.warning(f"[viz] set_custom_force_vector: unknown name '{name}'")
+            return False
+        prim = rec["prim"]
+        if prim is None or not prim.IsValid():
+            logger.debug(f"[viz] set_custom_force_vector: prim invalid '{name}'")
+            return False
+
+        from pxr import Gf, UsdGeom
+
+        if position is not None:
+            try:
+                tv = Gf.Vec3d(float(position[0]), float(position[1]),
+                              float(position[2]))
+                xformable = UsdGeom.Xformable(prim)
+                translate_op = None
+                for op in xformable.GetOrderedXformOps():
+                    if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                        translate_op = op
+                        break
+                with self._session_edit():
+                    if translate_op is None:
+                        translate_op = xformable.AddTranslateOp(
+                            UsdGeom.XformOp.PrecisionDouble
+                        )
+                    try:
+                        is_double = (translate_op.GetPrecision()
+                                     == UsdGeom.XformOp.PrecisionDouble)
+                    except Exception:
+                        is_double = True
+                    if is_double:
+                        translate_op.Set(tv)
+                    else:
+                        translate_op.Set(Gf.Vec3f(float(tv[0]),
+                                                  float(tv[1]),
+                                                  float(tv[2])))
+            except Exception as e:
+                logger.debug(f"[viz] set_custom_force_vector translate warn: {e}")
+
+        if vector is not None:
+            fx, fy, fz = (float(vector[0]), float(vector[1]), float(vector[2]))
+            self._apply_force_vector(prim, fx, fy, fz,
+                                     FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE)
+        return True
+
+    def remove_custom_force_vector(self, name):
+        """custom vector 하나를 stage 에서 제거."""
+        rec = self._custom_force_prims.pop(name, None)
+        if rec is None:
+            return False
+        prim_path = rec.get("prim_path")
+        if prim_path:
+            self._force_length_cache.pop(prim_path, None)
+            self._scale_op_cache.pop(prim_path, None)
+            self._last_scale_cache.pop(prim_path, None)
+            stage = self._get_stage()
+            if stage is not None:
+                try:
+                    with self._session_edit():
+                        stage.RemovePrim(prim_path)
+                except Exception as e:
+                    logger.debug(f"[viz] remove_custom_force_vector warn: {e}")
+        return True
+
+    def clear_custom_force_vectors(self):
+        """모든 custom vector 제거."""
+        for name in list(self._custom_force_prims.keys()):
+            self.remove_custom_force_vector(name)
+
+    def list_custom_force_vectors(self):
+        """등록된 custom vector 이름 리스트."""
+        return list(self._custom_force_prims.keys())
+
+    def _update_custom_force_vectors(self):
+        """update() 훅. 현재는 set_*/add_* 가 즉시 반영하므로 no-op.
+        추후 animated / time-varying vector 지원 시 여기서 step 별 갱신.
+        """
+        return
 
     def _detect_newton_backend(self) -> bool:
         """Newton physics backend 여부를 감지. get_measured_joint_efforts 호출 전 1회 실행."""
@@ -343,6 +543,7 @@ class ForceTorqueVisualizer:
         self._force_viz_prims.clear()
         self._created_prim_paths.clear()
         self._abbr_to_dof_idx.clear()
+        self._custom_force_prims.clear()
 
         self._scale_op_cache.clear()
         self._last_scale_cache.clear()
@@ -360,6 +561,24 @@ class ForceTorqueVisualizer:
             return omni.usd.get_context().get_stage()
         except Exception:
             return None
+
+    def _session_edit(self):
+        """모든 viz prim 편집(Set/Add)을 session layer 에 기록하기 위한 context.
+
+        force/torque 시각화는 저장이 필요 없는 UI 상태이고, 초기 reference 생성이
+        session layer 에 기록되므로 런타임 갱신도 session 에 통일해야 layer
+        composition 충돌이 발생하지 않는다. stage 를 구할 수 없을 때는 no-op
+        context 를 반환해 기본 edit target 으로 동작하게 한다.
+        """
+        import contextlib
+        stage = self._get_stage()
+        if stage is None:
+            return contextlib.nullcontext()
+        try:
+            from pxr import Usd
+            return Usd.EditContext(stage, stage.GetSessionLayer())
+        except Exception:
+            return contextlib.nullcontext()
 
     def _ensure_prims(self):
         """토크 링 + sim force 화살표 prim 생성 (+ real force 캐시)."""
@@ -977,23 +1196,24 @@ class ForceTorqueVisualizer:
                     existing_orient_op = op
                     break
 
-            if existing_orient_op is not None:
-                try:
-                    if existing_orient_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble:
-                        existing_orient_op.Set(q)
-                    else:
-                        existing_orient_op.Set(Gf.Quatf(
-                            float(q.GetReal()),
-                            Gf.Vec3f(float(im[0]), float(im[1]), float(im[2])),
-                        ))
-                except Exception as e:
-                    logger.debug(f"[viz] set existing orient warn: {e}")
-            else:
-                try:
-                    # 기존 op 순서 맨 뒤에 추가 (translate 는 유지, scale 앞)
-                    xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(q)
-                except Exception as e:
-                    logger.debug(f"[viz] add orient op warn: {e}")
+            with self._session_edit():
+                if existing_orient_op is not None:
+                    try:
+                        if existing_orient_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble:
+                            existing_orient_op.Set(q)
+                        else:
+                            existing_orient_op.Set(Gf.Quatf(
+                                float(q.GetReal()),
+                                Gf.Vec3f(float(im[0]), float(im[1]), float(im[2])),
+                            ))
+                    except Exception as e:
+                        logger.debug(f"[viz] set existing orient warn: {e}")
+                else:
+                    try:
+                        # 기존 op 순서 맨 뒤에 추가 (translate 는 유지, scale 앞)
+                        xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(q)
+                    except Exception as e:
+                        logger.debug(f"[viz] add orient op warn: {e}")
         except Exception as e:
             logger.debug(f"[viz] apply_orient_to_existing warn: {e}")
 
@@ -1077,7 +1297,12 @@ class ForceTorqueVisualizer:
             stage = self._get_stage()
             if stage is None:
                 return
+        except Exception as e:
+            logger.debug(f"[viz] cache_force_length_ops pre warn: {e}")
+            return
 
+        try:
+          with self._session_edit():
             shaft_path = f"{prim_path}/{FORCE_VEC_SHAFT_NAME}"
             head_path = f"{prim_path}/{FORCE_VEC_HEAD_NAME}"
             shaft_prim = stage.GetPrimAtPath(shaft_path)
@@ -1090,17 +1315,14 @@ class ForceTorqueVisualizer:
             L_base = float(FORCE_VEC_SHAFT_BASE_LENGTH)
             axis = FORCE_VEC_LENGTH_AXIS
 
-            # --- Shaft: translate + scale (이 순서 — scale 먼저 적용, 그 다음 translate) ---
+            # --- Shaft: translate + scale (한쪽 방향 확장: 원점 0, s=1 → 길이 L_base) ---
             shaft_xformable = UsdGeom.Xformable(shaft_prim)
-            # 기존 op 제거 후 재구성 (순서 강제를 위해).
             shaft_xformable.ClearXformOpOrder()
 
             shaft_translate_op = shaft_xformable.AddTranslateOp(
                 UsdGeom.XformOp.PrecisionDouble,
             )
-            shaft_t_init = [0.0, 0.0, 0.0]
-            shaft_t_init[axis] = -L_base / 2.0
-            shaft_translate_op.Set(Gf.Vec3d(*shaft_t_init))
+            shaft_translate_op.Set(Gf.Vec3d(0.0, 0.0, 0.0))  # 원점 고정
 
             shaft_scale_op = shaft_xformable.AddScaleOp(UsdGeom.XformOp.PrecisionDouble)
             shaft_scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
@@ -1117,14 +1339,78 @@ class ForceTorqueVisualizer:
                     UsdGeom.XformOp.PrecisionDouble,
                 )
             head_t_init = [0.0, 0.0, 0.0]
-            head_t_init[axis] = -L_base / 2.0  # s=1 → L_base*(1-2)/2 = -L_base/2
+            head_t_init[axis] = 0.0  # s=1 → L_base*(1-1)=0, head 는 원본 그 자리
             head_translate_op.Set(Gf.Vec3d(*head_t_init))
+
+            # Root prim (force arrow 자체) 의 orient op 를 찾아 캐시.
+            # _create_force_ref_xform 에서 identity 에 가까우면 AddOrientOp 생략하므로
+            # 여기서 없으면 identity 로 강제 추가 (update 에서 갱신 가능하게).
+            root_orient_op = None
+            try:
+                root_xformable = UsdGeom.Xformable(prim)
+                existing_ops = list(root_xformable.GetOrderedXformOps())
+                for op in existing_ops:
+                    if op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                        root_orient_op = op
+                        break
+                if root_orient_op is None:
+                    # orient op 없음 → 기존 op 순서 유지한 채 orient 를
+                    # translate 뒤 / scale 앞 위치에 삽입.
+                    # USD 는 XformOp 재정렬이 어려워 ClearXformOpOrder 후 재구성.
+                    old_tuples = []
+                    for op in existing_ops:
+                        try:
+                            val = op.Get()
+                        except Exception:
+                            val = None
+                        old_tuples.append((op, val))
+
+                    root_xformable.ClearXformOpOrder()
+                    translate_readded = False
+                    for op, val in old_tuples:
+                        t = op.GetOpType()
+                        if t == UsdGeom.XformOp.TypeTranslate:
+                            new_op = root_xformable.AddTranslateOp(op.GetPrecision())
+                            if val is not None:
+                                new_op.Set(val)
+                            translate_readded = True
+                            break
+                    # orient 삽입 (identity)
+                    root_orient_op = root_xformable.AddOrientOp(
+                        UsdGeom.XformOp.PrecisionDouble
+                    )
+                    root_orient_op.Set(Gf.Quatd(1.0, 0.0, 0.0, 0.0))
+                    # 나머지 op 재추가 (translate 는 이미 추가됨, 제외)
+                    for op, val in old_tuples:
+                        t = op.GetOpType()
+                        if t == UsdGeom.XformOp.TypeTranslate and translate_readded:
+                            continue
+                        new_op = None
+                        if t == UsdGeom.XformOp.TypeScale:
+                            new_op = root_xformable.AddScaleOp(op.GetPrecision())
+                        elif t == UsdGeom.XformOp.TypeRotateXYZ:
+                            new_op = root_xformable.AddRotateXYZOp(op.GetPrecision())
+                        elif t == UsdGeom.XformOp.TypeOrient:
+                            continue  # 이미 추가됨
+                        elif t == UsdGeom.XformOp.TypeTranslate:
+                            new_op = root_xformable.AddTranslateOp(op.GetPrecision())
+                        # 기타 op 는 스킵
+                        if new_op is not None and val is not None:
+                            try:
+                                new_op.Set(val)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug(f"[viz] root orient op setup warn ({prim_path}): {e}")
+                root_orient_op = None
 
             self._force_length_cache[prim_path] = {
                 "shaft_scale_op": shaft_scale_op,
                 "shaft_translate_op": shaft_translate_op,
                 "head_translate_op": head_translate_op,
+                "root_orient_op": root_orient_op,
                 "last_scale": None,
+                "last_orient": None,
             }
         except Exception as e:
             logger.debug(f"[viz] cache_force_length_ops warn ({prim_path}): {e}")
@@ -1215,10 +1501,11 @@ class ForceTorqueVisualizer:
                 is_double = scale_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
             except Exception:
                 is_double = True
-            if is_double:
-                scale_op.Set(Gf.Vec3d(s, s, s))
-            else:
-                scale_op.Set(Gf.Vec3f(s, s, s))
+            with self._session_edit():
+                if is_double:
+                    scale_op.Set(Gf.Vec3d(s, s, s))
+                else:
+                    scale_op.Set(Gf.Vec3f(s, s, s))
             if prim_path is not None:
                 self._last_scale_cache[prim_path] = s
         except Exception as e:
@@ -1263,40 +1550,116 @@ class ForceTorqueVisualizer:
                 is_double = shaft_scale_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
             except Exception:
                 is_double = True
-            if is_double:
-                shaft_scale_op.Set(Gf.Vec3d(*scale_vec))
-            else:
-                shaft_scale_op.Set(Gf.Vec3f(*scale_vec))
 
-            # --- Shaft translate (대칭 중심화: -L_base*s/2) ---
+            # --- Shaft translate (한쪽 방향 확장: 원점 0 고정) ---
+            # origin 에서 +axis 방향으로만 자라도록 translate=0 유지.
+            # shaft 는 원점(0)..L_base*s 까지 뻗어 나감.
+            shaft_t = [0.0, 0.0, 0.0]
             if shaft_translate_op is not None:
-                shaft_t = [0.0, 0.0, 0.0]
-                shaft_t[axis] = -L_base * s / 2.0
                 try:
                     is_double_st = (shaft_translate_op.GetPrecision()
                                     == UsdGeom.XformOp.PrecisionDouble)
                 except Exception:
                     is_double_st = True
-                if is_double_st:
-                    shaft_translate_op.Set(Gf.Vec3d(*shaft_t))
-                else:
-                    shaft_translate_op.Set(Gf.Vec3f(*shaft_t))
+            else:
+                is_double_st = True
 
-            # --- Head translate (shaft 상단에 바닥이 얹히도록: L_base*(s-2)/2) ---
+            # --- Head translate (shaft 끝에 바닥이 얹히도록: L_base*(s-1)) ---
+            # 원래 head mesh 는 Z=L_base 부터 시작. translate 없을 때 shaft 끝과 일치.
+            # shaft scale=s → shaft 끝 Z=L_base*s. 거기로 맞추려면 translate=L_base*(s-1).
             head_t = [0.0, 0.0, 0.0]
-            head_t[axis] = L_base * (s - 2.0) / 2.0
+            head_t[axis] = L_base * (s - 1.0)
             try:
                 is_double_h = head_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
             except Exception:
                 is_double_h = True
-            if is_double_h:
-                head_op.Set(Gf.Vec3d(*head_t))
-            else:
-                head_op.Set(Gf.Vec3f(*head_t))
+
+            with self._session_edit():
+                if is_double:
+                    shaft_scale_op.Set(Gf.Vec3d(*scale_vec))
+                else:
+                    shaft_scale_op.Set(Gf.Vec3f(*scale_vec))
+                if shaft_translate_op is not None:
+                    if is_double_st:
+                        shaft_translate_op.Set(Gf.Vec3d(*shaft_t))
+                    else:
+                        shaft_translate_op.Set(Gf.Vec3f(*shaft_t))
+                if is_double_h:
+                    head_op.Set(Gf.Vec3d(*head_t))
+                else:
+                    head_op.Set(Gf.Vec3f(*head_t))
 
             cache["last_scale"] = s
         except Exception as e:
             logger.debug(f"[viz] apply_force_scale warn: {e}")
+
+    # ------------------------------------------------------------------
+    # 3D force vector → arrow length + orientation
+    # ------------------------------------------------------------------
+    def _apply_force_vector(self, prim, fx: float, fy: float, fz: float,
+                            gain: float, lo: float, hi: float):
+        """force vector (fx, fy, fz) 를 받아 arrow 의 길이 + 방향 갱신.
+
+        - 길이: _apply_force_scale(magnitude) 로 Shaft/Head scale 변경
+        - 방향: root prim 의 orient op 을 +Z → unit(F) 로 회전
+        force_vec.usda 의 shaft 는 local +Z 방향이므로 +Z 를 F_hat 으로
+        돌리면 arrow 가 force vector 방향을 가리킨다. vector 는
+        **arrow 의 parent (= link) local frame** 기준으로 해석됨.
+        """
+        if prim is None:
+            return
+        import math
+        magnitude = math.sqrt(fx * fx + fy * fy + fz * fz)
+
+        # 1) 길이
+        self._apply_force_scale(prim, magnitude, gain, lo, hi)
+
+        # 2) 방향 (magnitude 너무 작으면 orient 유지)
+        if magnitude < 1e-9:
+            return
+        try:
+            prim_path = prim.GetPath().pathString
+        except Exception:
+            return
+        cache = self._force_length_cache.get(prim_path) if prim_path else None
+        if cache is None:
+            return
+        orient_op = cache.get("root_orient_op")
+        if orient_op is None:
+            return
+
+        try:
+            from pxr import Gf, UsdGeom
+            inv = 1.0 / magnitude
+            f_hat = Gf.Vec3d(fx * inv, fy * inv, fz * inv)
+            from_vec = Gf.Vec3d(0, 0, 1)
+            d = Gf.Dot(from_vec, f_hat)
+            if d > 1.0 - 1e-9:
+                orient = Gf.Quatd(1.0, 0.0, 0.0, 0.0)
+            elif d < -1.0 + 1e-9:
+                orient = Gf.Quatd(0.0, Gf.Vec3d(1.0, 0.0, 0.0))
+            else:
+                orient = Gf.Rotation(from_vec, f_hat).GetQuat()
+
+            im = orient.GetImaginary()
+            key = (float(orient.GetReal()), float(im[0]), float(im[1]), float(im[2]))
+            last = cache.get("last_orient")
+            if last is not None and all(abs(a - b) < 1e-6 for a, b in zip(last, key)):
+                return
+
+            try:
+                is_double = orient_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
+            except Exception:
+                is_double = True
+
+            with self._session_edit():
+                if is_double:
+                    orient_op.Set(orient)
+                else:
+                    orient_op.Set(Gf.Quatf(orient))
+            cache["last_orient"] = key
+        except Exception as e:
+            logger.debug(f"[viz] apply_force_vector orient warn: {e}")
 
     def _apply_visibility(self):
         """force / torque 가시성 반영. 두 경로 독립.
