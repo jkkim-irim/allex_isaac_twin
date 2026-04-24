@@ -153,9 +153,13 @@ class TorquePlotter:
         physics_hz: float = _DEFAULT_PHYSICS_HZ,
         window_s: float = _DEFAULT_WINDOW_SECONDS,
         plot_hz: float = 50.0,
+        ff_manager=None,
     ):
         self._articulation = articulation
         self._ff_provider = ff_provider
+        # FeedforwardTorqueManager — ``apply_step`` 에서 ``read_current()`` 로
+        # control.joint_f 의 ground-truth FF 를 읽는 데 사용.
+        self._ff_manager = ff_manager
         self._subset = subset
         self._physics_hz = float(physics_hz)
         self._window_s = float(window_s)
@@ -346,10 +350,19 @@ class TorquePlotter:
     def apply_step(self, dt: float) -> None:
         """Called on Isaac Sim main thread per physics step.
 
-        Recomputes τ_total, then pushes a sample frame to the subprocess
-        if it is alive. Silent no-op when subprocess isn't running — this
-        lets ``scenario._push_torque_sample`` call both body/hand plotters
+        Reads the simulation's actual applied torque per DOF and pushes a sample
+        frame. Silent no-op when subprocess isn't running — this lets
+        ``scenario._push_torque_sample`` call both body/hand plotters
         unconditionally.
+
+        소스: Newton MuJoCo solver 가 실제 joint 에 가하는 총 torque.
+
+          τ_total_sim  =  state_0.mujoco.qfrc_actuator   (PD clipping 후 출력)
+                       +  control.joint_f                 (사용자 feedforward)
+
+        PD 재계산 (kp*Δp + kd*Δv + τ_ff) 경로는 수치가 실제 solver 내부 clipping /
+        limits / equality constraint 보정 전이라 "simulation 이 진짜 내는 힘" 과
+        다를 수 있다. 아래처럼 state 에서 직접 읽는 편이 진실에 가까움.
         """
         self._step_count += 1
         if not self.is_running():
@@ -360,69 +373,68 @@ class TorquePlotter:
         if self._step_count % self._decim != 0:
             return
 
+        # --- qfrc_actuator (PD clipping 후 solver 가 쓰는 실제 torque) ----
+        # Wrapper: SingleArticulation.get_applied_joint_efforts() 가 패치된
+        # articulation_view.get_dof_actuation_forces() 를 통해 내부적으로
+        # state_0.mujoco.qfrc_actuator 를 읽어옴.
+        num = self._num_dof
+        tau_pd_act = None
         try:
-            view = getattr(self._articulation, "_articulation_view", None)
-            if view is None:
-                if self._step_count % (200 * self._decim) == 0:
-                    print(f"[ALLEX][TorquePlot {self._subset}] drop: no _articulation_view")
-                return
-
-            pos = _to_np(view.get_joint_positions())
-            vel = _to_np(view.get_joint_velocities())
-            kps, kds = view.get_gains()
-            kp_vec = _to_np(kps)
-            kd_vec = _to_np(kds)
-            actions = view.get_applied_actions(clone=False)
-            pos_tgt = _to_np(actions.joint_positions) if actions is not None else None
-            vel_tgt = _to_np(actions.joint_velocities) if actions is not None else None
+            arr = self._articulation.get_applied_joint_efforts()
+            if arr is not None:
+                a = _to_np(arr)
+                if a is not None and a.ndim == 2:
+                    a = a[0]
+                if a is not None:
+                    tau_pd_act = np.asarray(a, dtype=np.float32).reshape(-1)
         except Exception as exc:
             if self._step_count % (200 * self._decim) == 0:
-                print(f"[ALLEX][TorquePlot {self._subset}] read failed: {exc}")
-            return
+                print(f"[ALLEX][TorquePlot {self._subset}] "
+                      f"get_applied_joint_efforts failed: {exc}")
 
-        if pos is None or kp_vec is None or kd_vec is None or pos_tgt is None:
-            if self._step_count % 200 == 0:
-                sizes = (
-                    None if pos is None else pos.size,
-                    None if kp_vec is None else kp_vec.size,
-                    None if kd_vec is None else kd_vec.size,
-                    None if pos_tgt is None else pos_tgt.size,
-                )
-                print(f"[ALLEX][TorquePlot {self._subset}] drop: None input "
-                      f"(pos,kp,kd,pos_tgt)={sizes}")
-            return
-        if vel is None:
-            vel = np.zeros_like(pos)
-        if vel_tgt is None:
-            vel_tgt = np.zeros_like(pos)
-
-        num = self._num_dof
-        if (
-            pos.size < num or vel.size < num or kp_vec.size < num or kd_vec.size < num
-            or pos_tgt.size < num
-        ):
-            return
-        pos = pos[:num]
-        vel = vel[:num]
-        kp_vec = kp_vec[:num]
-        kd_vec = kd_vec[:num]
-        pos_tgt = pos_tgt[:num]
-        vel_tgt = vel_tgt[:num] if vel_tgt.size >= num else np.zeros(num, dtype=np.float32)
-
-        tau_pd = kp_vec * (pos_tgt - pos) + kd_vec * (vel_tgt - vel)
-
+        # --- joint_f (ground-truth FF, 모든 writer 합산 결과) -------------
+        # Wrapper: FeedforwardTorqueManager.read_current() — control.joint_f 를
+        # 직접 읽어 return. 여러 writer (this manager, RuntimeGainFFController,
+        # 외부 script 등) 의 최종 합산 상태.
         tau_ff = np.zeros(num, dtype=np.float32)
-        if self._ff_provider is not None:
+        ff_mgr = self._ff_manager
+        if ff_mgr is not None:
             try:
-                ff = self._ff_provider()
-                if ff is not None:
-                    ff = np.asarray(ff, dtype=np.float32).reshape(-1)
-                    if ff.size >= num:
-                        tau_ff = ff[:num]
+                arr = ff_mgr.read_current()
+                if arr is not None and arr.size >= num:
+                    tau_ff = arr[:num]
             except Exception as exc:
-                logger.debug(f"ff_provider failed: {exc}")
+                if self._step_count % (200 * self._decim) == 0:
+                    print(f"[ALLEX][TorquePlot {self._subset}] "
+                          f"ff_manager.read_current failed: {exc}")
 
-        tau_total = (tau_pd + tau_ff).astype(np.float32)
+        # qfrc_actuator 가 아직 채워지지 않은 초기 몇 step 은 skip.
+        if tau_pd_act is None or tau_pd_act.size < num:
+            if self._step_count % (200 * self._decim) == 0:
+                size = None if tau_pd_act is None else int(tau_pd_act.size)
+                print(f"[ALLEX][TorquePlot {self._subset}] qfrc_actuator unavailable "
+                      f"(size={size}, need>={num}). "
+                      f"Newton patch 가 빠졌거나 아직 build 전일 수 있음.")
+            return
+
+        tau_total = (tau_pd_act[:num] + tau_ff[:num]).astype(np.float32)
+
+        # --- (legacy, 참고용) PD 재계산 경로 — 주석 보존 ----------------
+        # try:
+        #     view = getattr(self._articulation, "_articulation_view", None)
+        #     pos = _to_np(view.get_joint_positions())
+        #     vel = _to_np(view.get_joint_velocities())
+        #     kps, kds = view.get_gains()
+        #     kp_vec = _to_np(kps)
+        #     kd_vec = _to_np(kds)
+        #     actions = view.get_applied_actions(clone=False)
+        #     pos_tgt = _to_np(actions.joint_positions)
+        #     vel_tgt = _to_np(actions.joint_velocities)
+        # except Exception:
+        #     pass
+        # tau_pd  = kp_vec * (pos_tgt - pos) + kd_vec * (vel_tgt - vel)
+        # tau_ff_cb = self._ff_provider() if self._ff_provider else 0
+        # tau_total = (tau_pd + tau_ff_cb).astype(np.float32)
 
         effective_dt = (float(dt) if dt else (1.0 / self._physics_hz)) * self._decim
         self._sim_time += effective_dt

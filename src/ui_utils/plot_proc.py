@@ -286,14 +286,23 @@ def main() -> int:
                 n = min(t_arr.size, y_arr.size)
                 if n == 0:
                     continue
-                ln.set_data(t_arr[-n:], y_arr[-n:])
+                t_tail = t_arr[-n:]
+                y_tail = y_arr[-n:]
+                # Restrict to samples inside the visible window. deque retains
+                # more history than window_sec if plot_hz was lowered at
+                # runtime — those stale samples must not drive autoscale.
+                mask = t_tail >= t_min
+                if not mask.any():
+                    continue
+                t_vis = t_tail[mask]
+                y_vis = y_tail[mask]
+                ln.set_data(t_vis, y_vis)
                 updated.append(ln)
-                # Exclude hidden lines from y-autoscale so user-selected
-                # joints dominate the visible range.
+                # Exclude hidden lines from y-autoscale.
                 if not ln.get_visible():
                     continue
-                y_min = min(y_min, float(y_arr[-n:].min()))
-                y_max = max(y_max, float(y_arr[-n:].max()))
+                y_min = min(y_min, float(y_vis.min()))
+                y_max = max(y_max, float(y_vis.max()))
             ax.set_xlim(t_min, t_last + 1e-3)
             if y_min != float("inf") and y_max != float("-inf"):
                 if y_min == y_max:

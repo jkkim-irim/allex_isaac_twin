@@ -169,6 +169,7 @@ class ALLEXDigitalTwin:
         try:
             self._visualizer.attach_articulation(
                 self._articulation, self._joint_controller,
+                ff_manager=self._ff_manager,
             )
             print("ForceTorqueVisualizer articulation attached")
         except Exception as e:
@@ -301,6 +302,7 @@ class ALLEXDigitalTwin:
                 articulation=self._articulation,
                 ff_provider=ff_provider,
                 subset="body",
+                ff_manager=self._ff_manager,
             )
             register_singleton("body", self._torque_plotter_body)
         except Exception as exc:
@@ -312,6 +314,7 @@ class ALLEXDigitalTwin:
                 articulation=self._articulation,
                 ff_provider=ff_provider,
                 subset="hand",
+                ff_manager=self._ff_manager,
             )
             register_singleton("hand", self._torque_plotter_hand)
         except Exception as exc:

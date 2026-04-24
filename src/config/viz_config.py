@@ -77,7 +77,7 @@ def _ring_offset_for(joint_name: str) -> float:
 # ========================================
 # Force 화살표 스케일
 # ========================================
-FORCE_GAIN = 0.1
+FORCE_GAIN = 0.5
 FORCE_MIN_SCALE = -3.0
 FORCE_MAX_SCALE = 3.0
 

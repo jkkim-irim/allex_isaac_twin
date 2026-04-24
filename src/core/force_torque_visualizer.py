@@ -96,6 +96,9 @@ class ForceTorqueVisualizer:
         self._articulation = articulation
         self._joint_controller = joint_controller
         self._stage = stage
+        # FeedforwardTorqueManager — update() 에서 control.joint_f 의 ground-truth
+        # FF 를 읽어 qfrc_actuator 와 합산하는 데 사용. scenario 가 attach 시 주입.
+        self._ff_manager = None
 
         # 상태 — 기본 OFF. UI 토글을 눌러야 표시된다.
         self._mode = "off"          # off / real / sim / both  (force arrow)
@@ -145,8 +148,8 @@ class ForceTorqueVisualizer:
         except Exception as e:
             logger.warning(f"[viz] early _ensure_prims failed: {e}")
 
-    def attach_articulation(self, articulation, joint_controller=None):
-        """articulation/joint_controller 를 지연 주입. dof 매핑 LUT 를 재구축한다.
+    def attach_articulation(self, articulation, joint_controller=None, ff_manager=None):
+        """articulation/joint_controller/ff_manager 를 지연 주입. dof 매핑 LUT 를 재구축한다.
 
         prim 은 이미 __init__ 에서 생성되어 있을 것이므로 건드리지 않는다. 재호출
         (reset 등) 도 안전하다.
@@ -154,6 +157,8 @@ class ForceTorqueVisualizer:
         self._articulation = articulation
         if joint_controller is not None:
             self._joint_controller = joint_controller
+        if ff_manager is not None:
+            self._ff_manager = ff_manager
         # prim 이 아직 안 만들어졌다면 지금이라도 생성 시도
         if not self._prims_initialized:
             try:
@@ -218,17 +223,44 @@ class ForceTorqueVisualizer:
             self._newton_backend = self._detect_newton_backend()
 
         # --- sim torque ---
-        # get_applied_joint_efforts() → Articulation._physics_view.get_dof_actuation_forces()
-        # Newton/PhysX 모두 동일 공개 API 경로 사용.
+        # 총 joint torque = qfrc_actuator (PD clipping 후) + control.joint_f (FF).
+        #   - get_applied_joint_efforts() → articulation_view.get_dof_actuation_forces()
+        #     → state_0.mujoco.qfrc_actuator 만. FF (control.joint_f) 는 포함 안 됨.
+        #   - FF 는 FeedforwardTorqueManager.read_current() 로 control.joint_f 직접 조회.
+        #     (torque_plotter 와 동일 경로 — plot/ring 이 같은 소스를 보도록 통일)
         sim_torques = None
         if have_articulation:
             try:
-                sim_torques = self._articulation.get_applied_joint_efforts()
-                if sim_torques is not None and hasattr(sim_torques, "shape"):
-                    if len(sim_torques.shape) == 2:
-                        sim_torques = sim_torques[0]
+                qfrc = self._articulation.get_applied_joint_efforts()
+                if qfrc is not None and hasattr(qfrc, "shape"):
+                    if len(qfrc.shape) == 2:
+                        qfrc = qfrc[0]
+                # torch → numpy 변환 (후속 합산 일관성)
+                if qfrc is not None:
+                    try:
+                        import torch  # noqa: F401
+                        if hasattr(qfrc, "detach"):
+                            qfrc = qfrc.detach().cpu().numpy()
+                    except Exception:
+                        pass
+                sim_torques = qfrc
             except Exception as e:
                 logger.debug(f"[viz] get_applied_joint_efforts failed: {e}")
+
+            # FF 합산 (ff_manager 가 attach 된 경우)
+            if self._ff_manager is not None and sim_torques is not None:
+                try:
+                    ff = self._ff_manager.read_current()
+                    if ff is not None and hasattr(sim_torques, "shape"):
+                        n = min(len(ff), sim_torques.shape[-1])
+                        if n > 0:
+                            # sim_torques 는 numpy/torch 혼재 가능 — 안전하게 numpy 로.
+                            import numpy as _np
+                            _st = _np.asarray(sim_torques, dtype=_np.float32).reshape(-1)
+                            _st[:n] = _st[:n] + ff[:n].astype(_np.float32)
+                            sim_torques = _st
+                except Exception as e:
+                    logger.debug(f"[viz] ff_manager.read_current failed: {e}")
 
         # --- real torque (dict by abbr) ---
         real_snapshot = {}
@@ -724,9 +756,13 @@ class ForceTorqueVisualizer:
 
         B1 idempotency: 이미 authored reference 가 있으면 AddReference skip,
         이미 같은 displayColor 면 Set skip.
+
+        Layer 정책: viz prim 은 저장 불필요한 UI 이므로 전부 session layer 에 authored.
+        _create_force_ref_xform 과 일관성 유지 (런타임 _apply_scale / _apply_force_* 도 session).
         """
         from pxr import UsdGeom, Gf
         try:
+          with self._session_edit():
             prim = stage.GetPrimAtPath(prim_path)
             if not prim or not prim.IsValid():
                 prim = stage.DefinePrim(prim_path, "Xform")
@@ -1501,6 +1537,8 @@ class ForceTorqueVisualizer:
                 is_double = scale_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
             except Exception:
                 is_double = True
+            # torque ring / force viz 모두 초기 setup (_create_[force_]ref_xform) 이
+            # session layer 에 authored 하므로 런타임 Set 도 session 으로 통일.
             with self._session_edit():
                 if is_double:
                     scale_op.Set(Gf.Vec3d(s, s, s))

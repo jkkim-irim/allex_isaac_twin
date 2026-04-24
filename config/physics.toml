@@ -42,6 +42,12 @@
 # bounce_threshold = 2.0
 # friction_offset_threshold = 0.04
 # time_steps_per_second = 50
+#
+# NOTE: physics Hz 조정은 `src/config/ui_config.py` 의 `UIConfig.PHYSICS_DT` 를
+# 쓰세요. Scene Loader 가 World(physics_dt=...) 로 전달해 /physicsScene.
+# timeStepsPerSecond 를 자동 authored 합니다. 여기서 `time_steps_per_second`
+# 를 켜면 World 가 쓴 값 뒤에 한번 더 덮어쓰는 redundant writer 가 되어 혼란
+# (디버깅 시 어느 값이 이기는지 추적해야 함) 을 유발하니 권장하지 않음.
 
 # ==========================================================================
 # Newton Physics — isaacsim.physics.newton.NewtonConfig
@@ -64,9 +70,14 @@ pd_scale = 0.017453292519943295  # π / 180
 # Common NewtonConfig fields (uncomment to override):
 # num_substeps = 1
 # debug_mode = false
-use_cuda_graph = false                 # RTX 5080 (sm_100): CUDA graph capture 불안정 → 비활성화
+use_cuda_graph = false                 # true 로 두면 `state_0.mujoco.qfrc_actuator` 가 매 step 갱신 안 되어 torque ring / torque plot 이 전부 0 으로 보임 (2026-04-24 RTX 5080/Newton 0.6.0 재현). solver_mujoco.py:3397-3421 의 state copy 가 graph replay 경로에서 생략되는 것으로 추정. NewtonConfig.use_cuda_graph default=True 이므로 주석 처리하면 켜진 상태로 fallback → 반드시 명시적 false 유지.
 # time_step_app = true
-# physics_frequency = 600.0              # Hz (null/absent = use USD timeStepsPerSecond)
+# physics_frequency 는 NewtonConfig.physics_frequency (Python 레벨) 로만 들어감.
+# 실측(2026-04-24, Isaac Sim 6.0.0-rc.22 + Newton 0.6.0): USD /physicsScene.*:timeStepsPerSecond
+# 가 authored 되어 있으면 USD 값이 항상 이김. 여기 값은 USD 에 timestep 이 없을 때
+# fallback default 로만 쓰임. 실제 physics Hz 조정은 위 [usd.physics_scene.physx] 섹션의
+# time_steps_per_second 로 하면 됨 (우리 코드가 newton:*/mjc:* 도 동시 authored).
+# physics_frequency = 600.0              # Hz — USD fallback default (USD authored 되면 무시됨)
 # update_fabric = true
 # disable_physx_fabric_tracker = true
 # collapse_fixed_joints = false
