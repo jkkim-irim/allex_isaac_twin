@@ -287,7 +287,7 @@
     }
   ],
   "coupled_joints": {},
-  "_joint_friction": {
+  "joint_friction": {
     "_comment": "DISABLED for testing — rename key back to 'joint_friction' to re-enable. Loader (_load_friction) only looks at 'joint_friction'; any other key name is auto-skipped. Fields: static/dynamic (N·m for revolute / N for prismatic, Coulomb dry friction), viscous (N·m/(rad/s) or N/(m/s)). Newton uses 'dynamic' only (→ Model.joint_friction → MuJoCo dof_frictionloss). static/viscous are PhysX-only and ignored under Newton. Keys starting with '_' are metadata.",
     "_example_L_Elbow_Joint": { "static": 0.5, "dynamic": 0.3, "viscous": 0.01 },
 
