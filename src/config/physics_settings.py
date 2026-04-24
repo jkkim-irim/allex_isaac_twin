@@ -70,6 +70,23 @@ def get_armature_overrides() -> dict[str, float]:
         return {}
 
 
+def get_actuator_gravcomp_cfg() -> dict[str, Any]:
+    """Return [allex.actuator_gravcomp] section with safe defaults.
+
+    Keys:
+        enabled (bool): 전역 on/off. 변경 후 stage reload 필요.
+        joints (list[str]): 대상 joint short-name 목록. 빈 리스트 → 모든 active joint.
+    """
+    cfg = _load().get("allex", {}).get("actuator_gravcomp", {}) or {}
+    enabled = bool(cfg.get("enabled", False))
+    joints_raw = cfg.get("joints", []) or []
+    try:
+        joints = [str(x) for x in joints_raw]
+    except Exception:
+        joints = []
+    return {"enabled": enabled, "joints": joints}
+
+
 # ---------------------------------------------------------------------------
 # Newton cfg applier
 # ---------------------------------------------------------------------------

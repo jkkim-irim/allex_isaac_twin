@@ -142,3 +142,20 @@ default_armature = 0.01
 Waist_Upper_Pitch_Joint = 2.0
 Waist_Pitch_Dummy_Joint = 2.0
 Waist_Lower_Pitch_Joint = 0.5
+
+# ==========================================================================
+# Actuator gravity compensation (MuJoCo jnt_actgravcomp)
+# ==========================================================================
+# MuJoCo 의 actuator-level gravity compensation. 켜진 joint 의 PD actuator 가
+# 자기 축 중력 항을 자동으로 출력에 편입 → 실기 컨트롤러의 `τ_cmd = τ_PD +
+# τ_grav(q)` 구조를 sim 에서 재현하는 데 사용.
+#
+# ⚠ 켜지면 `qfrc_actuator` 값에 PD 출력과 중력보상이 **합산**되어 나옴. torque
+#    plot 해석 주의 (순수 PD 값이 아님). 완전 분리가 필요하면 대신
+#    `control.joint_f` 에 직접 gravity FF 를 쓰는 경로 권장.
+#
+[allex.actuator_gravcomp]
+enabled = false
+# 대상 joint 목록 (articulation dof_name 기준, short name).
+# 빈 배열이면 모든 active joint 에 일괄 적용. 특정 joint 만 켜려면 이름 나열.
+joints = []
