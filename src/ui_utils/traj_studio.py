@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import omni.ui as ui
 from isaacsim.gui.components.element_wrappers import CollapsableFrame
 from isaacsim.gui.components.ui_utils import get_style
@@ -20,9 +21,11 @@ from ..trajectory import TrajectoryPlayer
 _EXT_ROOT = Path(__file__).resolve().parent.parent.parent
 _TRAJECTORY_DIR = _EXT_ROOT / "trajectory"
 
+_RESET_RAMP_S = 3.0
+
 
 class TrajStudioControls:
-    """Traj Studio collapsable section — Dropdown / Refresh / Run / Stop."""
+    """Traj Studio collapsable section — Dropdown / Run / Stop / Reset."""
 
     def __init__(self, ui_ref):
         self._ui = ui_ref
@@ -43,14 +46,6 @@ class TrajStudioControls:
                     self._combo_frame = ui.Frame()
                     self._rebuild_combo()
 
-                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
-                    UIComponentFactory.create_styled_button(
-                        "Refresh",
-                        callback=self._on_refresh,
-                        color_scheme="blue",
-                        height=UILayout.BUTTON_HEIGHT,
-                    )
-
                 UIComponentFactory.create_separator(UILayout.SEPARATOR_HEIGHT)
 
                 with ui.HStack(height=UILayout.BUTTON_HEIGHT_LARGE):
@@ -64,6 +59,12 @@ class TrajStudioControls:
                         "Stop",
                         callback=self._on_stop,
                         color_scheme="yellow",
+                        height=UILayout.BUTTON_HEIGHT,
+                    )
+                    UIComponentFactory.create_styled_button(
+                        "Reset",
+                        callback=self._on_reset,
+                        color_scheme="blue",
                         height=UILayout.BUTTON_HEIGHT,
                     )
 
@@ -119,33 +120,51 @@ class TrajStudioControls:
         return None
 
     # ------------------------------------------------------------------
-    # Button callbacks
+    # Helpers
     # ------------------------------------------------------------------
     def _set_status(self, text: str) -> None:
         if self._status_label is not None:
             self._status_label.text = text
         print(f"[ALLEX][Traj] {text}")
 
-    def _on_refresh(self) -> None:
-        self._rebuild_combo()
-        self._set_status(f"Status: scanned {len(self._items)} group(s)")
+    def _resolve_articulation(self) -> "tuple[object, object] | tuple[None, None]":
+        """Return (scenario, articulation) ready for playback, or (None, None) on failure."""
+        scenario = getattr(self._ui, "_scenario", None)
+        if scenario is None:
+            self._set_status("Status: scenario not ready")
+            return None, None
+        articulation = scenario._asset_manager.get_articulation()
+        if articulation is None:
+            self._set_status("Status: load robot (LOAD) + start sim (RUN) first")
+            return None, None
+        if not getattr(articulation, "dof_names", None):
+            self._set_status("Status: articulation not initialized — press RUN first")
+            return None, None
+        return scenario, articulation
 
+    def _query_physics_hz(self, default: float = 200.0) -> float:
+        try:
+            from isaacsim.physics.newton import acquire_stage
+            st = acquire_stage()
+            if st is not None:
+                f = getattr(st, "physics_frequency", None)
+                if f and f > 0:
+                    return float(f)
+        except Exception as exc:
+            print(f"[ALLEX][Traj] physics_frequency query failed: {exc}; using hz={default}")
+        return default
+
+    # ------------------------------------------------------------------
+    # Button callbacks
+    # ------------------------------------------------------------------
     def _on_run(self) -> None:
         group = self._get_selected_group()
         if group is None:
             self._set_status("Status: no group selected")
             return
 
-        scenario = getattr(self._ui, "_scenario", None)
+        scenario, articulation = self._resolve_articulation()
         if scenario is None:
-            self._set_status("Status: scenario not ready")
-            return
-        articulation = scenario._asset_manager.get_articulation()
-        if articulation is None:
-            self._set_status("Status: load robot (LOAD) + start sim (RUN) first")
-            return
-        if not getattr(articulation, "dof_names", None):
-            self._set_status("Status: articulation not initialized — press RUN first")
             return
 
         # Prefer the initializer's neutral pose as the seed; it avoids
@@ -157,17 +176,8 @@ class TrajStudioControls:
 
         # Match dense-trajectory sample rate to physics step rate, otherwise
         # playback runs slower/faster than real-time (one sample consumed per
-        # physics step). Query Newton stage for actual physics_frequency.
-        hz = 200.0
-        try:
-            from isaacsim.physics.newton import acquire_stage
-            st = acquire_stage()
-            if st is not None:
-                f = getattr(st, "physics_frequency", None)
-                if f and f > 0:
-                    hz = float(f)
-        except Exception as exc:
-            print(f"[ALLEX][Traj] physics_frequency query failed: {exc}; using hz={hz}")
+        # physics step).
+        hz = self._query_physics_hz()
 
         csv_dir = _TRAJECTORY_DIR / group
         player = TrajectoryPlayer(csv_dir, articulation, hz=hz, seed_pose=seed_pose)
@@ -191,3 +201,20 @@ class TrajStudioControls:
             return
         player.stop()
         self._set_status("Status: Stopped (holding current target)")
+
+    def _on_reset(self) -> None:
+        scenario, articulation = self._resolve_articulation()
+        if scenario is None:
+            return
+        hz = self._query_physics_hz()
+        num_dof = int(getattr(articulation, "num_dof", 0) or 0)
+        if num_dof <= 0:
+            self._set_status("Status: articulation has no dof")
+            return
+        zero_pose = np.zeros(num_dof, dtype=np.float32)
+        player = TrajectoryPlayer.hold_pose(
+            articulation, hz=hz, target_pose=zero_pose, ramp_s=_RESET_RAMP_S,
+        )
+        scenario.set_trajectory_player(player)
+        player.start()
+        self._set_status(f"Status: Reset (ramp to zero pose, {_RESET_RAMP_S:.1f}s)")

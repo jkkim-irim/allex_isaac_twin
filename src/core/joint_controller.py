@@ -40,7 +40,7 @@ class ALLEXJointController:
 
         if not config_path or not os.path.exists(config_path):
             # 환경변수 미설정 시 extension 내부 기본 경로로 폴백
-            default_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "joint_config.json")
+            default_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "joint_config.json")
             if os.path.exists(default_path):
                 config_path = default_path
             else:

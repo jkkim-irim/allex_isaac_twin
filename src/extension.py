@@ -97,7 +97,7 @@ class Extension(omni.ext.IExt):
 
         # Newton: inject MJCF equality constraints before finalize.
         from .core import newton_bridge
-        joint_config = Path(__file__).parent / "joint_config.json"
+        joint_config = Path(__file__).parent / "config" / "joint_config.json"
         newton_bridge.install(joint_config)
 
     def on_shutdown(self):

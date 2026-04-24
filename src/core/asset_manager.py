@@ -9,61 +9,7 @@ from pxr import UsdGeom, Gf
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.stage import add_reference_to_stage
 
-
-# MJCF-intended drive gains (SI units: N·m/rad stiffness, N·m·s/rad damping).
-# USD authored values are ~57× these (PhysX deg-convention), causing extreme
-# actuator stiffness under Newton/MuJoCo. We override at runtime to restore
-# physically-correct behavior.
-_MJCF_DRIVE_GAINS: dict[str, tuple[float, float]] = {
-    "Waist_Yaw_Joint":        (2000.0, 100.0),
-    "Waist_Lower_Pitch_Joint": (600.0, 120.0),
-    "Neck_Pitch_Joint":        (100.0,   5.0),
-    "Neck_Yaw_Joint":          (100.0,   2.5),
-    "L_Shoulder_Pitch_Joint": (5000.0, 200.0),
-    "L_Shoulder_Roll_Joint":  (5000.0, 200.0),
-    "L_Shoulder_Yaw_Joint":   (5000.0, 100.0),
-    "L_Elbow_Joint":          (1000.0,  50.0),
-    "L_Wrist_Yaw_Joint":       (400.0,  10.0),
-    "L_Wrist_Roll_Joint":      (100.0,   5.0),
-    "L_Wrist_Pitch_Joint":     (100.0,   5.0),
-    "L_Thumb_Yaw_Joint":        (40.0,   1.0),
-    "L_Thumb_CMC_Joint":        (40.0,   1.0),
-    "L_Thumb_MCP_Joint":        (20.0,   0.5),
-    "L_Index_ABAD_Joint":       (20.0,   0.5),
-    "L_Index_MCP_Joint":        (40.0,   1.0),
-    "L_Index_PIP_Joint":        (20.0,   0.5),
-    "L_Little_ABAD_Joint":      (20.0,   0.5),
-    "L_Little_MCP_Joint":       (40.0,   1.0),
-    "L_Little_PIP_Joint":       (20.0,   0.5),
-    "L_Middle_ABAD_Joint":      (20.0,   0.5),
-    "L_Middle_MCP_Joint":       (40.0,   1.0),
-    "L_Middle_PIP_Joint":       (20.0,   0.5),
-    "L_Ring_ABAD_Joint":        (20.0,   0.5),
-    "L_Ring_MCP_Joint":         (40.0,   1.0),
-    "L_Ring_PIP_Joint":         (20.0,   0.5),
-    "R_Shoulder_Pitch_Joint": (5000.0, 200.0),
-    "R_Shoulder_Roll_Joint":  (5000.0, 200.0),
-    "R_Shoulder_Yaw_Joint":   (5000.0, 100.0),
-    "R_Elbow_Joint":          (1000.0,  50.0),
-    "R_Wrist_Yaw_Joint":       (400.0,  10.0),
-    "R_Wrist_Roll_Joint":      (100.0,   5.0),
-    "R_Wrist_Pitch_Joint":     (100.0,   5.0),
-    "R_Thumb_Yaw_Joint":        (40.0,   1.0),
-    "R_Thumb_CMC_Joint":        (40.0,   1.0),
-    "R_Thumb_MCP_Joint":        (20.0,   0.5),
-    "R_Index_ABAD_Joint":       (20.0,   0.5),
-    "R_Index_MCP_Joint":        (40.0,   1.0),
-    "R_Index_PIP_Joint":        (20.0,   0.5),
-    "R_Little_ABAD_Joint":      (20.0,   0.5),
-    "R_Little_MCP_Joint":       (40.0,   1.0),
-    "R_Little_PIP_Joint":       (20.0,   0.5),
-    "R_Middle_ABAD_Joint":      (20.0,   0.5),
-    "R_Middle_MCP_Joint":       (40.0,   1.0),
-    "R_Middle_PIP_Joint":       (20.0,   0.5),
-    "R_Ring_ABAD_Joint":        (20.0,   0.5),
-    "R_Ring_MCP_Joint":         (40.0,   1.0),
-    "R_Ring_PIP_Joint":         (20.0,   0.5),
-}
+from ..config import load_drive_gains
 
 
 def _override_drive_gains(articulation) -> int:
@@ -79,6 +25,7 @@ def _override_drive_gains(articulation) -> int:
     num_dof = len(names)
     if num_dof == 0:
         return 0
+    drive_gains = load_drive_gains()
     try:
         cur_kps, cur_kds = view.get_gains()
     except Exception as exc:
@@ -95,7 +42,7 @@ def _override_drive_gains(articulation) -> int:
 
     changed = 0
     for i, n in enumerate(names):
-        gains = _MJCF_DRIVE_GAINS.get(n)
+        gains = drive_gains.get(n)
         if gains is None:
             continue
         kp, kd = gains
@@ -158,7 +105,7 @@ class ALLEXAssetManager:
             # 스테이지에 로봇 에셋 추가
             add_reference_to_stage(path_to_robot_usd, self._robot_prim_path)
 
-            # Apply USD /physicsScene overrides from config/physics.toml.
+            # Apply USD /physicsScene overrides from src/config/physics_settings.py.
             try:
                 stage_ctx = omni.usd.get_context().get_stage()
                 from ..config import physics_settings as _ps

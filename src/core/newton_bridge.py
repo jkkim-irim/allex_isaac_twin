@@ -1,7 +1,7 @@
 """Inject MJCF-style equality constraints into Newton ModelBuilder.
 
 Newton's USD importer does not load `<equality>` entries. We source them from
-`src/joint_config.json` (regenerated from MJCF) and inject at finalize time by
+`src/config/joint_config.json` (regenerated from MJCF) and inject at finalize time by
 patching `newton.ModelBuilder.finalize`.
 
 MJCF/Newton convention: joint1 = poly(joint2). We store (follower, master) and
@@ -311,7 +311,7 @@ def _uninstall_articulation_reset_patch() -> None:
 
 
 def configure_newton_from_toml() -> bool:
-    """Apply [newton] and [newton.solver] sections from config/physics.toml.
+    """Apply newton + newton.solver sections from src/config/physics_settings.py.
 
     Key use: pd_scale = π/180 cancels Newton USD importer's implicit deg→rad
     drive-gain multiplication so USD-authored SI gains pass through unchanged.

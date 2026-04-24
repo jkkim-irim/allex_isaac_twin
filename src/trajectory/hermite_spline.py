@@ -8,12 +8,30 @@ C++ monotonic_cubic_spline / trajectory_manager와 동일한 로직.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 _EPS = 1e-9
 _HOLD_TOL_RAD = 1e-4  # P1≈P2이면 홀드(상수)
+
+
+@dataclass
+class ViaCSVData:
+    """Via point CSV 파싱 결과.
+
+    position 외에 via별 torque limit / PD gain 컬럼(있을 때만)을 같은 레이아웃
+    (N, n_joints) 배열로 노출합니다. 해당 via 행에 값이 생략된 경우 NaN.
+
+    단위는 CSV 원본을 그대로 유지 (deg → rad 변환은 position에만 적용).
+    """
+
+    t_via: np.ndarray                    # (N,) seconds
+    pos_via: np.ndarray                  # (N, n_joints) rad
+    kps_via: np.ndarray | None = None    # (N, n_joints) CSV units
+    kds_via: np.ndarray | None = None    # (N, n_joints) CSV units
+    trq_via: np.ndarray | None = None    # (N, n_joints) CSV units
 
 
 # ── Hermite basis functions ──
@@ -99,60 +117,123 @@ def _hermite_1d(t_out: np.ndarray, t_via: np.ndarray, y_via: np.ndarray) -> np.n
     return out
 
 
-def parse_via_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+def _parse_float(s: str) -> float:
+    """Parse one CSV cell. Empty/missing → NaN. Non-numeric → raises."""
+    s = s.strip()
+    if not s:
+        return float("nan")
+    return float(s)
+
+
+def parse_via_csv(path: str | Path) -> ViaCSVData:
     """Via point CSV 파싱.
 
-    CSV format: duration, joint_1, joint_2, ..., joint_N (degree)
-    duration <= 0 인 행은 주석으로 무시.
-    첫 행의 duration은 초기 hold 시간.
+    지원 헤더 컬럼 (대소문자 구분, 순서 자유):
+        duration, joint_1..N, trq_lim_1..N, K_pos_1..N, K_vel_1..N
 
-    Returns:
-        (time_arr, position_rad): via point 시간[s]과 위치[rad].
+    - **Multi-section 헤더 지원**: ``duration``으로 시작하는 라인을 만나면
+      그 시점부터 새 섹션 schema 로 전환. 즉 한 파일 안에서 trq_lim 만 있는
+      섹션과 K_pos/K_vel 만 있는 섹션을 섞어 쓸 수 있음. 이전에는 첫 헤더만
+      읽혀 후속 섹션의 추가 컬럼이 모두 버려졌음.
+    - 행이 현재 섹션에서 정의되지 않은 카테고리(예: K_pos 컬럼이 없는
+      섹션의 PD gain)는 NaN 으로 기록되어, 후속 이벤트 추출 시 ``None`` 으로
+      정규화되거나 NaN 마스크로 적용에서 제외됨.
+    - duration <= 0 인 행은 주석/섹션 마커로 무시 (예: ``-1,팔짱 [9.0 sec]``).
+    - 첫 데이터 행의 duration 은 초기 hold 시간 (time[0] = 0 고정).
     """
     path = Path(path)
-    rows = []
-    n_cols = None
+
+    rows_dur: list[float] = []
+    rows_pos: list[list[float]] = []
+    rows_trq: list[list[float]] = []
+    rows_kp: list[list[float]] = []
+    rows_kd: list[list[float]] = []
+
+    # Section-local schema. Reset on every "duration,..." header line.
+    joint_cols: list[int] = []
+    trq_cols: list[int] = []
+    kp_cols: list[int] = []
+    kd_cols: list[int] = []
+    n_joints: int | None = None
 
     with open(path, "r", encoding="utf-8") as f:
-        header = next(f)  # skip header
-        # joint 열만 카운트 (K_pos, K_vel 등 제외)
-        header_parts = [p.strip() for p in header.split(",") if p.strip()]
-        n_joint_cols = sum(1 for p in header_parts if p.startswith("joint_") or p == "duration")
-        if n_joint_cols < 2:
-            n_joint_cols = len(header_parts)
-        n_cols = n_joint_cols
-
         for line in f:
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
+            if not parts or not parts[0]:
                 continue
+
+            # Header (or re-header for new section)
+            if parts[0] == "duration":
+                joint_cols = []
+                trq_cols = []
+                kp_cols = []
+                kd_cols = []
+                for i, name in enumerate(parts):
+                    if name.startswith("joint_"):
+                        joint_cols.append(i)
+                    elif name.startswith("trq_lim_"):
+                        trq_cols.append(i)
+                    elif name.startswith("K_pos_"):
+                        kp_cols.append(i)
+                    elif name.startswith("K_vel_"):
+                        kd_cols.append(i)
+                if n_joints is None:
+                    n_joints = len(joint_cols)
+                continue
+
+            if not joint_cols:
+                # No header seen yet; cannot interpret data.
+                continue
+
             try:
                 d = float(parts[0])
             except ValueError:
                 continue
             if d <= 0:
                 continue
-            try:
-                row = [float(parts[i]) for i in range(min(len(parts), n_cols))]
-            except (ValueError, IndexError):
+
+            def cell(idx: int) -> float:
+                return _parse_float(parts[idx]) if idx < len(parts) else float("nan")
+
+            pos_row = [cell(c) for c in joint_cols]
+            if any(np.isnan(v) for v in pos_row):
+                # position은 필수 — 결측 행은 스킵.
                 continue
-            if len(row) == n_cols:
-                rows.append(row)
 
-    if not rows:
-        return np.array([0.0]), np.zeros((1, 1))
+            n = n_joints or len(joint_cols)
 
-    arr = np.array(rows)
-    n_joints = arr.shape[1] - 1
-    durations = arr[:, 0]
+            def cells(cols: list[int]) -> list[float]:
+                if not cols:
+                    return [float("nan")] * n
+                return [cell(c) for c in cols]
 
+            rows_dur.append(d)
+            rows_pos.append(pos_row)
+            rows_trq.append(cells(trq_cols))
+            rows_kp.append(cells(kp_cols))
+            rows_kd.append(cells(kd_cols))
+
+    if not rows_pos:
+        return ViaCSVData(t_via=np.array([0.0]), pos_via=np.zeros((1, 1)))
+
+    durations = np.asarray(rows_dur, dtype=np.float64)
     # C++ 규약: row k의 duration = segment (k-1)→(k) 소요 시간
     # time[0] = 0, time[i] = sum(duration[1:i+1])
-    time_arr = np.concatenate([[0.0], np.cumsum(durations[1:])])
-    pos_deg = arr[:, 1: 1 + n_joints]
-    pos_rad = np.deg2rad(pos_deg)
+    t_via = np.concatenate([[0.0], np.cumsum(durations[1:])])
 
-    return time_arr, pos_rad
+    pos_via = np.deg2rad(np.asarray(rows_pos, dtype=np.float32))
+
+    def _arr_or_none(rows: list[list[float]]) -> "np.ndarray | None":
+        arr = np.asarray(rows, dtype=np.float32)
+        return None if arr.size == 0 or np.all(np.isnan(arr)) else arr
+
+    return ViaCSVData(
+        t_via=t_via,
+        pos_via=pos_via,
+        trq_via=_arr_or_none(rows_trq),
+        kps_via=_arr_or_none(rows_kp),
+        kds_via=_arr_or_none(rows_kd),
+    )
 
 
 def generate_trajectory(
@@ -197,5 +278,5 @@ def generate_trajectory_from_csv(
     Returns:
         (time_out, pos_out_rad): 균일 샘플링된 시간[s]과 위치[rad].
     """
-    time_via, pos_via = parse_via_csv(csv_path)
-    return generate_trajectory(time_via, pos_via, hz=hz, duration=duration)
+    data = parse_via_csv(csv_path)
+    return generate_trajectory(data.t_via, data.pos_via, hz=hz, duration=duration)
