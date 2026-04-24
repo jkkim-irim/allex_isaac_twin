@@ -136,7 +136,7 @@ class TorquePlotter:
     ff_provider : callable returning np.ndarray of shape (num_dof,), optional
         Invoked on the main thread during ``apply_step`` to fetch the
         most-recent applied feedforward torque. Typically
-        ``RuntimeGainFFController.get_last_applied_ff``.
+        ``FeedforwardTorqueManager.get_last``.
     subset : "body" | "hand"
     physics_hz : float
         Passed to the subprocess as the assumed sample rate when sizing
@@ -394,8 +394,8 @@ class TorquePlotter:
 
         # --- joint_f (ground-truth FF, 모든 writer 합산 결과) -------------
         # Wrapper: FeedforwardTorqueManager.read_current() — control.joint_f 를
-        # 직접 읽어 return. 여러 writer (this manager, RuntimeGainFFController,
-        # 외부 script 등) 의 최종 합산 상태.
+        # 직접 읽어 return. 여러 writer (this manager, 외부 script 등) 의
+        # 최종 합산 상태.
         tau_ff = np.zeros(num, dtype=np.float32)
         ff_mgr = self._ff_manager
         if ff_mgr is not None:

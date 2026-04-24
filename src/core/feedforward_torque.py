@@ -85,9 +85,8 @@ class FeedforwardTorqueManager:
         """Copy of the most recently applied FF torque vector **by this
         manager**, or None if never applied. Safe to call from any thread.
 
-        ⚠ 주의: 다른 코드 경로 (예: RuntimeGainFFController) 가
-        ``control.joint_f`` 에 직접 써도 여기엔 반영 안 됨. Ground truth 가
-        필요하면 :meth:`read_current` 를 쓸 것.
+        ⚠ 주의: 외부 코드 경로가 ``control.joint_f`` 에 직접 써도 여기엔
+        반영 안 됨. Ground truth 가 필요하면 :meth:`read_current` 를 쓸 것.
         """
         if self._last is None:
             return None
@@ -96,9 +95,8 @@ class FeedforwardTorqueManager:
     def read_current(self) -> np.ndarray | None:
         """Read back ``control.joint_f`` from Newton directly (ground truth).
 
-        모든 writer (this manager, RuntimeGainFFController, 외부 script 등)
-        가 써둔 **최종 FF torque 벡터** 를 반환. solver 가 실제 pass-through
-        할 값과 동일.
+        모든 writer (this manager, 외부 script 등) 가 써둔 **최종 FF torque
+        벡터** 를 반환. solver 가 실제 pass-through 할 값과 동일.
 
         Returns: (num_dof,) float32 ndarray, 실패 시 None.
         """
