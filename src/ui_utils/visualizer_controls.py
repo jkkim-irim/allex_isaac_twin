@@ -54,6 +54,11 @@ class VisualizerControls:
         self._torque_plot_body_label = None
         self._torque_plot_hand_label = None
         self._plot_hz_model = None
+        # Plot mode is read at Start time. ["rolling", "cumulative"]
+        self._plot_mode_combo = None
+        self._plot_mode: str = "rolling"
+        # Save-on-stop is read at Start time.
+        self._save_on_exit_model = None
 
     # ========================================
     # scenario 주입 지연 허용
@@ -150,6 +155,22 @@ class VisualizerControls:
                     self._plot_hz_model.add_end_edit_fn(
                         lambda _m: self._apply_plot_hz()
                     )
+
+                # Plot mode selector — applied at next Start (subprocess respawn).
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Plot Mode:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._plot_mode_combo = ui.ComboBox(0, "Rolling 5s", "Cumulative")
+                    try:
+                        m = self._plot_mode_combo.model.get_item_value_model()
+                        m.add_value_changed_fn(self._on_plot_mode_change)
+                    except Exception:
+                        pass
+
+                # Save-on-stop checkbox — saves CSV+PNG when subprocess exits.
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Save on Stop:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._save_on_exit_model = ui.SimpleBoolModel(False)
+                    ui.CheckBox(self._save_on_exit_model)
 
                 UIComponentFactory.create_styled_button(
                     "Torque Plot (Body)",
@@ -406,6 +427,15 @@ class VisualizerControls:
                 print(f"[TorquePlot] set_plot_hz({subset}) failed: {exc}")
         print(f"[TorquePlot] plot_hz -> {hz}")
 
+    def _on_plot_mode_change(self, model):
+        try:
+            idx = int(model.as_int)
+        except Exception:
+            return
+        self._plot_mode = "cumulative" if idx == 1 else "rolling"
+        print(f"[TorquePlot] plot_mode -> {self._plot_mode} "
+              "(applies on next Start)")
+
     def _toggle_torque_plot(self, subset: str):
         plotter = self._get_torque_plotter(subset)
         label = self._torque_plot_label(subset)
@@ -428,6 +458,22 @@ class VisualizerControls:
             if label:
                 label.text = f"Torque Plot ({subset.capitalize()}): OFF"
             return
+
+        # Apply currently selected plot mode (rolling/cumulative) before spawn.
+        try:
+            plotter.set_plot_mode(self._plot_mode)
+        except Exception as exc:
+            print(f"[TorquePlot] set_plot_mode({subset}) failed: {exc}")
+
+        # Apply save-on-exit checkbox state before spawn.
+        try:
+            save_on_exit = bool(self._save_on_exit_model.as_bool) \
+                if self._save_on_exit_model is not None else False
+            plotter.set_save_on_exit(save_on_exit)
+            if save_on_exit:
+                print(f"[TorquePlot] save_on_exit=ON for {subset} — CSV+PNG will be written on Stop")
+        except Exception as exc:
+            print(f"[TorquePlot] set_save_on_exit({subset}) failed: {exc}")
 
         try:
             ok = plotter.start()

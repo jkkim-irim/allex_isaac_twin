@@ -42,9 +42,12 @@ from matplotlib.animation import FuncAnimation  # noqa: E402
 from matplotlib.widgets import Button  # noqa: E402
 
 import json  # noqa: E402
+import os  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
+import time  # noqa: E402
 from collections import deque  # noqa: E402
+from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -134,6 +137,13 @@ def _stdin_reader_loop(
     stop_event.set()
 
 
+def _resolve_save_dir() -> Path:
+    env = os.environ.get("ALLEX_PLOT_SAVE_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / "allex_twin_plots"
+
+
 def main() -> int:
     init = _read_init(sys.stdin)
     if init is None:
@@ -144,6 +154,10 @@ def main() -> int:
     window_sec = float(init.get("window_sec", 5.0))
     hz = float(init.get("hz", _DEFAULT_HZ))
     y_label = str(init.get("y_label", "value"))
+    plot_mode = str(init.get("plot_mode", "rolling")).lower()
+    if plot_mode not in ("rolling", "cumulative"):
+        plot_mode = "rolling"
+    save_on_exit = bool(init.get("save_on_exit", False))
     groups = init.get("groups", [])
     if not isinstance(groups, list) or not groups:
         _log("init has no groups; exiting")
@@ -155,15 +169,21 @@ def main() -> int:
         _log("init has only empty groups; exiting")
         return 1
 
-    # Rolling-window buffers: one shared timestamp stream + per-group joint streams.
-    buflen = max(64, int(window_sec * hz))
-    shared_t: deque = deque(maxlen=buflen)
+    # Buffers: maxlen=None (unbounded) for both modes — visualization 차이는
+    # _update 의 visible window 처리에서만. 저장 기능은 항상 전체 history 가
+    # 있어야 하므로 통일.
+    shared_t: deque = deque()
     group_joint_dqs: list[list[deque]] = []
     groups_joint_count: list[int] = []
     for g in groups:
         joints = list(g.get("joints", []))
         groups_joint_count.append(len(joints))
-        group_joint_dqs.append([deque(maxlen=buflen) for _ in joints])
+        group_joint_dqs.append([deque() for _ in joints])
+
+    # Flat joint name list for CSV header.
+    flat_joint_names: list[str] = []
+    for g in groups:
+        flat_joint_names.extend(str(j) for j in g.get("joints", []))
 
     # Build figure + subplots.
     n_rows = len(groups)
@@ -215,6 +235,58 @@ def main() -> int:
     btn_show = Button(btn_ax_show, "Show all")
     btn_hide.on_clicked(lambda _e: _set_all_visible(False))
     btn_show.on_clicked(lambda _e: _set_all_visible(True))
+
+    def _save_data(_evt=None):
+        if not shared_t:
+            _log("save: no samples to write")
+            return
+        save_dir = _resolve_save_dir()
+        _log(f"save: target dir = {save_dir}")
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            _log(f"save: mkdir failed: {exc}")
+            return
+        # 파일명: <title 의 안전화 prefix>_<timestamp>
+        safe_title = "".join(c if c.isalnum() or c in "._-" else "_" for c in title)[:60]
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        stem = f"{safe_title}_{ts}"
+        csv_path = save_dir / f"{stem}.csv"
+        png_path = save_dir / f"{stem}.png"
+
+        # CSV: time + flat joint columns
+        try:
+            t_arr_save = np.fromiter(shared_t, dtype=np.float32, count=len(shared_t))
+            n = t_arr_save.size
+            cols = [t_arr_save.reshape(-1, 1)]
+            header = ["time"]
+            for grp_dqs, grp in zip(group_joint_dqs, groups):
+                for jdq, jname in zip(grp_dqs, grp.get("joints", [])):
+                    arr = np.fromiter(jdq, dtype=np.float32, count=len(jdq))
+                    if arr.size < n:
+                        pad = np.full(n - arr.size, np.nan, dtype=np.float32)
+                        arr = np.concatenate([pad, arr])
+                    elif arr.size > n:
+                        arr = arr[-n:]
+                    cols.append(arr.reshape(-1, 1))
+                    header.append(str(jname))
+            data = np.hstack(cols)
+            np.savetxt(
+                csv_path, data, delimiter=",",
+                header=",".join(header), comments="", fmt="%.6f",
+            )
+        except Exception as exc:
+            _log(f"save CSV failed: {exc}")
+            csv_path = None
+
+        try:
+            fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        except Exception as exc:
+            _log(f"save PNG failed: {exc}")
+            png_path = None
+
+        _log(f"saved: {csv_path}  +  {png_path}")
+
     # Strong refs — matplotlib widgets are GC'd if unreferenced.
     fig._allex_btns = (btn_hide, btn_show)
 
@@ -274,7 +346,11 @@ def main() -> int:
             return []
         t_arr = np.fromiter(shared_t, dtype=np.float32, count=len(shared_t))
         t_last = float(t_arr[-1])
-        t_min = t_last - window_sec
+        if plot_mode == "cumulative":
+            # 시작부터 모든 데이터, x 는 첫 sample ~ now.
+            t_min = float(t_arr[0])
+        else:
+            t_min = t_last - window_sec
         updated = []
         for (ax, lines), joint_dqs in zip(axis_specs, group_joint_dqs):
             y_min = float("inf")
@@ -288,14 +364,17 @@ def main() -> int:
                     continue
                 t_tail = t_arr[-n:]
                 y_tail = y_arr[-n:]
-                # Restrict to samples inside the visible window. deque retains
-                # more history than window_sec if plot_hz was lowered at
-                # runtime — those stale samples must not drive autoscale.
-                mask = t_tail >= t_min
-                if not mask.any():
-                    continue
-                t_vis = t_tail[mask]
-                y_vis = y_tail[mask]
+                if plot_mode == "rolling":
+                    # window 밖 샘플은 화면/autoscale 모두에서 제외.
+                    mask = t_tail >= t_min
+                    if not mask.any():
+                        continue
+                    t_vis = t_tail[mask]
+                    y_vis = y_tail[mask]
+                else:
+                    # cumulative: 전체 history 그대로.
+                    t_vis = t_tail
+                    y_vis = y_tail
                 ln.set_data(t_vis, y_vis)
                 updated.append(ln)
                 # Exclude hidden lines from y-autoscale.
@@ -323,6 +402,12 @@ def main() -> int:
         pass
     finally:
         stop_event.set()
+        # save_on_exit: subprocess 종료 직전 마지막 buffer 를 dump.
+        if save_on_exit:
+            try:
+                _save_data()
+            except Exception as exc:
+                _log(f"save_on_exit failed: {exc}")
         try:
             plt.close("all")
         except Exception:

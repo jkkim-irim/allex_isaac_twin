@@ -88,7 +88,7 @@ _CONFIG: dict[str, Any] = {
         # set_dof_stiffnesses / set_dof_dampings / set_dof_max_forces at via
         # events — every external write breaks the captured graph and forces a
         # re-record, surfacing as visible per-event stutter.
-        "use_cuda_graph": True,
+        "use_cuda_graph": False,
         # "time_step_app": True,
         # "physics_frequency": 600.0,        # Hz (None = use USD timeStepsPerSecond)
         # "update_fabric": True,

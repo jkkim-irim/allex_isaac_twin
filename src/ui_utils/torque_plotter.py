@@ -154,6 +154,8 @@ class TorquePlotter:
         window_s: float = _DEFAULT_WINDOW_SECONDS,
         plot_hz: float = 50.0,
         ff_manager=None,
+        plot_mode: str = "rolling",
+        save_on_exit: bool = False,
     ):
         self._articulation = articulation
         self._ff_provider = ff_provider
@@ -164,6 +166,10 @@ class TorquePlotter:
         self._physics_hz = float(physics_hz)
         self._window_s = float(window_s)
         self._plot_hz = float(plot_hz)
+        # "rolling" : 짧은 window + autoscale (현재 동작).
+        # "cumulative": 시작부터 모든 데이터 누적, x 축은 0~now 로 계속 확장.
+        self._plot_mode = "cumulative" if str(plot_mode).lower() == "cumulative" else "rolling"
+        self._save_on_exit = bool(save_on_exit)
 
         # Resolve DOF names + filter to subset.
         try:
@@ -188,6 +194,22 @@ class TorquePlotter:
         # 20 Hz so much higher than ~50 Hz is wasted GPU→CPU sync.
         self._decim = self._compute_decim(self._plot_hz)
         self._step_count = 0
+
+    def set_plot_mode(self, mode: str) -> None:
+        """Pre-start 만 의미 있음 — Start 후 변경은 다음 spawn 부터 반영."""
+        self._plot_mode = "cumulative" if str(mode).lower() == "cumulative" else "rolling"
+
+    @property
+    def plot_mode(self) -> str:
+        return self._plot_mode
+
+    def set_save_on_exit(self, on: bool) -> None:
+        """Subprocess 종료 시 자동으로 CSV+PNG 저장할지. Pre-start 만 의미 있음."""
+        self._save_on_exit = bool(on)
+
+    @property
+    def save_on_exit(self) -> bool:
+        return self._save_on_exit
 
     def _compute_decim(self, plot_hz: float) -> int:
         hz = max(1.0, float(plot_hz))
@@ -295,10 +317,12 @@ class TorquePlotter:
 
         init_msg = {
             "cmd": "init",
-            "title": f"ALLEX Torque ({self._subset})",
+            "title": f"ALLEX Torque ({self._subset}) [{self._plot_mode}]",
             "window_sec": self._window_s,
             "hz": self._physics_hz,
             "y_label": "torque [N m]",
+            "plot_mode": self._plot_mode,
+            "save_on_exit": self._save_on_exit,
             "groups": self._groups,
         }
         if not self._send(init_msg):

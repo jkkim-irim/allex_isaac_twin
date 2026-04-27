@@ -175,9 +175,9 @@ class TrajectoryPlayer:
         self._notify_flag: int = 0      # SolverNotifyFlags.JOINT_DOF_PROPERTIES
 
         # Per-category event toggles. Defaults all True; flip for diagnosis.
-        self.apply_kps_events = True
-        self.apply_kds_events = True
-        self.apply_eff_events = True
+        self.apply_kps_events = False   # USD gain 사용하기 위해 False - Debug
+        self.apply_kds_events = False
+        self.apply_eff_events = False
 
         # CPU-side timing of each per-step write batch. Logs only when over
         # threshold to avoid spam during normal operation.
