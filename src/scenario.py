@@ -46,7 +46,7 @@ class ALLEXDigitalTwin:
         self._initializer.setup_camera_view()
 
         extension_root = os.path.dirname(os.path.abspath(__file__))
-        joint_config_path = os.path.join(extension_root, "joint_config.json")
+        joint_config_path = os.path.join(extension_root, "config", "joint_config.json")
         self._joint_controller.load_coupled_joint_config(joint_config_path)
 
         print("ALLEX Digital Twin setup complete")

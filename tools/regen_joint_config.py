@@ -1,7 +1,10 @@
-"""Regenerate src/joint_config.json from asset/ALLEX/mjcf/ALLEX.xml.
+"""Regenerate src/config/joint_config.json from asset/ALLEX/mjcf/ALLEX.xml.
 
 Run:
     python tools/regen_joint_config.py
+
+The hand-managed ``ui`` and ``drive_gains`` sections of the existing JSON are
+preserved across regeneration; only MJCF-derived keys are overwritten.
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ from pathlib import Path
 
 EXT_ROOT = Path(__file__).resolve().parent.parent
 MJCF_PATH = EXT_ROOT / "asset" / "ALLEX" / "mjcf" / "ALLEX.xml"
-OUT_PATH = EXT_ROOT / "src" / "joint_config.json"
+OUT_PATH = EXT_ROOT / "src" / "config" / "joint_config.json"
 
 
 def _parse_polycoef(s: str) -> list[float]:
@@ -59,7 +62,7 @@ def regenerate(mjcf_path: Path, out_path: Path) -> dict:
     active_indices = [str(i) for i, n in enumerate(joints) if n not in follower_set]
 
     cfg = {
-        "notes": "Auto-generated from asset/ALLEX/mjcf/ALLEX.xml by tools/regen_joint_config.py. Do not edit by hand.",
+        "notes": "Auto-generated from asset/ALLEX/mjcf/ALLEX.xml by tools/regen_joint_config.py. Do not edit by hand (except the 'ui' and 'drive_gains' sections).",
         "source_mjcf": str(mjcf_path.relative_to(EXT_ROOT)),
         "total_joints": len(joints),
         "joint_names": joint_names,
@@ -68,6 +71,17 @@ def regenerate(mjcf_path: Path, out_path: Path) -> dict:
         "equality_constraints": equality,
         "coupled_joints": {},
     }
+
+    # Preserve hand-managed sections across regeneration.
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"WARN: could not read existing {out_path}: {exc}", file=sys.stderr)
+            existing = {}
+        for key in ("drive_gains", "ui"):
+            if key in existing:
+                cfg[key] = existing[key]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

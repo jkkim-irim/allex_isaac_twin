@@ -1,4 +1,8 @@
-"""Load and apply ALLEX physics configuration from config/physics.toml.
+"""ALLEX physics configuration (in-tree Python).
+
+All physics-related overrides live in this module. Edit the ``_CONFIG`` dict
+below and disable/re-enable the ALLEX extension in Isaac Sim's Extension
+Manager to reload.
 
 Usage:
     from .config.physics_settings import (
@@ -8,45 +12,167 @@ Usage:
         apply_usd_physics_scene,
     )
 
-The config is loaded lazily on first access and cached. Sections absent from
-the TOML simply fall back to whatever Isaac Sim / Newton / our bridge already
-use as defaults — this file is an *opt-in override layer*, not a hard schema.
+Sections (mirrors the previous TOML schema):
+    usd.physics_scene             USD /physicsScene prim (UsdPhysics.Scene)
+    usd.physics_scene.physx       PhysxSceneAPI attrs (PhysX-only; Newton ignores)
+    newton                        isaacsim.physics.newton.NewtonConfig
+    newton.solver                 NewtonConfig.solver_cfg (MuJoCoSolverConfig)
+    allex.equality                MJCF equality constraint tuning
+    allex.equality.armature_overrides
+                                  per-joint armature boosts
+
+Keys absent from ``_CONFIG`` fall back to whatever Isaac Sim / Newton / our
+bridge already use as defaults — this module is an *opt-in override layer*,
+not a hard schema.
 """
 from __future__ import annotations
 
-import tomllib
-from pathlib import Path
+import math
 from typing import Any
 
 
-_EXT_ROOT = Path(__file__).resolve().parent.parent.parent  # extension root
-_CONFIG_PATH = _EXT_ROOT / "config" / "physics.toml"
+# ---------------------------------------------------------------------------
+# Active configuration
+# ---------------------------------------------------------------------------
+# To override a value the engine would otherwise pick, add it under the
+# matching section. Removing / commenting a key restores the engine default.
 
-_cache: dict[str, Any] | None = None
+_CONFIG: dict[str, Any] = {
+    # USD /physicsScene — UsdPhysics.Scene + PhysxSceneAPI
+    # ---------------------------------------------------------------------
+    # Leave the dicts empty (or omit keys) to keep Isaac Sim defaults.
+    # Available keys are listed in _USD_SCENE_KEYS / _PHYSX_SCENE_KEYS below.
+    "usd": {
+        "physics_scene": {
+            # "gravity_magnitude": 9.81,
+            # "gravity_direction": [0.0, 0.0, -1.0],
+            "physx": {
+                # NOTE: PhysX-specific. Newton ignores these but they are still
+                # authored on the USD stage (useful if falling back to PhysX).
+                # "friction_cone_type": "patch",     # "patch" | "oneDirection"
+                # "solver_type": "PGS",              # "PGS" | "TGS"
+                # "broadphase_type": "SAP",          # "SAP" | "MBP"
+                # "collision_system": "PCM",
+                # "enable_ccd": False,
+                # "enable_stabilization": True,
+                # "enable_enhanced_determinism": False,
+                # "min_position_iteration_count": 1,
+                # "max_position_iteration_count": 255,
+                # "min_velocity_iteration_count": 1,
+                # "max_velocity_iteration_count": 255,
+                # "bounce_threshold": 2.0,
+                # "friction_offset_threshold": 0.04,
+                # "time_steps_per_second": 50,
+            },
+        },
+    },
+
+    # Newton Physics — isaacsim.physics.newton.NewtonConfig
+    # ---------------------------------------------------------------------
+    # Reference: isaacsim.physics.newton.impl.newton_config.NewtonConfig
+    # Note: "capture_graph_physics_step" / "auto_switch_on_startup" are carb
+    # kit settings (under exts."isaacsim.physics.newton".*), NOT NewtonConfig
+    # fields — they must be set in kit/settings.toml, not here.
+    "newton": {
+        # Cancel Newton USD importer's implicit deg→rad drive-gain multiplication.
+        # USD drive stiffness/damping are SI (N·m/rad). Setting pd_scale = π/180
+        # makes the importer's (1 / DegreesToRadian / pd_scale) factor equal to
+        # 1.0. Leaving at default 1.0 would scale SI values by ~57.3× (broken on
+        # MJCF-style USD exports).
+        "pd_scale": math.pi / 180.0,
+
+        # Common NewtonConfig fields (uncomment to override):
+        # "num_substeps": 1,
+        # "debug_mode": False,
+        # CUDA graph capture must stay OFF while the trajectory player issues
+        # set_dof_stiffnesses / set_dof_dampings / set_dof_max_forces at via
+        # events — every external write breaks the captured graph and forces a
+        # re-record, surfacing as visible per-event stutter.
+        "use_cuda_graph": True,
+        # "time_step_app": True,
+        # "physics_frequency": 600.0,        # Hz (None = use USD timeStepsPerSecond)
+        # "update_fabric": True,
+        # "disable_physx_fabric_tracker": True,
+        # "collapse_fixed_joints": False,
+        # "fix_missing_xform_ops": True,
+        # "contact_ke": 1.0e4,               # contact stiffness (N/m)
+        # "contact_kd": 1.0e2,               # contact damping
+        # "contact_kf": 1.0e1,               # contact friction stiffness
+        # "contact_mu": 1.0,                 # coefficient of friction
+        # "contact_ka": 0.5,
+        # "restitution": 0.0,
+        # "contact_margin": 0.01,
+        # "soft_contact_margin": 0.01,
+
+        # Newton Solver — MuJoCoSolverConfig (MuJoCo Warp backend)
+        # Reference: isaacsim.physics.newton.impl.solver_config.MuJoCoSolverConfig
+        "solver": {
+            # "solver_type": "mujoco",       # "xpbd" | "mujoco" | "featherstone" | "semiImplicit"
+            # "njmax": 1200,                 # max constraints / world
+            # "nconmax": 200,                # max contact points / world
+            # "iterations": 100,             # solver iterations
+            # "ls_iterations": 15,           # line search iterations
+            # "solver": "newton",            # "newton" (sparse LDL) | "cg"
+            # "integrator": "implicitfast",  # "euler" | "rk4" | "implicit" | "implicitfast"
+            # "cone": "elliptic",            # "pyramidal" | "elliptic"
+            # "impratio": 1.0,
+            # "use_mujoco_cpu": False,
+            # "use_mujoco_contacts": True,
+            # "disable_contacts": False,
+            # "tolerance": 1.0e-8,
+            # "ls_tolerance": 0.001,
+            # "ls_parallel": True,
+            # "update_data_interval": 1,
+            # "include_sites": False,
+            # "save_to_mjcf": "",            # non-empty path: dump generated MJCF
+        },
+    },
+
+    # ALLEX — MJCF equality constraint tuning
+    # ---------------------------------------------------------------------
+    "allex": {
+        "equality": {
+            # Default tuning (used by finger coupling constraints).
+            # solref = (timeconst [s], dampratio)
+            "default_solref_timeconst": 0.02,
+            "default_solref_dampratio": 1.0,
+            # solimp = (dmin, dmax, width, midpoint, power)
+            "default_solimp": [0.9, 0.95, 0.001, 0.5, 2.0],
+
+            # Softer tuning for the waist 4-bar linkage carrying chest + arms + head.
+            "waist_solref_timeconst": 0.02,
+            "waist_solref_dampratio": 1.0,
+            "waist_solimp": [0.9, 0.95, 0.001, 0.5, 2.0],
+
+            # Minimum rotor inertia (armature) applied to every joint that
+            # participates in an equality constraint and currently has an
+            # armature below this value.
+            "default_armature": 0.01,
+
+            # Per-joint armature. Applied when the builder's current value is
+            # smaller. Heavy-load waist joints need significantly more rotor
+            # inertia for stability.
+            "armature_overrides": {
+                "Waist_Upper_Pitch_Joint": 2.0,
+                "Waist_Pitch_Dummy_Joint": 2.0,
+                "Waist_Lower_Pitch_Joint": 0.5,
+            },
+        },          
+        "actuator_gravcomp": {                                    
+            "enabled": False,
+            "joints": [],                   # empty = active all joints                            
+        }, 
+    },
+}
 
 
 def _load() -> dict[str, Any]:
-    global _cache
-    if _cache is not None:
-        return _cache
-    if not _CONFIG_PATH.exists():
-        print(f"[ALLEX][Cfg] {_CONFIG_PATH} not found; using built-in defaults")
-        _cache = {}
-        return _cache
-    try:
-        with open(_CONFIG_PATH, "rb") as f:
-            _cache = tomllib.load(f)
-        print(f"[ALLEX][Cfg] loaded {_CONFIG_PATH}")
-    except Exception as exc:
-        print(f"[ALLEX][Cfg] failed to parse {_CONFIG_PATH}: {exc}; using defaults")
-        _cache = {}
-    return _cache
+    return _CONFIG
 
 
 def reload() -> None:
-    """Drop the cache so the next access re-reads physics.toml."""
-    global _cache
-    _cache = None
+    """No-op kept for API compatibility (config is now a Python literal)."""
+    return
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +180,7 @@ def reload() -> None:
 # ---------------------------------------------------------------------------
 
 def get_equality_tuning() -> dict[str, Any]:
-    """Return the [allex.equality] section (minus armature_overrides subtable)."""
+    """Return the allex.equality section (minus armature_overrides subtable)."""
     eq = _load().get("allex", {}).get("equality", {})
     return {k: v for k, v in eq.items() if k != "armature_overrides"}
 
@@ -92,9 +218,9 @@ def get_actuator_gravcomp_cfg() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def apply_newton_config(cfg_obj: Any) -> None:
-    """Apply [newton] and [newton.solver] TOML sections onto a NewtonConfig.
+    """Apply newton + newton.solver sections onto a NewtonConfig.
 
-    Unknown attribute names in TOML are ignored (with a log line).
+    Unknown attribute names are ignored (with a log line).
     """
     cfg = _load().get("newton", {})
     if not cfg:
@@ -128,13 +254,13 @@ def apply_newton_config(cfg_obj: Any) -> None:
 # USD /physicsScene applier
 # ---------------------------------------------------------------------------
 
-# Map: TOML snake_case key → UsdPhysics.Scene setter + expected value type
+# Map: snake_case key → UsdPhysics.Scene setter
 _USD_SCENE_KEYS = {
     "gravity_magnitude": "CreateGravityMagnitudeAttr",
     "gravity_direction": "CreateGravityDirectionAttr",
 }
 
-# Map: TOML snake_case key → PhysxSchema.PhysxSceneAPI setter
+# Map: snake_case key → PhysxSchema.PhysxSceneAPI setter
 # (Only common knobs — extend as needed.)
 _PHYSX_SCENE_KEYS = {
     "friction_cone_type":          "CreateFrictionTypeAttr",
@@ -167,7 +293,7 @@ def _find_physics_scene(stage) -> "object | None":
 
 
 def apply_usd_physics_scene(stage, scene_path: str | None = None) -> int:
-    """Apply [usd.physics_scene] + [usd.physics_scene.physx] to a stage prim.
+    """Apply usd.physics_scene + usd.physics_scene.physx to a stage prim.
 
     If scene_path is None, auto-locate the first UsdPhysics.Scene prim.
     Returns 0 (and prints) if no scene exists yet.
