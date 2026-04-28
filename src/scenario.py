@@ -122,9 +122,10 @@ class ALLEXDigitalTwin:
     def update(self, step: float):
         """매 physics step마다 호출"""
         done = self._simulation_loop.update(step)
-        # csv_replayer 는 _simulation_loop (PD generator) 직후, viz.update 직전.
-        # kinematic write 가 generator 의 apply_action 을 덮어쓴다 (의도된 동작).
-        if self._csv_replayer is not None:
+        # csv_replayer 는 기본적으로 omni.kit.app update stream (rendering tick) 으로
+        # 자체 진행한다 (kinematic replay 는 physics 와 무관). subscription 등록 실패 시
+        # fallback 으로 여기서 호출.
+        if self._csv_replayer is not None and not self._csv_replayer.is_self_ticking():
             try:
                 self._csv_replayer.advance()
             except Exception as e:

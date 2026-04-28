@@ -64,6 +64,6 @@ class UIConfig:
     JOINT_CONTROL_COLLAPSED = True
     VISUALIZER_COLLAPSED = True
 
-    PHYSICS_DT = 1 / 50.0
+    PHYSICS_DT = 1 / 40.0
     RENDERING_DT = 1 / 60.0
     GRAVITY = [0, 0, -9.81]

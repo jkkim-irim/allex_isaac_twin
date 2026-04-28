@@ -38,8 +38,8 @@ TORQUE_MAX_SCALE = 3.0
 # ========================================
 TORQUE_GAIN_SHOULDER = 0.02   # 어깨 — 토크가 커서 기본값보다 줄임
 TORQUE_GAIN_ELBOW    = 0.02   # 팔꿈치
-TORQUE_GAIN_WRIST    = 0.15   # 손목 — 토크가 작아서 기본값보다 키움
-TORQUE_GAIN_FINGER   = 0.20   # 손가락 — 토크가 매우 작음
+TORQUE_GAIN_WRIST    = 0.08   # 손목 — 토크가 작아서 기본값보다 키움
+TORQUE_GAIN_FINGER   = 0.15   # 손가락 — 토크가 매우 작음
 
 
 # ========================================
@@ -77,9 +77,9 @@ def _ring_offset_for(joint_name: str) -> float:
 # ========================================
 # Force 화살표 스케일
 # ========================================
-FORCE_GAIN = 0.5
-FORCE_MIN_SCALE = -3.0
-FORCE_MAX_SCALE = 3.0
+FORCE_GAIN = 0.3
+FORCE_MIN_SCALE = -60.0
+FORCE_MAX_SCALE = 60.0
 
 
 # ========================================
@@ -101,7 +101,10 @@ _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 EXT_ROOT = os.path.abspath(os.path.join(_CONFIG_DIR, "..", ".."))
 TORQUE_VIZ_USD_PATH = os.path.join(EXT_ROOT, "asset", "utils", "torque_viz.usd")
 # force 화살표 asset 교체: 정적 force_viz.usd → 길이 가변 force_vec.usda (Arrow/Shaft + Arrow/Head)
+# - FORCE_VIZ_USD_PATH      : 손에 붙은 12 link 자동 force_viz 용 (가는 shaft, 작은 head)
+# - FORCE_VIZ_CUSTOM_USD_PATH: CSV replay 등 add_custom_force_vector 용 (두께 2배 thick 버전)
 FORCE_VIZ_USD_PATH = os.path.join(EXT_ROOT, "asset", "utils", "force_vec.usda")
+FORCE_VIZ_CUSTOM_USD_PATH = os.path.join(EXT_ROOT, "asset", "utils", "force_vec_thick.usda")
 
 
 # ========================================
@@ -116,6 +119,11 @@ FORCE_VEC_SHAFT_BASE_LENGTH = 0.005
 FORCE_VEC_HEAD_BASE_TRANSLATE_Z = 0.0
 # force 길이 스케일을 적용할 축 (force_vec 의 shaft 축은 +Z)
 FORCE_VEC_LENGTH_AXIS = 2  # 0=X, 1=Y, 2=Z
+
+# 화살표 visibility 임계 — clip(|F|*gain, lo, hi) 결과 s 가 이 값 미만이면 화살표 hide.
+# 입력이 너무 작아 의미 없는 micro-force frame 시각 노이즈 제거.
+# 12 link auto force_viz 는 raw_value 항상 0 이라 항상 hide 됨 (real 토픽 wire up 전).
+FORCE_VEC_HIDE_BELOW = 0.005
 
 
 # ========================================

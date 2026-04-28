@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -28,6 +30,22 @@ logger = logging.getLogger("allex.replay.csv")
 
 
 _ZERO_VEC_EPS = 1e-6
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 디버그 export — replay 동안 매 sample 의 contact_pos / aggregate_origin 을
+# (world, link-local) frame 둘 다로 기록해서 stop() 시 CSV 로 저장.
+# 자주 쓰는 기능이 아니라서 module-level flag 로 on/off 만 토글한다.
+# True → trajectory/<group>/contact_local_<csv_stem>.csv 에 저장.
+EXPORT_CONTACT_LOCAL_CSV: bool = False
+# CSV pair / aggregate 이름은 collision region 단위 (예: "R_Palm_Back") 라
+# 실제 articulation link 이름과 다름. 매핑 못 하는 토큰은 여기서 link 로 보정.
+EXPORT_LINK_ALIAS: dict[str, str] = {
+    "R_Palm_Back": "R_Palm",
+    "L_Palm_Back": "L_Palm",
+    # "L_Elbow"/"R_Elbow"/"R_Palm" 는 그대로 사용 (실제 link 이름과 일치).
+}
+# ─────────────────────────────────────────────────────────────────────
 
 
 def _other_source(src: str) -> str:
@@ -142,6 +160,9 @@ class CsvReplayer:
         # custom force vector 등록 상태 — (sanitized_pair, source) 가 add 됐는지.
         self._registered_force_keys: set[tuple[str, str]] = set()
 
+        # debug pause/resume 용 — wall-clock baseline 보정.
+        self._pause_t: Optional[float] = None
+
         self._t0: Optional[float] = None
         self._finished: bool = False
         self._step_count: int = 0
@@ -149,6 +170,31 @@ class CsvReplayer:
         self._csv_t0_sec = (
             float(self._sec.t[0]) if (self._sec is not None and self._sec.num_samples) else 0.0
         )
+
+        # rendering tick subscription — kinematic replay 는 physics 와 무관하게
+        # 매 rendering frame 마다 진행해야 함 (timeline pause / physics rate 변경에 영향 X).
+        self._update_sub = None
+        self._self_ticking: bool = False
+
+        # contact-local CSV export 버퍼 (flag on 일 때만).
+        self._export_records: Optional[list[dict]] = None
+        self._export_pair_to_links: dict[str, list[str]] = {}
+        self._export_agg_to_links: dict[str, list[str]] = {}
+        if EXPORT_CONTACT_LOCAL_CSV:
+            self._export_records = []
+            # sanitized "L_Elbow__R_Palm_Back" → ["L_Elbow", "R_Palm_Back"]
+            for sanitized in self._main.pair_force_vec.keys():
+                parts = sanitized.split("__")
+                if len(parts) == 2:
+                    self._export_pair_to_links[sanitized] = parts
+            # aggregate "R_Palm_Net_Force" → "R_Palm" (trailing _Net_Force strip).
+            for tag in self._main.aggregate.keys():
+                base = tag
+                for suffix in ("_Net_Force", "_Force", "_Net"):
+                    if base.endswith(suffix):
+                        base = base[: -len(suffix)]
+                        break
+                self._export_agg_to_links[tag] = [base]
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -173,18 +219,46 @@ class CsvReplayer:
             f"secondary={sec_tag}"
         )
 
+
+        # rendering tick (= 매 frame) subscription. 성공하면 scenario.update() 의
+        # physics-step driven advance 호출은 skip 됨 (is_self_ticking() 이 True).
+        try:
+            import omni.kit.app
+            stream = omni.kit.app.get_app().get_update_event_stream()
+            self._update_sub = stream.create_subscription_to_pop(
+                self._on_render_tick, name="allex.replay.csv.tick"
+            )
+            self._self_ticking = True
+            logger.info("[replay] subscribed to omni.kit.app update stream (rendering tick)")
+        except Exception as exc:
+            logger.warning(
+                f"[replay] rendering tick subscribe failed: {exc} — "
+                f"falling back to physics-step driven advance"
+            )
+            self._update_sub = None
+            self._self_ticking = False
+
         # CSV replay 동안 viz.update() 가 자체 qfrc 로 sim/real ring 을 덮어쓰지 않도록
         # 채널 lock — kinematic replay 는 actuator force 가 0 이라 그대로 두면 push 한
         # 값이 매 step 0 으로 리셋됨.
         viz = self._viz
+        sources = {self._main_src}
+        if self._sec is not None:
+            sources.add(self._sec_src)
         if viz is not None and hasattr(viz, "set_external_torque_sources"):
-            sources = {self._main_src}
-            if self._sec is not None:
-                sources.add(self._sec_src)
             try:
                 viz.set_external_torque_sources(sources)
             except Exception as exc:
                 logger.debug(f"[replay] set_external_torque_sources warn: {exc}")
+
+        # replay 용 custom force prim 가시성 bypass — global force/torque mode 는 건드리지
+        # 않고 (사용자 토글 존중), replayer 가 등록한 prim 만 mode 와 무관하게 항상 보이게.
+        # 이 플래그가 없으면 default mode "off" 일 때 prim 은 만들어져도 invisible.
+        if viz is not None and hasattr(viz, "set_replay_force_visible"):
+            try:
+                viz.set_replay_force_visible(True)
+            except Exception as exc:
+                logger.debug(f"[replay] set_replay_force_visible warn: {exc}")
 
         # TorquePlotter override — plot 도 articulation qfrc 대신 CSV 값을 그리게.
         # 첫 frame 으로 1회 채워두고 reference 등록 (이후 advance 에서 매 step 갱신).
@@ -203,6 +277,19 @@ class CsvReplayer:
                 logger.debug(f"[replay] plotter override register warn: {exc}")
 
     def stop(self) -> None:
+        # rendering tick subscription 먼저 해제 — 더 이상 advance 안 불리도록.
+        if self._update_sub is not None:
+            try:
+                self._update_sub.unsubscribe()
+            except Exception:
+                try:
+                    # 일부 버전은 .unsubscribe() 대신 del/None 이면 GC.
+                    self._update_sub = None
+                except Exception:
+                    pass
+            self._update_sub = None
+        self._self_ticking = False
+
         if self._t0 is None and not self._registered_force_keys:
             return
         self._t0 = None
@@ -222,6 +309,12 @@ class CsvReplayer:
                     viz.set_external_torque_sources(set())
                 except Exception as exc:
                     logger.debug(f"[replay] release torque lock warn: {exc}")
+            # replay 용 visibility bypass 해제 — 다시 global mode 에 따라 가려지도록.
+            if hasattr(viz, "set_replay_force_visible"):
+                try:
+                    viz.set_replay_force_visible(False)
+                except Exception as exc:
+                    logger.debug(f"[replay] clear_replay_force_visible warn: {exc}")
         # plotter override 해제 — articulation 폴링 경로 복귀.
         for plotter in self._plotters:
             try:
@@ -232,17 +325,68 @@ class CsvReplayer:
             except Exception as exc:
                 logger.debug(f"[replay] plotter override clear warn: {exc}")
         self._registered_force_keys.clear()
+        # contact-local CSV flush (flag on 일 때만).
+        if self._export_records is not None:
+            try:
+                self._write_export_csv()
+            except Exception as exc:
+                logger.warning(f"[replay] export CSV flush warn: {exc}")
         logger.info("[replay] stopped")
+
+    def is_self_ticking(self) -> bool:
+        """True 이면 rendering tick 으로 자체 진행 — scenario.update() 는 advance 호출 skip."""
+        return self._self_ticking
+
+    def _on_render_tick(self, _event) -> None:
+        """omni.kit.app update stream callback — rendering frame 마다 호출."""
+        if not self.is_active():
+            return
+        try:
+            self.advance()
+        except Exception as exc:
+            logger.warning(f"[replay] render-tick advance warn: {exc}")
 
     # ------------------------------------------------------------------
     # Per-step
     # ------------------------------------------------------------------
+    # 디버깅용 슬로우모션 — contact frame 을 Property panel 로 inspect 하기 좋게.
+    # 1.0 = realtime, 0.1 = 10배 느리게, 0.0 < x < 1 권장. 운영시 1.0 으로 둘 것.
+    TIME_SCALE: float = 1.0
+
+    # 외부에서 토글 가능한 pause flag — True 면 advance 가 idx 진행 멈춤 (현재 frame 유지).
+    _paused: bool = False
+
+    def set_time_scale(self, scale: float) -> None:
+        """0.1 = 10x 느리게. 1.0 = 정속. <0 또는 0 은 무시."""
+        if scale > 0:
+            self.TIME_SCALE = float(scale)
+            logger.warning(f"[replay] TIME_SCALE set to {self.TIME_SCALE}")
+
+    def pause(self) -> None:
+        self._paused = True
+        logger.warning("[replay] paused")
+
+    def resume(self) -> None:
+        # 일시정지 해제 시 t0 를 보정해 그동안 흐른 시간을 빼줌 — idx 가 점프하지 않게.
+        if self._paused and self._t0 is not None and self._pause_t is not None:
+            self._t0 += time.monotonic() - self._pause_t
+        self._paused = False
+        self._pause_t = None
+        logger.warning("[replay] resumed")
+
     def advance(self) -> None:
-        """Per physics step — call from scenario.update() before viz.update."""
+        """Per render tick (or physics step in fallback) — kinematic write + viz/plot push."""
         if not self.is_active():
             return
 
-        elapsed = time.monotonic() - (self._t0 or 0.0)
+        if self._paused:
+            # pause 시작 시점 기록 (resume 에서 t0 보정용).
+            if getattr(self, "_pause_t", None) is None:
+                self._pause_t = time.monotonic()
+            return
+
+        # TIME_SCALE 적용 — wall-clock 경과 × scale 만큼만 CSV 진행.
+        elapsed = (time.monotonic() - (self._t0 or 0.0)) * self.TIME_SCALE
         if elapsed >= self._main.duration_s:
             # 마지막 프레임을 한 번 적용한 뒤 자동 stop.
             self._apply_at(self._main.num_samples - 1, sec_idx=None)
@@ -271,10 +415,6 @@ class CsvReplayer:
         if viz is None:
             return
 
-        # 진단: 첫 step 에서 실제로 push 되는 값의 magnitude 확인.
-        if self._step_count == 0:
-            self._diag_push_values(idx_main)
-
         # 2) main torque → main_src ring channel.
         for csv_joint, arr in self._main.torque.items():
             try:
@@ -287,6 +427,10 @@ class CsvReplayer:
 
         # 3) main force vectors (per-pair + aggregates) → main_src.
         self._push_force_frame(self._main, idx_main, self._main_src)
+
+        # 3.5) contact-local CSV export (debug flag on 일 때만).
+        if self._export_records is not None:
+            self._sample_local_contacts(idx_main)
 
         # 4) secondary (optional) — visibility 는 visualizer set_mode 가 결정.
         if self._sec is not None and sec_idx is not None:
@@ -327,25 +471,7 @@ class CsvReplayer:
         for _name, dof_idx, arr in self._pos_plan:
             self._q_buf[dof_idx] = float(arr[idx])
 
-        # 3) 첫 호출 시 backend 진단 — 어떤 형태가 통하는지 1회 로깅.
-        if self._step_count == 0:
-            try:
-                from isaacsim.core.simulation_manager import SimulationManager
-                be = SimulationManager.get_backend()
-                dev = SimulationManager.get_physics_sim_device()
-            except Exception as e:
-                be, dev = f"<err:{e}>", "?"
-            cur_kind = type(cur_t).__name__ if cur_t is not None else "None"
-            cur_dtype = getattr(cur_t, "dtype", None)
-            cur_device = getattr(cur_t, "device", None)
-            logger.warning(
-                f"[replay][diag] backend={be} sim_device={dev} "
-                f"articulation={type(articulation).__name__} "
-                f"get_joint_positions: kind={cur_kind} dtype={cur_dtype} device={cur_device} "
-                f"num_dof={self._num_dof}"
-            )
-
-        # 4) Newton set_joint_positions 는 torch tensor 요구 (.to(device) 호출).
+        # 3) Newton set_joint_positions 는 torch tensor 요구 (.to(device) 호출).
         try:
             import torch
         except ImportError:
@@ -374,13 +500,7 @@ class CsvReplayer:
         cpu_tensor = torch.from_numpy(self._q_buf)
         self._q_buf_t[0].copy_(cpu_tensor)
 
-        # 5) Kinematic write via inner Articulation view (bypass wrapper).
-        if self._step_count == 0:
-            logger.warning(
-                f"[replay][diag] inner view={type(view).__name__} view._device={view_device} "
-                f"q_buf_t dtype={self._q_buf_t.dtype} device={self._q_buf_t.device} "
-                f"shape={tuple(self._q_buf_t.shape)}"
-            )
+        # 4) Kinematic write via inner Articulation view (bypass wrapper).
         try:
             view.set_joint_positions(self._q_buf_t)
         except Exception as exc:
@@ -395,6 +515,137 @@ class CsvReplayer:
                 import traceback
                 tb = traceback.format_exc()
                 logger.warning(f"[replay] set_joint_velocities warn: {exc}\n{tb}")
+
+    # ------------------------------------------------------------------
+    # Contact-local CSV export (debug)
+    # ------------------------------------------------------------------
+    def _sample_local_contacts(self, idx: int) -> None:
+        """non-zero contact_pos / aggregate_origin 을 link local frame 으로 변환해 buffer 에 적재."""
+        try:
+            import omni.usd
+            from pxr import Gf, Usd, UsdGeom
+        except Exception:
+            return
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return
+
+        def _to_local(link_name: str, wx: float, wy: float, wz: float):
+            # CSV pair 이름은 collision region 일 수 있음 → 실제 link 로 alias.
+            resolved = EXPORT_LINK_ALIAS.get(link_name, link_name)
+            prim_path = f"/ALLEX/{resolved}_Link"
+            prim = stage.GetPrimAtPath(prim_path)
+            if not (prim and prim.IsValid()):
+                # 첫 sample 에 한 번 경고 — prim path convention 이 다르면 lookup 전부 fail.
+                if not getattr(self, "_export_link_warned", False):
+                    logger.warning(
+                        f"[replay][export] link prim missing: {prim_path} — "
+                        f"local-frame conversion will be skipped for '{link_name}'. "
+                        f"Stage 의 articulation root 가 다른 경로면 csv_replayer.py 의 "
+                        f"_to_local prim_path 를 수정해야 합니다."
+                    )
+                    self._export_link_warned = True
+                return None
+            try:
+                xf = UsdGeom.Xformable(prim)
+                mat = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                inv = mat.GetInverse()
+                lp = inv.Transform(Gf.Vec3d(wx, wy, wz))
+                # 첫 valid 변환 1회 진단 — link world pose 와 변환 결과 dump.
+                if not getattr(self, "_export_dump_done", False):
+                    t = mat.ExtractTranslation()
+                    logger.warning(
+                        f"[replay][export] first convert: link={link_name} "
+                        f"link_world_translate=({float(t[0]):.4f},{float(t[1]):.4f},{float(t[2]):.4f}) "
+                        f"world_pt=({wx:.4f},{wy:.4f},{wz:.4f}) "
+                        f"→ local=({float(lp[0]):.4f},{float(lp[1]):.4f},{float(lp[2]):.4f})"
+                    )
+                    self._export_dump_done = True
+                return (float(lp[0]), float(lp[1]), float(lp[2]))
+            except Exception as e:
+                if not getattr(self, "_export_xform_warned", False):
+                    logger.warning(f"[replay][export] xform compute warn ({link_name}): {e}")
+                    self._export_xform_warned = True
+                return None
+
+        # pair contacts
+        for sanitized, _ in self._main.pair_force_vec.items():
+            origin_arr = self._main.pair_contact_pos.get(sanitized)
+            if origin_arr is None:
+                continue
+            wx = float(origin_arr[idx][0])
+            wy = float(origin_arr[idx][1])
+            wz = float(origin_arr[idx][2])
+            if wx == 0.0 and wy == 0.0 and wz == 0.0:
+                continue
+            if not (np.isfinite(wx) and np.isfinite(wy) and np.isfinite(wz)):
+                continue
+            for link_name in self._export_pair_to_links.get(sanitized, []):
+                local = _to_local(link_name, wx, wy, wz)
+                if local is None:
+                    continue
+                self._export_records.append({
+                    "group": sanitized, "link": link_name, "frame_idx": idx,
+                    "world_x": wx, "world_y": wy, "world_z": wz,
+                    "local_x": local[0], "local_y": local[1], "local_z": local[2],
+                })
+
+        # aggregates
+        for tag, agg in self._main.aggregate.items():
+            wx = float(agg["origin"][idx][0])
+            wy = float(agg["origin"][idx][1])
+            wz = float(agg["origin"][idx][2])
+            if wx == 0.0 and wy == 0.0 and wz == 0.0:
+                continue
+            if not (np.isfinite(wx) and np.isfinite(wy) and np.isfinite(wz)):
+                continue
+            for link_name in self._export_agg_to_links.get(tag, []):
+                local = _to_local(link_name, wx, wy, wz)
+                if local is None:
+                    continue
+                self._export_records.append({
+                    "group": tag, "link": link_name, "frame_idx": idx,
+                    "world_x": wx, "world_y": wy, "world_z": wz,
+                    "local_x": local[0], "local_y": local[1], "local_z": local[2],
+                })
+
+    def _write_export_csv(self) -> None:
+        if not self._export_records:
+            logger.info("[replay] export csv: no records to write")
+            return
+        out_path = self._main.path.parent / f"contact_local_{self._main.path.stem}.csv"
+        fieldnames = ["group", "link", "frame_idx",
+                      "world_x", "world_y", "world_z",
+                      "local_x", "local_y", "local_z"]
+        try:
+            import csv
+            with out_path.open("w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for rec in self._export_records:
+                    w.writerow(rec)
+                # per (group, link) average row
+                agg = defaultdict(lambda: [0.0] * 6 + [0])
+                for rec in self._export_records:
+                    key = (rec["group"], rec["link"])
+                    agg[key][0] += rec["world_x"]; agg[key][1] += rec["world_y"]; agg[key][2] += rec["world_z"]
+                    agg[key][3] += rec["local_x"]; agg[key][4] += rec["local_y"]; agg[key][5] += rec["local_z"]
+                    agg[key][6] += 1
+                for (group, link), s in agg.items():
+                    n = s[6]
+                    if n == 0:
+                        continue
+                    w.writerow({
+                        "group": group, "link": link, "frame_idx": f"AVG (n={n})",
+                        "world_x": s[0] / n, "world_y": s[1] / n, "world_z": s[2] / n,
+                        "local_x": s[3] / n, "local_y": s[4] / n, "local_z": s[5] / n,
+                    })
+            logger.info(
+                f"[replay] contact-local CSV written: {out_path}  "
+                f"records={len(self._export_records)}, groups={len(agg)}"
+            )
+        except Exception as exc:
+            logger.warning(f"[replay] export CSV write failed: {exc}")
 
     def _refresh_plot_buffers(self, idx_main: int, idx_sec: Optional[int]) -> None:
         """plotter override 버퍼를 현재 frame 기준으로 다시 채운다.
@@ -437,44 +688,6 @@ class CsvReplayer:
             else:
                 _fill_real_from(self._sec, idx_sec)
 
-    def _diag_push_values(self, idx: int) -> None:
-        """첫 step 진단 — main reader 의 torque/force 값 magnitude 와 channel 보고."""
-        viz = self._viz
-        # torque: 처음 3개 joint 의 값 + 최대 abs.
-        torque_items = list(self._main.torque.items())
-        torque_max = max((abs(float(arr[idx])) for _, arr in torque_items), default=0.0)
-        torque_sample = [(n, float(arr[idx])) for n, arr in torque_items[:3]]
-        # pair force: vector norm 의 max.
-        pair_max = 0.0
-        pair_sample = None
-        for pair, vec_arr in self._main.pair_force_vec.items():
-            v = vec_arr[idx]
-            n = float((v[0]**2 + v[1]**2 + v[2]**2) ** 0.5)
-            if n > pair_max:
-                pair_max = n
-                pair_sample = (pair, v.tolist())
-        # aggregate: mag.
-        agg_max = 0.0
-        agg_sample = None
-        for tag, agg in self._main.aggregate.items():
-            m = float(agg["mag"][idx])
-            if abs(m) > abs(agg_max):
-                agg_max = m
-                agg_sample = (tag, m, agg["normal"][idx].tolist())
-        logger.warning(
-            f"[replay][diag] push values @idx={idx} src={self._main_src} "
-            f"torque_max={torque_max:.3f} sample={torque_sample} "
-            f"pair_max={pair_max:.3f} sample={pair_sample} "
-            f"agg_max={agg_max:.3f} sample={agg_sample}"
-        )
-        # visualizer 채널 상태 — 메서드가 있다면 mode dump.
-        for attr in ("get_mode", "get_torque_mode"):
-            if hasattr(viz, attr):
-                try:
-                    logger.warning(f"[replay][diag] viz.{attr}() = {getattr(viz, attr)()}")
-                except Exception as e:
-                    logger.warning(f"[replay][diag] viz.{attr} err: {e}")
-
     def _push_force_frame(self, reader: ShowcaseReader, idx: int, source: str) -> None:
         viz = self._viz
         if viz is None:
@@ -488,11 +701,16 @@ class CsvReplayer:
             self._set_or_add(viz, sanitized_pair, source, origin, vec)
 
         # ---- aggregate (R_Palm_Net_Force 등) ----
+        # 부호 반전 — CSV 의 normal 은 contact 면이 받는 reaction 기준이라 palm 안쪽
+        # (= 손바닥 아래) 으로 향함. 시각적으로 손등 위로 솟는 게 보기 좋아 -1 곱한다.
+        # 양쪽 동시 표시가 필요하면 두 개 prim 으로 분리하면 됨.
         for tag, agg in reader.aggregate.items():
             mag = float(agg["mag"][idx])
             normal = agg["normal"][idx]
             origin = agg["origin"][idx]
-            vec = (float(normal[0]) * mag, float(normal[1]) * mag, float(normal[2]) * mag)
+            vec = (-float(normal[0]) * mag,
+                   -float(normal[1]) * mag,
+                   -float(normal[2]) * mag)
             self._set_or_add(viz, tag, source, origin, vec)
 
     def _set_or_add(self, viz, name: str, source: str, origin, vec) -> None:
@@ -510,19 +728,70 @@ class CsvReplayer:
         key = (name, source)
         if key not in self._registered_force_keys:
             try:
-                viz.add_custom_force_vector(
+                ret = viz.add_custom_force_vector(
                     name, position=(ox, oy, oz), vector=(fx, fy, fz), source=source,
                 )
-                self._registered_force_keys.add(key)
+                logger.debug(
+                    f"[replay] add_custom_force_vector(name={name!r}, src={source}) "
+                    f"→ {ret!r}"
+                )
+                if ret is not None:
+                    self._registered_force_keys.add(key)
+                    # stage 에서 prim 실재 여부 검증 (1회).
+                    try:
+                        import omni.usd
+                        st = omni.usd.get_context().get_stage()
+                        if st is not None:
+                            p = st.GetPrimAtPath(ret)
+                            if not (p and p.IsValid()):
+                                logger.warning(
+                                    f"[replay] add_custom_force_vector created prim "
+                                    f"but stage lookup invalid: {ret}"
+                                )
+                    except Exception as e:
+                        logger.debug(f"[replay] stage check warn: {e}")
             except Exception as exc:
-                logger.debug(f"[replay] add_custom_force_vector warn: {exc}")
+                import traceback
+                logger.warning(f"[replay] add_custom_force_vector raised: {exc}\n{traceback.format_exc()}")
             return
 
-        # 0 vector 면 update 만 — visualizer 가 length 0 으로 그려서 거의 안 보임.
+        # force ≈ 0 이면 prim hide — set_custom_force_vector 가 _apply_force_vector(mag=0)
+        # 로 shaft scale Z=0 (collapse) + head translate Z=-L_base (mesh 망가짐) 만들어서
+        # collapsed 화살표가 visible 인 채 남는 걸 방지.
+        mag = (fx * fx + fy * fy + fz * fz) ** 0.5
+        zero_force = mag < _ZERO_VEC_EPS
         try:
-            viz.set_custom_force_vector(
-                name, position=(ox, oy, oz), vector=(fx, fy, fz), source=source,
-            )
+            if zero_force:
+                self._set_force_prim_visible(viz, name, source, False)
+            else:
+                self._set_force_prim_visible(viz, name, source, True)
+                viz.set_custom_force_vector(
+                    name, position=(ox, oy, oz), vector=(fx, fy, fz), source=source,
+                )
         except Exception as exc:
             if self._step_count % 200 == 0:
                 logger.debug(f"[replay] set_custom_force_vector warn: {exc}")
+
+    def _set_force_prim_visible(self, viz, name: str, source: str, visible: bool) -> None:
+        """custom force prim 한 개의 visibility 만 토글 — global mode 와 무관.
+        visualizer 의 _custom_force_prims 에서 prim 직접 가져와 MakeVisible/Invisible.
+        """
+        try:
+            key = f"{source}::{name}"
+            rec = getattr(viz, "_custom_force_prims", {}).get(key)
+            if rec is None:
+                return
+            prim = rec.get("prim")
+            if prim is None:
+                return
+            from pxr import UsdGeom
+            if not prim.IsValid():
+                return
+            imageable = UsdGeom.Imageable(prim)
+            if visible:
+                imageable.MakeVisible()
+            else:
+                imageable.MakeInvisible()
+        except Exception as exc:
+            logger.debug(f"[replay] per-prim visibility toggle warn: {exc}")
+

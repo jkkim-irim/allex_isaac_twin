@@ -32,13 +32,13 @@ from ..config.viz_config import (
     FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE,
     FORCE_VIZ_REAL_NAME, FORCE_VIZ_SIM_NAME,
     TORQUE_RING_REAL_NAME, TORQUE_RING_SIM_NAME,
-    TORQUE_VIZ_USD_PATH, FORCE_VIZ_USD_PATH,
+    TORQUE_VIZ_USD_PATH, FORCE_VIZ_USD_PATH, FORCE_VIZ_CUSTOM_USD_PATH,
     HAND_JOINT_TORQUE_RING_MAP, HAND_JOINT_TORQUE_RING_TUPLES,
     FORCE_VIZ_PARENT_LINKS,
     FORCE_VIZ_VISUAL_SUBPATH,
     FORCE_VEC_SHAFT_NAME, FORCE_VEC_HEAD_NAME,
     FORCE_VEC_SHAFT_BASE_LENGTH, FORCE_VEC_HEAD_BASE_TRANSLATE_Z,
-    FORCE_VEC_LENGTH_AXIS,
+    FORCE_VEC_LENGTH_AXIS, FORCE_VEC_HIDE_BELOW,
 )
 
 
@@ -108,6 +108,16 @@ class ForceTorqueVisualizer:
         # update() 의 자체 articulation 측정으로 덮어쓰지 않도록 채널을 잠그는 플래그.
         # 원소: "sim" / "real". 비어있으면 기존 동작과 동일.
         self._external_torque_sources: set = set()
+
+        # CSV replay 동안 custom force prim 을 force-mode 와 무관하게 보이게 하는 bypass.
+        # True 이면 _apply_visibility() 가 source="sim"/"real" custom prim 도 항상 visible
+        # 처리. user 가 force/torque mode 토글을 안 켜도 replay 가 등록한 화살표는 보임.
+        self._replay_force_visible: bool = False
+
+        # _apply_force_scale 가 임계 미만 입력에 대해 prim 을 hide 한 상태 추적.
+        # cache 유무와 무관하게 모든 force 화살표에 적용 — fallback path 도 커버.
+        # 매 frame USD write 가 발생하지 않도록 transition 시에만 _set_visible 호출.
+        self._threshold_hide_state: dict = {}
 
         # 생성한 prim 캐시
         self._torque_ring_prims: dict = {}   # dof_abbr -> {"real": prim, "sim": prim}
@@ -367,6 +377,15 @@ class ForceTorqueVisualizer:
         """하위호환 — True → both, False → off."""
         self.set_torque_mode("both" if visible else "off")
 
+    def set_replay_force_visible(self, visible: bool) -> None:
+        """CSV replay 가 등록한 custom force prim 을 global force mode 토글과
+        무관하게 보이도록 강제. ``_apply_visibility()`` 에서 source="sim"/"real"
+        custom prim 만 영향을 받음 — link standard arrow / torque ring 은 원래
+        모드 그대로 유지된다.
+        """
+        self._replay_force_visible = bool(visible)
+        self._apply_visibility()
+
     # ========================================
     # External torque push — CSV replay 용
     # ========================================
@@ -481,8 +500,13 @@ class ForceTorqueVisualizer:
             logger.warning("[viz] add_custom_force_vector: stage unavailable")
             return None
 
-        if not os.path.exists(FORCE_VIZ_USD_PATH):
-            logger.warning(f"[viz] force_vec.usda missing: {FORCE_VIZ_USD_PATH}")
+        # custom force vector 는 thick 버전 mesh 사용 (12 link auto force_viz 와 분리).
+        # 없으면 fallback 으로 기본 force_vec.usda 사용.
+        usd_path = (FORCE_VIZ_CUSTOM_USD_PATH
+                    if os.path.exists(FORCE_VIZ_CUSTOM_USD_PATH)
+                    else FORCE_VIZ_USD_PATH)
+        if not os.path.exists(usd_path):
+            logger.warning(f"[viz] force vec asset missing: {usd_path}")
             return None
 
         from pxr import Gf, UsdGeom, Sdf
@@ -524,7 +548,7 @@ class ForceTorqueVisualizer:
             source, REAL_COLOR
         )
         prim = self._create_force_ref_xform(
-            stage, prim_path, FORCE_VIZ_USD_PATH,
+            stage, prim_path, usd_path,
             tuple(float(c) for c in position), orient_q, (1, 1, 1),
             eff_color,
         )
@@ -1070,10 +1094,11 @@ class ForceTorqueVisualizer:
                 self._scale_op_cache[prim_path] = scale_op
                 self._last_scale_cache[prim_path] = float(scale[0])
 
-                if usd_path is not None:
-                    self._bind_omni_pbr_to_force_vec(stage, prim_path, color)
-                else:
-                    self._apply_display_color(prim, color)
+                # force_vec.usda mesh 는 primvars:displayColor 만으로 RTX/Storm 양쪽 다
+                # 정상 렌더된다. OmniPBR material binding 은 RTX 에서 force_viz prim 만
+                # silently 누락되는 케이스가 있어 사용하지 않는다 (link standard arrow
+                # 쪽 _ensure_force_viz_prims 도 동일 패턴이면 추가 검토 필요).
+                self._apply_display_color(prim, color)
                 return prim
         except Exception as e:
             logger.warning(f"[viz] create_force_ref_xform failed for {prim_path}: {e}")
@@ -1508,61 +1533,61 @@ class ForceTorqueVisualizer:
             # Root prim (force arrow 자체) 의 orient op 를 찾아 캐시.
             # _create_force_ref_xform 에서 identity 에 가까우면 AddOrientOp 생략하므로
             # 여기서 없으면 identity 로 강제 추가 (update 에서 갱신 가능하게).
+            # Root prim 의 xformOpOrder 를 [translate, orient, scale] 로 강제 정규화.
+            # 기존 버전은 set_custom_force_vector 가 나중에 translate 를 끝에 추가하면서
+            # [orient, scale, translate] 순으로 끝나, USD 가 translate 를 먼저 적용한 뒤
+            # orient 로 world origin 기준 회전시켜 wrapper 가 바닥에 박혔음.
+            # 표준 TRS — 첫 op (translate) 가 left-most, matrix 곱셈에서 마지막에 적용돼
+            # 회전·스케일된 local point 를 world 위치로 옮김.
             root_orient_op = None
             try:
                 root_xformable = UsdGeom.Xformable(prim)
                 existing_ops = list(root_xformable.GetOrderedXformOps())
-                for op in existing_ops:
-                    if op.GetOpType() == UsdGeom.XformOp.TypeOrient:
-                        root_orient_op = op
-                        break
-                if root_orient_op is None:
-                    # orient op 없음 → 기존 op 순서 유지한 채 orient 를
-                    # translate 뒤 / scale 앞 위치에 삽입.
-                    # USD 는 XformOp 재정렬이 어려워 ClearXformOpOrder 후 재구성.
-                    old_tuples = []
-                    for op in existing_ops:
-                        try:
-                            val = op.Get()
-                        except Exception:
-                            val = None
-                        old_tuples.append((op, val))
 
-                    root_xformable.ClearXformOpOrder()
-                    translate_readded = False
-                    for op, val in old_tuples:
-                        t = op.GetOpType()
-                        if t == UsdGeom.XformOp.TypeTranslate:
-                            new_op = root_xformable.AddTranslateOp(op.GetPrecision())
-                            if val is not None:
-                                new_op.Set(val)
-                            translate_readded = True
-                            break
-                    # orient 삽입 (identity)
-                    root_orient_op = root_xformable.AddOrientOp(
-                        UsdGeom.XformOp.PrecisionDouble
-                    )
-                    root_orient_op.Set(Gf.Quatd(1.0, 0.0, 0.0, 0.0))
-                    # 나머지 op 재추가 (translate 는 이미 추가됨, 제외)
-                    for op, val in old_tuples:
-                        t = op.GetOpType()
-                        if t == UsdGeom.XformOp.TypeTranslate and translate_readded:
-                            continue
-                        new_op = None
-                        if t == UsdGeom.XformOp.TypeScale:
-                            new_op = root_xformable.AddScaleOp(op.GetPrecision())
-                        elif t == UsdGeom.XformOp.TypeRotateXYZ:
-                            new_op = root_xformable.AddRotateXYZOp(op.GetPrecision())
-                        elif t == UsdGeom.XformOp.TypeOrient:
-                            continue  # 이미 추가됨
-                        elif t == UsdGeom.XformOp.TypeTranslate:
-                            new_op = root_xformable.AddTranslateOp(op.GetPrecision())
-                        # 기타 op 는 스킵
-                        if new_op is not None and val is not None:
-                            try:
-                                new_op.Set(val)
-                            except Exception:
-                                pass
+                # 기존 값 보존 (precision 도 같이).
+                old_translate_val = None
+                old_orient_val = None
+                old_scale_val = None
+                t_prec = UsdGeom.XformOp.PrecisionDouble
+                o_prec = UsdGeom.XformOp.PrecisionDouble
+                s_prec = UsdGeom.XformOp.PrecisionDouble
+                for op in existing_ops:
+                    try:
+                        v = op.Get()
+                    except Exception:
+                        v = None
+                    t = op.GetOpType()
+                    if t == UsdGeom.XformOp.TypeTranslate:
+                        old_translate_val = v
+                        t_prec = op.GetPrecision()
+                    elif t == UsdGeom.XformOp.TypeOrient:
+                        old_orient_val = v
+                        o_prec = op.GetPrecision()
+                    elif t == UsdGeom.XformOp.TypeScale:
+                        old_scale_val = v
+                        s_prec = op.GetPrecision()
+
+                root_xformable.ClearXformOpOrder()
+
+                # 항상 [translate, orient, scale] 순으로 재생성. 값이 없으면 identity.
+                new_t = root_xformable.AddTranslateOp(t_prec)
+                if old_translate_val is not None:
+                    new_t.Set(old_translate_val)
+                else:
+                    new_t.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+
+                new_o = root_xformable.AddOrientOp(o_prec)
+                if old_orient_val is not None:
+                    new_o.Set(old_orient_val)
+                else:
+                    new_o.Set(Gf.Quatd(1.0, 0.0, 0.0, 0.0))
+                root_orient_op = new_o
+
+                new_s = root_xformable.AddScaleOp(s_prec)
+                if old_scale_val is not None:
+                    new_s.Set(old_scale_val)
+                else:
+                    new_s.Set(Gf.Vec3d(1.0, 1.0, 1.0))
             except Exception as e:
                 logger.debug(f"[viz] root orient op setup warn ({prim_path}): {e}")
                 root_orient_op = None
@@ -1688,6 +1713,20 @@ class ForceTorqueVisualizer:
         except Exception:
             prim_path = None
 
+        # ── threshold-hide (cache 유무와 무관하게 *항상* 먼저 처리) ─────────
+        # Shaft/Head cache miss (legacy ALLEX.usd force_viz prim 등) 가 있어도
+        # 화살표 자체는 wrapper visibility 로 hide 가능해야 한다.
+        s = _clip(abs(float(raw_value)) * gain, lo, hi)
+        threshold_hidden = s < FORCE_VEC_HIDE_BELOW
+        prev_hidden = self._threshold_hide_state.get(prim_path, False) if prim_path else False
+        if threshold_hidden != prev_hidden:
+            self._set_visible(prim, not threshold_hidden)
+            if prim_path is not None:
+                self._threshold_hide_state[prim_path] = threshold_hidden
+        if threshold_hidden:
+            return  # hide 중엔 scale ops 갱신 skip
+        # ──────────────────────────────────────────────────────────────────
+
         cache = self._force_length_cache.get(prim_path) if prim_path else None
         if cache is None:
             # fallback — 전체 scale
@@ -1695,7 +1734,7 @@ class ForceTorqueVisualizer:
             return
 
         try:
-            s = _clip(abs(float(raw_value)) * gain, lo, hi)
+
             prev = cache.get("last_scale")
             if prev is not None and abs(s - prev) < _SCALE_DEADBAND:
                 return
@@ -1832,6 +1871,10 @@ class ForceTorqueVisualizer:
         - torque rings: `_torque_mode` (off/real/sim/both)
         - force arrows: `_mode` (off/real/sim/both) — 12 link arrow + custom 통합
         """
+        # mode 토글 직접 visibility 변경 → _apply_force_scale 의 threshold-hide
+        # state 를 무효화. 다음 update 에서 입력 크기에 따라 다시 hide/show 결정.
+        self._threshold_hide_state.clear()
+
         # --- torque rings ---
         show_real_torque = self._torque_mode in ("real", "both")
         show_sim_torque = self._torque_mode in ("sim", "both")
@@ -1848,10 +1891,12 @@ class ForceTorqueVisualizer:
 
         # --- custom force vectors (source 별) ---
         # source="user" 는 force mode 와 무관하게 항상 표시 (디버그 / 수동 주입용).
-        # source="real"/"sim" 은 mode 토글 따라감 → CSV 기반 viz 와 통합.
+        # source="real"/"sim" 은 기본적으로 force mode 토글 따라감.
+        # _replay_force_visible=True 이면 (CSV replay 중) source 무관 항상 보이도록 bypass.
+        replay_bypass = self._replay_force_visible
         show_per_source = {
-            "real": show_real_force,
-            "sim":  show_sim_force,
+            "real": True if replay_bypass else show_real_force,
+            "sim":  True if replay_bypass else show_sim_force,
             "user": True,
         }
         for rec in self._custom_force_prims.values():
