@@ -29,6 +29,7 @@ class ALLEXDigitalTwin:
         self._articulation = None
         self._ros2_manager = None
         self._trajectory_player = None
+        self._csv_replayer = None
         self._visualizer = None
 
         # General-purpose feedforward torque manager (control.joint_f 쓰기 +
@@ -121,6 +122,13 @@ class ALLEXDigitalTwin:
     def update(self, step: float):
         """매 physics step마다 호출"""
         done = self._simulation_loop.update(step)
+        # csv_replayer 는 _simulation_loop (PD generator) 직후, viz.update 직전.
+        # kinematic write 가 generator 의 apply_action 을 덮어쓴다 (의도된 동작).
+        if self._csv_replayer is not None:
+            try:
+                self._csv_replayer.advance()
+            except Exception as e:
+                logger.warning(f"csv_replayer advance warn: {e}")
         if self._visualizer is not None:
             try:
                 self._visualizer.update(step)
@@ -263,6 +271,12 @@ class ALLEXDigitalTwin:
 
         # Plotter 는 FF torque snapshot 을 FeedforwardTorqueManager 에서 조회.
         ff_provider = self._ff_manager.get_last
+        # ROS2-fed real torque snapshot. JointController 가 없거나 메서드가
+        # 없으면 None 으로 두고 plotter 는 real 라인을 비활성화한다.
+        real_provider = None
+        jc = self._joint_controller
+        if jc is not None and hasattr(jc, "get_torque_snapshot"):
+            real_provider = jc.get_torque_snapshot
 
         # Stop any previous plotter subprocesses cleanly before rebuilding.
         self._stop_torque_plotters()
@@ -273,6 +287,7 @@ class ALLEXDigitalTwin:
                 ff_provider=ff_provider,
                 subset="body",
                 ff_manager=self._ff_manager,
+                real_provider=real_provider,
             )
             register_singleton("body", self._torque_plotter_body)
         except Exception as exc:
@@ -285,6 +300,7 @@ class ALLEXDigitalTwin:
                 ff_provider=ff_provider,
                 subset="hand",
                 ff_manager=self._ff_manager,
+                real_provider=real_provider,
             )
             register_singleton("hand", self._torque_plotter_hand)
         except Exception as exc:
@@ -298,16 +314,49 @@ class ALLEXDigitalTwin:
         self._ros2_manager = ros2_manager
 
     def set_trajectory_player(self, player):
-        """Install a TrajectoryPlayer; replaces any existing one."""
+        """Install a TrajectoryPlayer; replaces any existing one.
+
+        CsvReplayer 와 상호배타 — trajectory player 를 활성화하면 csv_replayer 가
+        자동 stop.
+        """
         if self._trajectory_player is not None:
             try:
                 self._trajectory_player.stop()
             except Exception:
                 pass
+        # csv_replayer 와 동시 활성화 금지 (kinematic vs PD 충돌).
+        if player is not None and self._csv_replayer is not None:
+            try:
+                self._csv_replayer.stop()
+            except Exception:
+                pass
+            self._csv_replayer = None
         self._trajectory_player = player
 
     def get_trajectory_player(self):
         return self._trajectory_player
+
+    def set_csv_replayer(self, replayer):
+        """Install a CsvReplayer; replaces any existing one.
+
+        TrajectoryPlayer 와 상호배타 — set 시 trajectory player 를 자동 stop.
+        replayer=None 으로 호출하면 현재 replayer 를 stop + 제거.
+        """
+        if self._csv_replayer is not None and self._csv_replayer is not replayer:
+            try:
+                self._csv_replayer.stop()
+            except Exception:
+                pass
+        if replayer is not None and self._trajectory_player is not None:
+            try:
+                self._trajectory_player.stop()
+            except Exception:
+                pass
+            self._trajectory_player = None
+        self._csv_replayer = replayer
+
+    def get_csv_replayer(self):
+        return self._csv_replayer
 
     # ========================================
     # Torque plotter accessors (UI uses these)

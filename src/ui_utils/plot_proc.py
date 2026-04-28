@@ -84,17 +84,24 @@ def _stdin_reader_loop(
     groups_joint_count: list[int],
     shared_t: deque,
     group_joint_dqs: list[list[deque]],
+    group_real_dqs: Optional[list[list[deque]]],
     stop_event: threading.Event,
 ) -> None:
     """Read stdin lines, route samples into shared t + per-group joint deques.
 
     ``shared_t`` holds one timestamp per sample.
-    ``group_joint_dqs[g][j]`` holds the y-value stream for joint ``j`` of
+    ``group_joint_dqs[g][j]`` holds the sim y-value stream for joint ``j`` of
     group ``g``. The incoming ``y`` list is flat across all groups in the
     order given by the init handshake; ``groups_joint_count[g]`` slices
     that flat list.
+
+    ``group_real_dqs`` (None when ``has_real`` was False) mirrors the same
+    shape and is fed from the optional ``y_real`` field. When ``has_real``
+    is True but a frame omits ``y_real``, real deques are padded with 0.0
+    to keep length parity with the sim deques and ``shared_t``.
     """
     total_expected = sum(groups_joint_count)
+    has_real = group_real_dqs is not None
     received = 0
     for raw in stdin:
         if stop_event.is_set():
@@ -121,15 +128,32 @@ def _stdin_reader_loop(
             _log(f"y length mismatch: got {len(y) if isinstance(y, list) else '?'} "
                  f"expected {total_expected}; drop")
             continue
+        # Validate optional real payload before any append so that sim/real/t
+        # deques stay length-aligned. If real is enabled but y_real is missing
+        # or wrong length, fall back to zeros.
+        y_real_use: Optional[list] = None
+        if has_real:
+            y_real = obj.get("y_real")
+            if isinstance(y_real, list) and len(y_real) == total_expected:
+                y_real_use = y_real
+            else:
+                y_real_use = [0.0] * total_expected
+
         shared_t.append(float(t))
         cursor = 0
         for g, count in enumerate(groups_joint_count):
             joint_dqs = group_joint_dqs[g]
+            real_dqs = group_real_dqs[g] if has_real else None
             for j in range(count):
                 try:
                     joint_dqs[j].append(float(y[cursor + j]))
                 except (TypeError, ValueError):
                     joint_dqs[j].append(0.0)
+                if real_dqs is not None and y_real_use is not None:
+                    try:
+                        real_dqs[j].append(float(y_real_use[cursor + j]))
+                    except (TypeError, ValueError):
+                        real_dqs[j].append(0.0)
             cursor += count
         received += 1
         if received % 200 == 0:
@@ -158,6 +182,7 @@ def main() -> int:
     if plot_mode not in ("rolling", "cumulative"):
         plot_mode = "rolling"
     save_on_exit = bool(init.get("save_on_exit", False))
+    has_real = bool(init.get("has_real", False))
     groups = init.get("groups", [])
     if not isinstance(groups, list) or not groups:
         _log("init has no groups; exiting")
@@ -174,11 +199,14 @@ def main() -> int:
     # 있어야 하므로 통일.
     shared_t: deque = deque()
     group_joint_dqs: list[list[deque]] = []
+    group_real_dqs: Optional[list[list[deque]]] = [] if has_real else None
     groups_joint_count: list[int] = []
     for g in groups:
         joints = list(g.get("joints", []))
         groups_joint_count.append(len(joints))
         group_joint_dqs.append([deque() for _ in joints])
+        if group_real_dqs is not None:
+            group_real_dqs.append([deque() for _ in joints])
 
     # Flat joint name list for CSV header.
     flat_joint_names: list[str] = []
@@ -195,24 +223,43 @@ def main() -> int:
         axes = [axes]
 
     # Per-axis line objects. Legend entries are pickable — clicking one
-    # toggles the corresponding line's visibility (dimmed legend marker
-    # indicates hidden). Double-click anywhere on an axes resets all lines.
-    axis_specs: list[tuple[object, list]] = []
+    # toggles the corresponding sim line's visibility (dimmed legend marker
+    # indicates hidden). The paired real line (dashed, same color) tracks
+    # the sim line's visibility 1:1. Double-click anywhere on an axes
+    # resets all lines (sim + real).
+    #
+    # axis_specs entry: (ax, sim_lines, real_lines_or_None)
+    # real_lines is None for the entire run when has_real=False.
+    axis_specs: list[tuple[object, list, Optional[list]]] = []
+    # Map id(sim_line) -> real_line so toggle handler can sync. Empty when
+    # has_real is False.
+    sim_to_real: dict = {}
     leg_to_orig: dict = {}
     for ax, grp in zip(axes, groups):
-        lines = []
+        sim_lines = []
+        real_lines: Optional[list] = [] if has_real else None
         for jname in grp.get("joints", []):
-            (ln,) = ax.plot([], [], label=str(jname), linewidth=1.0)
-            lines.append(ln)
+            (ln_sim,) = ax.plot([], [], label=str(jname), linewidth=1.0)
+            sim_lines.append(ln_sim)
+            if real_lines is not None:
+                # Same color as the sim line, dashed, slightly thinner. Not
+                # added to legend so the legend stays compact.
+                color = ln_sim.get_color()
+                (ln_real,) = ax.plot(
+                    [], [], color=color, linestyle="--", linewidth=0.9,
+                    alpha=0.85,
+                )
+                real_lines.append(ln_real)
+                sim_to_real[id(ln_sim)] = ln_real
         ax.set_title(str(grp.get("name", "")))
         ax.set_ylabel(y_label)
         ax.grid(True, alpha=0.3)
         leg = ax.legend(loc="upper left", fontsize="x-small", ncol=2)
-        for leg_line, orig_line in zip(leg.get_lines(), lines):
+        for leg_line, orig_line in zip(leg.get_lines(), sim_lines):
             leg_line.set_picker(True)
             leg_line.set_pickradius(5)
             leg_to_orig[id(leg_line)] = orig_line
-        axis_specs.append((ax, lines))
+        axis_specs.append((ax, sim_lines, real_lines))
     axes[-1].set_xlabel("time [s]")
     # Reserve a strip at the top for Hide/Show all buttons.
     fig.tight_layout(rect=[0, 0, 1, 0.92])
@@ -226,6 +273,9 @@ def main() -> int:
                 orig = leg_to_orig.get(id(leg_line))
                 if orig is not None:
                     orig.set_visible(visible)
+                    real = sim_to_real.get(id(orig))
+                    if real is not None:
+                        real.set_visible(visible)
                 leg_line.set_alpha(1.0 if visible else 0.25)
         fig.canvas.draw_idle()
 
@@ -254,22 +304,39 @@ def main() -> int:
         csv_path = save_dir / f"{stem}.csv"
         png_path = save_dir / f"{stem}.png"
 
-        # CSV: time + flat joint columns
+        # CSV: time + flat joint columns. When has_real, each joint gets a
+        # paired ``<joint>_real`` column right after its sim column.
         try:
             t_arr_save = np.fromiter(shared_t, dtype=np.float32, count=len(shared_t))
             n = t_arr_save.size
             cols = [t_arr_save.reshape(-1, 1)]
             header = ["time"]
-            for grp_dqs, grp in zip(group_joint_dqs, groups):
-                for jdq, jname in zip(grp_dqs, grp.get("joints", [])):
+
+            def _align(arr: np.ndarray, target_n: int) -> np.ndarray:
+                if arr.size < target_n:
+                    pad = np.full(target_n - arr.size, np.nan, dtype=np.float32)
+                    return np.concatenate([pad, arr])
+                if arr.size > target_n:
+                    return arr[-target_n:]
+                return arr
+
+            for g_idx, (grp_dqs, grp) in enumerate(zip(group_joint_dqs, groups)):
+                grp_real_dqs = (
+                    group_real_dqs[g_idx]
+                    if (group_real_dqs is not None) else None
+                )
+                joint_names = grp.get("joints", [])
+                for j, (jdq, jname) in enumerate(zip(grp_dqs, joint_names)):
                     arr = np.fromiter(jdq, dtype=np.float32, count=len(jdq))
-                    if arr.size < n:
-                        pad = np.full(n - arr.size, np.nan, dtype=np.float32)
-                        arr = np.concatenate([pad, arr])
-                    elif arr.size > n:
-                        arr = arr[-n:]
+                    arr = _align(arr, n)
                     cols.append(arr.reshape(-1, 1))
                     header.append(str(jname))
+                    if grp_real_dqs is not None:
+                        rdq = grp_real_dqs[j]
+                        rarr = np.fromiter(rdq, dtype=np.float32, count=len(rdq))
+                        rarr = _align(rarr, n)
+                        cols.append(rarr.reshape(-1, 1))
+                        header.append(f"{jname}_real")
             data = np.hstack(cols)
             np.savetxt(
                 csv_path, data, delimiter=",",
@@ -297,13 +364,20 @@ def main() -> int:
             return
         visible = not orig.get_visible()
         orig.set_visible(visible)
+        # Sync the paired dashed real line (if any) with the sim line.
+        real = sim_to_real.get(id(orig))
+        if real is not None:
+            real.set_visible(visible)
         leg_line.set_alpha(1.0 if visible else 0.25)
         fig.canvas.draw_idle()
 
     def _on_dblclick(event):
         if event.dblclick:
-            for leg_line, orig in leg_to_orig.items():
+            for _leg_id, orig in leg_to_orig.items():
                 orig.set_visible(True)
+                real = sim_to_real.get(id(orig))
+                if real is not None:
+                    real.set_visible(True)
             for ax in axes:
                 leg = ax.get_legend()
                 if leg is not None:
@@ -319,7 +393,8 @@ def main() -> int:
     # Launch stdin reader thread.
     reader = threading.Thread(
         target=_stdin_reader_loop,
-        args=(sys.stdin, groups_joint_count, shared_t, group_joint_dqs, stop_event),
+        args=(sys.stdin, groups_joint_count, shared_t,
+              group_joint_dqs, group_real_dqs, stop_event),
         name="ALLEXPlotStdin",
         daemon=True,
     )
@@ -352,10 +427,16 @@ def main() -> int:
         else:
             t_min = t_last - window_sec
         updated = []
-        for (ax, lines), joint_dqs in zip(axis_specs, group_joint_dqs):
+        for spec_idx, ((ax, sim_lines, real_lines), joint_dqs) in enumerate(
+            zip(axis_specs, group_joint_dqs)
+        ):
+            real_jdqs = (
+                group_real_dqs[spec_idx]
+                if (group_real_dqs is not None) else None
+            )
             y_min = float("inf")
             y_max = float("-inf")
-            for ln, jdq in zip(lines, joint_dqs):
+            for j, (ln, jdq) in enumerate(zip(sim_lines, joint_dqs)):
                 if not jdq:
                     continue
                 y_arr = np.fromiter(jdq, dtype=np.float32, count=len(jdq))
@@ -364,6 +445,21 @@ def main() -> int:
                     continue
                 t_tail = t_arr[-n:]
                 y_tail = y_arr[-n:]
+                # Optional paired real series.
+                ln_real = (
+                    real_lines[j] if (real_lines is not None and j < len(real_lines))
+                    else None
+                )
+                yr_tail = None
+                if ln_real is not None and real_jdqs is not None:
+                    rdq = real_jdqs[j]
+                    if rdq:
+                        yr_arr = np.fromiter(rdq, dtype=np.float32, count=len(rdq))
+                        nr = min(n, yr_arr.size)
+                        if nr > 0:
+                            # Re-slice with same n (sim/real stay length-aligned
+                            # because reader appends in lockstep, but be defensive).
+                            yr_tail = yr_arr[-n:] if yr_arr.size >= n else yr_arr[-nr:]
                 if plot_mode == "rolling":
                     # window 밖 샘플은 화면/autoscale 모두에서 제외.
                     mask = t_tail >= t_min
@@ -371,17 +467,35 @@ def main() -> int:
                         continue
                     t_vis = t_tail[mask]
                     y_vis = y_tail[mask]
+                    if yr_tail is not None and yr_tail.size == t_tail.size:
+                        yr_vis = yr_tail[mask]
+                    else:
+                        yr_vis = None
                 else:
                     # cumulative: 전체 history 그대로.
                     t_vis = t_tail
                     y_vis = y_tail
+                    yr_vis = yr_tail if (yr_tail is not None and
+                                         yr_tail.size == t_tail.size) else None
                 ln.set_data(t_vis, y_vis)
                 updated.append(ln)
+                if ln_real is not None:
+                    if yr_vis is not None:
+                        ln_real.set_data(t_vis, yr_vis)
+                    else:
+                        # No real samples yet — keep line empty (not 0).
+                        ln_real.set_data([], [])
+                    updated.append(ln_real)
                 # Exclude hidden lines from y-autoscale.
                 if not ln.get_visible():
                     continue
                 y_min = min(y_min, float(y_vis.min()))
                 y_max = max(y_max, float(y_vis.max()))
+                # Real also contributes to autoscale only when its sim
+                # twin is visible (they share visibility) and real has data.
+                if yr_vis is not None and yr_vis.size > 0:
+                    y_min = min(y_min, float(yr_vis.min()))
+                    y_max = max(y_max, float(yr_vis.max()))
             ax.set_xlim(t_min, t_last + 1e-3)
             if y_min != float("inf") and y_max != float("-inf"):
                 if y_min == y_max:

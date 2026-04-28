@@ -122,6 +122,51 @@ def _group_for_joint(name: str) -> str:
     return "other"
 
 
+def _build_dof_name_to_abbr_lut() -> dict[str, str]:
+    """dof_name (== USD joint name) → ROS2Config abbr (e.g. "R11", "LSP", "WY", "NP").
+
+    Three sources are merged. Lookup order = source order, but values are
+    consistent across sources (sanity-checked at module import indirectly
+    via overlap).
+
+    Sources:
+      1. ``viz_config.HAND_JOINT_TORQUE_RING_MAP`` — covers 40 hand joints
+         (incl. mimic-slave DIP/IP) + 14 arm joints.
+      2. ``ALLEX_CSV_JOINT_NAMES`` × ``ROS2Config.OUTBOUND_TOPIC_TO_JOINTS``
+         — covers waist (WY, WP) and neck (NP, NY); same topic key gives
+         dof_name list and abbr list, zipped index-wise.
+    """
+    lut: dict[str, str] = {}
+
+    # Source 1: viz_config HAND_JOINT_TORQUE_RING_MAP
+    try:
+        from ..config.viz_config import HAND_JOINT_TORQUE_RING_MAP
+        for entry in HAND_JOINT_TORQUE_RING_MAP:
+            j = entry.get("usd_joint_name")
+            a = entry.get("dof_abbr")
+            if j and a:
+                lut[j] = a
+    except Exception as exc:
+        logger.debug(f"viz_config import failed in LUT build: {exc}")
+
+    # Source 2: joint_name_map × ros2_config — for waist/neck (and overlap
+    # confirmation for arm/hand).
+    try:
+        from ..config.ros2_config import ROS2Config
+        from ..trajectory.joint_name_map import ALLEX_CSV_JOINT_NAMES
+        for topic_key, abbr_list in ROS2Config.OUTBOUND_TOPIC_TO_JOINTS.items():
+            dof_list = ALLEX_CSV_JOINT_NAMES.get(topic_key)
+            if not dof_list:
+                continue
+            for dof_name, abbr in zip(dof_list, abbr_list):
+                # Only set if not already set by source 1; both should agree.
+                lut.setdefault(dof_name, abbr)
+    except Exception as exc:
+        logger.debug(f"ros2/joint_name_map import failed in LUT build: {exc}")
+
+    return lut
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -156,12 +201,17 @@ class TorquePlotter:
         ff_manager=None,
         plot_mode: str = "rolling",
         save_on_exit: bool = False,
+        real_provider: Optional[Callable[[], dict]] = None,
     ):
         self._articulation = articulation
         self._ff_provider = ff_provider
         # FeedforwardTorqueManager — ``apply_step`` 에서 ``read_current()`` 로
         # control.joint_f 의 ground-truth FF 를 읽는 데 사용.
         self._ff_manager = ff_manager
+        # ROS2 측 real torque snapshot provider. ``dict[joint_abbr -> float]``
+        # 또는 ``None`` 반환. ``None`` 이거나 callable 이 None 이면 plotter 는
+        # real 라인을 비활성화한다 (subprocess 에 ``has_real=False`` 통보).
+        self._real_provider = real_provider
         self._subset = subset
         self._physics_hz = float(physics_hz)
         self._window_s = float(window_s)
@@ -185,10 +235,37 @@ class TorquePlotter:
         # Flat joint order matches how tau is serialised to the subprocess.
         self._joint_order: list[str] = [j for g in self._groups for j in g["joints"]]
 
+        # dof_name (== USD joint name) → abbr (ROS2Config) LUT. Used to
+        # resolve ``real_provider()`` dict keys for each joint in
+        # ``_joint_order``. Built once; missing entries silently fall back to
+        # 0.0 in ``apply_step``.
+        self._dof_name_to_abbr: dict[str, str] = _build_dof_name_to_abbr_lut()
+        # Pre-resolved abbr list aligned with ``_joint_order`` for hot path.
+        # ``None`` for joints without a known abbr.
+        self._joint_order_abbrs: list[Optional[str]] = [
+            self._dof_name_to_abbr.get(name) for name in self._joint_order
+        ]
+        # Warn once on missing abbrs — useful when LUT sources drift from
+        # articulation dof_names.
+        missing = [n for n, a in zip(self._joint_order, self._joint_order_abbrs)
+                   if a is None]
+        if missing:
+            logger.warning(
+                f"TorquePlotter({subset}): {len(missing)} joint(s) have no abbr "
+                f"mapping; real-torque line will be 0 for them: {missing[:5]}..."
+            )
+
         # Subprocess state.
         self._proc: Optional[subprocess.Popen] = None
         self._stdin_lock = threading.Lock()
         self._sim_time: float = 0.0
+
+        # CSV replayer 등 외부 소스에서 sim/real torque 를 직접 공급할 때 쓰는 버퍼.
+        # apply_step 가 articulation 폴링 대신 이 값을 쓴다. None 이면 기존 동작 유지.
+        # _external_sim_tau     : (num_dof,) numpy float32 — 총 sim torque (PD+FF 합산 결과로 간주).
+        # _external_real_by_abbr: dict[abbr -> tau] — real_provider 와 동일 형식.
+        self._external_sim_tau: Optional[np.ndarray] = None
+        self._external_real_by_abbr: Optional[dict] = None
 
         # Decimate physics step → plotter sampling. FuncAnimation renders at
         # 20 Hz so much higher than ~50 Hz is wasted GPU→CPU sync.
@@ -219,6 +296,25 @@ class TorquePlotter:
         """Change sampling rate at runtime. Effective immediately; no restart."""
         self._plot_hz = max(1.0, float(plot_hz))
         self._decim = self._compute_decim(self._plot_hz)
+
+    def set_external_sim_tau(self, arr) -> None:
+        """CSV replay 동안 articulation 폴링 대신 사용할 (num_dof,) sim torque array.
+
+        ``arr`` is expected to be a numpy reference; replayer mutates in place every
+        step and plotter reads the latest values. ``None`` clears the override.
+        """
+        if arr is None:
+            self._external_sim_tau = None
+            return
+        self._external_sim_tau = np.asarray(arr, dtype=np.float32).reshape(-1)
+
+    def set_external_real_by_abbr(self, d) -> None:
+        """CSV replay 동안 real_provider 대신 사용할 ``dict[abbr -> tau]``.
+
+        Replayer is expected to mutate the same dict in place per step. ``None``
+        clears the override.
+        """
+        self._external_real_by_abbr = None if d is None else d
 
     @property
     def plot_hz(self) -> float:
@@ -324,6 +420,9 @@ class TorquePlotter:
             "plot_mode": self._plot_mode,
             "save_on_exit": self._save_on_exit,
             "groups": self._groups,
+            # Real-torque second line (ROS2-fed). When False, subprocess
+            # skips dashed real-line creation and ignores any "y_real" payload.
+            "has_real": self._real_provider is not None,
         }
         if not self._send(init_msg):
             logger.error("TorquePlotter: init handshake write failed")
@@ -397,51 +496,59 @@ class TorquePlotter:
         if self._step_count % self._decim != 0:
             return
 
-        # --- qfrc_actuator (PD clipping 후 solver 가 쓰는 실제 torque) ----
-        # Wrapper: SingleArticulation.get_applied_joint_efforts() 가 패치된
-        # articulation_view.get_dof_actuation_forces() 를 통해 내부적으로
-        # state_0.mujoco.qfrc_actuator 를 읽어옴.
         num = self._num_dof
-        tau_pd_act = None
-        try:
-            arr = self._articulation.get_applied_joint_efforts()
-            if arr is not None:
-                a = _to_np(arr)
-                if a is not None and a.ndim == 2:
-                    a = a[0]
-                if a is not None:
-                    tau_pd_act = np.asarray(a, dtype=np.float32).reshape(-1)
-        except Exception as exc:
-            if self._step_count % (200 * self._decim) == 0:
-                print(f"[ALLEX][TorquePlot {self._subset}] "
-                      f"get_applied_joint_efforts failed: {exc}")
+        tau_total: Optional[np.ndarray] = None
 
-        # --- joint_f (ground-truth FF, 모든 writer 합산 결과) -------------
-        # Wrapper: FeedforwardTorqueManager.read_current() — control.joint_f 를
-        # 직접 읽어 return. 여러 writer (this manager, 외부 script 등) 의
-        # 최종 합산 상태.
-        tau_ff = np.zeros(num, dtype=np.float32)
-        ff_mgr = self._ff_manager
-        if ff_mgr is not None:
+        # --- 외부 소스 (CSV replay 등) override 우선 ---
+        ext_sim = self._external_sim_tau
+        if ext_sim is not None and ext_sim.size >= num:
+            tau_total = ext_sim[:num].astype(np.float32, copy=True)
+
+        if tau_total is None:
+            # --- qfrc_actuator (PD clipping 후 solver 가 쓰는 실제 torque) ----
+            # Wrapper: SingleArticulation.get_applied_joint_efforts() 가 패치된
+            # articulation_view.get_dof_actuation_forces() 를 통해 내부적으로
+            # state_0.mujoco.qfrc_actuator 를 읽어옴.
+            tau_pd_act = None
             try:
-                arr = ff_mgr.read_current()
-                if arr is not None and arr.size >= num:
-                    tau_ff = arr[:num]
+                arr = self._articulation.get_applied_joint_efforts()
+                if arr is not None:
+                    a = _to_np(arr)
+                    if a is not None and a.ndim == 2:
+                        a = a[0]
+                    if a is not None:
+                        tau_pd_act = np.asarray(a, dtype=np.float32).reshape(-1)
             except Exception as exc:
                 if self._step_count % (200 * self._decim) == 0:
                     print(f"[ALLEX][TorquePlot {self._subset}] "
-                          f"ff_manager.read_current failed: {exc}")
+                          f"get_applied_joint_efforts failed: {exc}")
 
-        # qfrc_actuator 가 아직 채워지지 않은 초기 몇 step 은 skip.
-        if tau_pd_act is None or tau_pd_act.size < num:
-            if self._step_count % (200 * self._decim) == 0:
-                size = None if tau_pd_act is None else int(tau_pd_act.size)
-                print(f"[ALLEX][TorquePlot {self._subset}] qfrc_actuator unavailable "
-                      f"(size={size}, need>={num}). "
-                      f"Newton patch 가 빠졌거나 아직 build 전일 수 있음.")
-            return
+            # --- joint_f (ground-truth FF, 모든 writer 합산 결과) -------------
+            # Wrapper: FeedforwardTorqueManager.read_current() — control.joint_f 를
+            # 직접 읽어 return. 여러 writer (this manager, 외부 script 등) 의
+            # 최종 합산 상태.
+            tau_ff = np.zeros(num, dtype=np.float32)
+            ff_mgr = self._ff_manager
+            if ff_mgr is not None:
+                try:
+                    arr = ff_mgr.read_current()
+                    if arr is not None and arr.size >= num:
+                        tau_ff = arr[:num]
+                except Exception as exc:
+                    if self._step_count % (200 * self._decim) == 0:
+                        print(f"[ALLEX][TorquePlot {self._subset}] "
+                              f"ff_manager.read_current failed: {exc}")
 
-        tau_total = (tau_pd_act[:num] + tau_ff[:num]).astype(np.float32)
+            # qfrc_actuator 가 아직 채워지지 않은 초기 몇 step 은 skip.
+            if tau_pd_act is None or tau_pd_act.size < num:
+                if self._step_count % (200 * self._decim) == 0:
+                    size = None if tau_pd_act is None else int(tau_pd_act.size)
+                    print(f"[ALLEX][TorquePlot {self._subset}] qfrc_actuator unavailable "
+                          f"(size={size}, need>={num}). "
+                          f"Newton patch 가 빠졌거나 아직 build 전일 수 있음.")
+                return
+
+            tau_total = (tau_pd_act[:num] + tau_ff[:num]).astype(np.float32)
 
         # --- (legacy, 참고용) PD 재계산 경로 — 주석 보존 ----------------
         # try:
@@ -462,13 +569,41 @@ class TorquePlotter:
 
         effective_dt = (float(dt) if dt else (1.0 / self._physics_hz)) * self._decim
         self._sim_time += effective_dt
-        self.push_sample(self._sim_time, tau_total, self._dof_name_to_idx)
+
+        # --- real torque snapshot (ROS2-fed 또는 외부 override) ----------------
+        # 우선순위: external_real_by_abbr (CSV replay) → real_provider → None.
+        tau_real_list: Optional[list[float]] = None
+        ext_real = self._external_real_by_abbr
+        if ext_real is not None:
+            tau_real_list = [
+                float(ext_real.get(abbr, 0.0)) if abbr is not None else 0.0
+                for abbr in self._joint_order_abbrs
+            ]
+        elif self._real_provider is not None:
+            try:
+                snap = self._real_provider()
+            except Exception as exc:
+                if self._step_count % (200 * self._decim) == 0:
+                    print(f"[ALLEX][TorquePlot {self._subset}] "
+                          f"real_provider failed: {exc}")
+                snap = None
+            if isinstance(snap, dict):
+                tau_real_list = [
+                    float(snap.get(abbr, 0.0)) if abbr is not None else 0.0
+                    for abbr in self._joint_order_abbrs
+                ]
+            else:
+                tau_real_list = [0.0] * len(self._joint_order)
+
+        self.push_sample(self._sim_time, tau_total, self._dof_name_to_idx,
+                         tau_real_list=tau_real_list)
 
     def push_sample(
         self,
         t: float,
         tau_full: np.ndarray,
         dof_name_to_idx: dict,
+        tau_real_list: Optional[list] = None,
     ) -> None:
         """Send one sample frame to the subprocess.
 
@@ -476,6 +611,10 @@ class TorquePlotter:
         picked in ``self._joint_order`` order (which matches the init
         handshake). Missing joints are skipped; the subprocess enforces
         length equality and drops mismatched frames.
+
+        ``tau_real_list`` (optional) is a length-``len(_joint_order)`` list
+        of ROS2-fed real torque values, already pre-aligned. Sent under
+        ``y_real`` only when not None and ``has_real`` was set in init.
         """
         if not self.is_running():
             return
@@ -491,7 +630,10 @@ class TorquePlotter:
         except Exception as exc:
             logger.debug(f"push_sample serialise failed: {exc}")
             return
-        self._send({"t": float(t), "y": tau_list})
+        frame: dict = {"t": float(t), "y": tau_list}
+        if tau_real_list is not None and len(tau_real_list) == len(tau_list):
+            frame["y_real"] = [float(v) for v in tau_real_list]
+        self._send(frame)
 
     # ------------------------------------------------------------------
     # Low-level IPC

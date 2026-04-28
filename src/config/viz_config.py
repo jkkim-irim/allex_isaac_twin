@@ -21,7 +21,7 @@ SIM_COLOR = (0.0, 0.8, 1.0)
 # Torque 링 스케일 — 공통 기본값
 # ========================================
 TORQUE_GAIN = 0.1
-TORQUE_MIN_SCALE = 0.05   # 최소 표시 크기 (토크 0일 때). 음수는 clip 오류 유발.
+TORQUE_MIN_SCALE = 0.03   # 최소 표시 크기 (토크 0일 때). 음수는 clip 오류 유발.
 TORQUE_MAX_SCALE = 3.0
 
 
@@ -36,10 +36,10 @@ TORQUE_MAX_SCALE = 3.0
 #
 # gain 을 낮추면 링이 작아지고, 높이면 커진다.
 # ========================================
-TORQUE_GAIN_SHOULDER = 0.03   # 어깨 — 토크가 커서 기본값보다 줄임
-TORQUE_GAIN_ELBOW    = 0.05   # 팔꿈치
-TORQUE_GAIN_WRIST    = 0.30   # 손목 — 토크가 작아서 기본값보다 키움
-TORQUE_GAIN_FINGER   = 0.40   # 손가락 — 토크가 매우 작음
+TORQUE_GAIN_SHOULDER = 0.02   # 어깨 — 토크가 커서 기본값보다 줄임
+TORQUE_GAIN_ELBOW    = 0.02   # 팔꿈치
+TORQUE_GAIN_WRIST    = 0.15   # 손목 — 토크가 작아서 기본값보다 키움
+TORQUE_GAIN_FINGER   = 0.20   # 손가락 — 토크가 매우 작음
 
 
 # ========================================
@@ -56,15 +56,15 @@ TORQUE_GAIN_FINGER   = 0.40   # 손가락 — 토크가 매우 작음
 # ========================================
 RING_OFFSET_ALONG_AXIS_BY_JOINT: dict[str, float] = {
     # --- Shoulder ---
-    "L_Shoulder_Pitch_Joint": 0.01,
+    "L_Shoulder_Pitch_Joint": 0.03,
     "L_Shoulder_Roll_Joint":  -0.035,
     "L_Shoulder_Yaw_Joint":   0.07,
-    "R_Shoulder_Pitch_Joint": -0.01,
+    "R_Shoulder_Pitch_Joint": -0.03,
     "R_Shoulder_Roll_Joint":  -0.035,
     "R_Shoulder_Yaw_Joint":   0.07,
     # --- Elbow ---
-    "L_Elbow_Joint": 0.06,
-    "R_Elbow_Joint": -0.06,
+    "L_Elbow_Joint": 0.07,
+    "R_Elbow_Joint": -0.07,
     # --- Wrist / Finger --- 필요 시 추가 (없으면 0.0 적용)
 }
 

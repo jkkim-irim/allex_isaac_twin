@@ -6,7 +6,13 @@ import omni.timeline
 from omni.usd import StageEventType
 
 from .scenario import ALLEXDigitalTwin
-from .ui_utils import WorldControls, ROS2Controls, TrajStudioControls, VisualizerControls
+from .ui_utils import (
+    WorldControls,
+    ROS2Controls,
+    TrajStudioControls,
+    ShowcaseReplayControls,
+    VisualizerControls,
+)
 
 
 class UIBuilder:
@@ -18,6 +24,7 @@ class UIBuilder:
         self._world_controls = None
         self._ros2_controls = None
         self._traj_studio = None
+        self._showcase_replay = None
         self._visualizer = None
         self._on_init()
 
@@ -39,6 +46,9 @@ class UIBuilder:
 
         if self._traj_studio is None:
             self._traj_studio = TrajStudioControls(self)
+
+        if self._showcase_replay is None:
+            self._showcase_replay = ShowcaseReplayControls(self)
 
     # ========================================
     # Isaac Sim event callbacks
@@ -62,6 +72,7 @@ class UIBuilder:
         self._world_controls.build()
         self._ros2_controls.build()
         self._traj_studio.build()
+        self._showcase_replay.build()
         self._visualizer.build()
 
     def cleanup(self):
@@ -75,3 +86,5 @@ class UIBuilder:
         self._world_controls.cleanup()
         self._ros2_controls.cleanup()
         self._traj_studio.cleanup()
+        if self._showcase_replay is not None:
+            self._showcase_replay.cleanup()

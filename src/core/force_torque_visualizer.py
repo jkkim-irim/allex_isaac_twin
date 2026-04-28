@@ -104,6 +104,11 @@ class ForceTorqueVisualizer:
         self._mode = "off"          # off / real / sim / both  (force arrow)
         self._torque_mode = "off"   # off / real / sim / both  (torque ring)
 
+        # CSV replayer 등 외부 소스가 push_external_torque 로 ring 을 직접 갱신할 때
+        # update() 의 자체 articulation 측정으로 덮어쓰지 않도록 채널을 잠그는 플래그.
+        # 원소: "sim" / "real". 비어있으면 기존 동작과 동일.
+        self._external_torque_sources: set = set()
+
         # 생성한 prim 캐시
         self._torque_ring_prims: dict = {}   # dof_abbr -> {"real": prim, "sim": prim}
         self._force_viz_prims: dict = {}     # link_path -> {"real": prim, "sim": prim}
@@ -272,8 +277,15 @@ class ForceTorqueVisualizer:
 
 
         # --- torque rings (평탄화된 튜플 순회 — N3) ---
-        update_sim_torque = self._torque_mode in ("sim", "both")
-        update_real_torque = self._torque_mode in ("real", "both")
+        # 외부 push 로 lock 된 채널은 update() 가 건너뛴다 (push 한 값이 그대로 남음).
+        update_sim_torque = (
+            self._torque_mode in ("sim", "both")
+            and "sim" not in self._external_torque_sources
+        )
+        update_real_torque = (
+            self._torque_mode in ("real", "both")
+            and "real" not in self._external_torque_sources
+        )
         if have_articulation and self._torque_mode != "off":
             for abbr, _usd_joint_name, _child_link_path in HAND_JOINT_TORQUE_RING_TUPLES:
                 pair = self._torque_ring_prims.get(abbr)
@@ -339,14 +351,87 @@ class ForceTorqueVisualizer:
     def get_torque_mode(self) -> str:
         return self._torque_mode
 
+    def set_external_torque_sources(self, sources) -> None:
+        """CSV replay 등 외부에서 push_external_torque 로 ring 을 갱신하는 동안
+        update() 의 자체 articulation 측정이 덮어쓰지 않도록 채널을 잠근다.
+
+        sources : iterable of {"sim", "real"} 또는 빈 컬렉션 → lock 해제.
+        """
+        if sources is None:
+            self._external_torque_sources = set()
+            return
+        valid = {"sim", "real"}
+        self._external_torque_sources = {str(s).lower() for s in sources if str(s).lower() in valid}
+
     def set_torque_visibility(self, visible: bool):
         """하위호환 — True → both, False → off."""
         self.set_torque_mode("both" if visible else "off")
 
     # ========================================
+    # External torque push — CSV replay 용
+    # ========================================
+    def _joint_name_to_abbr(self, joint_name: str) -> str | None:
+        """USD joint prim name → dof_abbr (lazy 캐시).
+
+        ``HAND_JOINT_TORQUE_RING_MAP`` 안에 있는 joint 만 ring 이 존재.
+        없으면 None 반환 — caller 가 silently skip.
+        """
+        cache = getattr(self, "_joint_to_abbr_cache", None)
+        if cache is None:
+            cache = {
+                e["usd_joint_name"]: e["dof_abbr"]
+                for e in HAND_JOINT_TORQUE_RING_MAP
+            }
+            self._joint_to_abbr_cache = cache
+        return cache.get(joint_name)
+
+    def push_external_torque(self, joint_name: str, value: float,
+                             source: str = "sim") -> bool:
+        """CSV replay 등 외부 소스에서 한 joint 의 torque 값을 ring 에 즉시 반영.
+
+        joint_name : USD joint prim 이름 (예: "L_Shoulder_Pitch_Joint").
+        source     : "sim" 또는 "real". ring prim 채널 분리 — 동시 표시 가능.
+
+        prim 이 없거나 ring map 에 없는 joint 는 silently skip (False 반환).
+        ``set_torque_mode`` 의 visibility 는 별도 — mode 가 off 여도 scale 은
+        갱신되며, 토글하면 즉시 표시된다.
+        """
+        if not self._prims_initialized:
+            self.ensure_initialized()
+            if not self._prims_initialized:
+                return False
+        source = str(source).lower()
+        if source not in ("sim", "real"):
+            return False
+        abbr = self._joint_name_to_abbr(joint_name)
+        if abbr is None:
+            return False
+        pair = self._torque_ring_prims.get(abbr)
+        if not pair:
+            return False
+        prim = pair.get(source)
+        if prim is None:
+            return False
+        self._apply_scale(prim, float(value), self._torque_gain_for(abbr),
+                          TORQUE_MIN_SCALE, TORQUE_MAX_SCALE)
+        return True
+
+    # ========================================
     # Custom force vector — 임의 위치·방향·크기 화살표 API
     # ========================================
     CUSTOM_FORCE_ROOT = "/World/AllexForceViz"
+
+    # source 별 자동 색상.
+    _SOURCE_COLOR = {
+        "real": REAL_COLOR,
+        "sim": SIM_COLOR,
+        "user": (1.0, 1.0, 0.0),    # 노랑 — 사용자 임의 vector
+    }
+
+    @staticmethod
+    def _custom_key(name: str, source: str) -> str:
+        """source + name 조합으로 내부 key. ``_custom_force_prims`` 에 사용."""
+        return f"{source}::{name}"
 
     def add_custom_force_vector(
         self,
@@ -355,29 +440,41 @@ class ForceTorqueVisualizer:
         vector=(0.0, 0.0, 0.1),
         color=None,
         parent_path: str | None = None,
+        source: str = "user",
     ):
         """임의 위치에 force vector 화살표 prim 을 새로 만든다.
 
-        name          : 고유 식별자. set_/remove_ 호출 시 이 key 사용.
+        name          : 고유 식별자 (source 별로 namespace 분리됨).
         position      : (x, y, z) translate. parent_path 기준 (None 이면 world).
         vector        : (fx, fy, fz). 길이 = magnitude, 방향 = orient.
                          force_vec.usda 는 local +Z 화살표라 +Z → vector 로 회전.
-        color         : (r, g, b) 0~1. None 이면 REAL_COLOR.
-        parent_path   : 생성할 부모 prim 경로. None 이면 CUSTOM_FORCE_ROOT 아래에
-                         /World/AllexForceViz/<name> 으로 생성 (world 공간 floating).
-                         링크 추종이 필요하면 `/ALLEX/<link>` 같은 경로를 지정.
+        color         : (r, g, b) 0~1. None 이면 source 따라 자동 (real=빨강,
+                         sim=시안, user=노랑).
+        parent_path   : 생성할 부모 prim 경로. None 이면 CUSTOM_FORCE_ROOT/<source>
+                         아래에 /World/AllexForceViz/<source>/<name> 으로 생성
+                         (world 공간 floating). 링크 추종이 필요하면 `/ALLEX/<link>`.
+        source        : "real" | "sim" | "user". visibility mode (off/real/sim/both)
+                         가 force mode 와 함께 자동 적용됨. 같은 name 이라도 source
+                         가 다르면 서로 다른 prim.
 
         Returns: 성공 시 prim path (str), 실패 시 None.
-        동일 name 이 이미 존재하면 기존 prim 재사용하고 pose/vector 만 갱신.
+        동일 (source, name) 이 이미 존재하면 기존 prim 재사용하고 pose/vector 갱신.
         """
         if not name:
             logger.warning("[viz] add_custom_force_vector: name required")
             return None
+        source = str(source).lower()
+        if source not in ("real", "sim", "user"):
+            logger.warning(f"[viz] add_custom_force_vector: invalid source '{source}'; "
+                           f"expected real/sim/user. Falling back to 'user'.")
+            source = "user"
 
-        if name in self._custom_force_prims:
+        key = self._custom_key(name, source)
+        if key in self._custom_force_prims:
             # 이미 있으면 갱신만 수행
-            self.set_custom_force_vector(name, position=position, vector=vector)
-            return self._custom_force_prims[name]["prim"].GetPath().pathString
+            self.set_custom_force_vector(name, position=position,
+                                         vector=vector, source=source)
+            return self._custom_force_prims[key]["prim"].GetPath().pathString
 
         stage = self._get_stage()
         if stage is None:
@@ -390,7 +487,8 @@ class ForceTorqueVisualizer:
 
         from pxr import Gf, UsdGeom, Sdf
 
-        parent = parent_path or self.CUSTOM_FORCE_ROOT
+        # parent_path 미지정 시 source 별 root 분리 — visibility 일괄 토글 가능.
+        parent = parent_path or f"{self.CUSTOM_FORCE_ROOT}/{source}"
         prim_path = f"{parent}/{name}"
 
         # parent 가 없으면 session 에 Xform 으로 생성
@@ -422,38 +520,51 @@ class ForceTorqueVisualizer:
                         Gf.Vec3d(float(im[0]), float(im[1]), float(im[2])),
                     )
 
+        eff_color = color if color is not None else self._SOURCE_COLOR.get(
+            source, REAL_COLOR
+        )
         prim = self._create_force_ref_xform(
             stage, prim_path, FORCE_VIZ_USD_PATH,
             tuple(float(c) for c in position), orient_q, (1, 1, 1),
-            color if color is not None else REAL_COLOR,
+            eff_color,
         )
         if prim is None:
             return None
         self._cache_force_length_ops(prim, prim_path)
 
-        self._custom_force_prims[name] = {
+        self._custom_force_prims[key] = {
             "prim": prim,
             "prim_path": prim_path,
             "parent_path": parent,
+            "source": source,
+            "name": name,
         }
 
         # 최초 크기 적용
         self._apply_force_vector(prim, fx, fy, fz,
                                  FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE)
 
-        # custom prim 은 기본으로 보이게
-        self._set_visible(prim, True)
+        # 가시성: source 별 force mode 토글에 맞춤. 처음 만들 때 한 번 적용.
+        self._apply_visibility()
         return prim_path
 
-    def set_custom_force_vector(self, name, position=None, vector=None):
+    def set_custom_force_vector(self, name, position=None, vector=None,
+                                source: str = "user"):
         """기존 custom vector 의 translate / 방향+크기 갱신.
 
         position : None 이면 translate 유지. 아니면 (x, y, z) 로 교체.
         vector   : None 이면 length+orient 유지. 아니면 (fx, fy, fz) 적용.
+        source   : "real" | "sim" | "user". add 와 동일한 source 로 호출해야 매칭.
         """
-        rec = self._custom_force_prims.get(name)
+        source = str(source).lower()
+        if source not in ("real", "sim", "user"):
+            source = "user"
+        key = self._custom_key(name, source)
+        rec = self._custom_force_prims.get(key)
         if rec is None:
-            logger.warning(f"[viz] set_custom_force_vector: unknown name '{name}'")
+            logger.warning(
+                f"[viz] set_custom_force_vector: unknown ({source}, '{name}')"
+            )
             return False
         prim = rec["prim"]
         if prim is None or not prim.IsValid():
@@ -497,9 +608,13 @@ class ForceTorqueVisualizer:
                                      FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE)
         return True
 
-    def remove_custom_force_vector(self, name):
-        """custom vector 하나를 stage 에서 제거."""
-        rec = self._custom_force_prims.pop(name, None)
+    def remove_custom_force_vector(self, name, source: str = "user"):
+        """custom vector 하나를 stage 에서 제거. source 는 add 시점과 동일해야 함."""
+        source = str(source).lower()
+        if source not in ("real", "sim", "user"):
+            source = "user"
+        key = self._custom_key(name, source)
+        rec = self._custom_force_prims.pop(key, None)
         if rec is None:
             return False
         prim_path = rec.get("prim_path")
@@ -516,14 +631,26 @@ class ForceTorqueVisualizer:
                     logger.debug(f"[viz] remove_custom_force_vector warn: {e}")
         return True
 
-    def clear_custom_force_vectors(self):
-        """모든 custom vector 제거."""
-        for name in list(self._custom_force_prims.keys()):
-            self.remove_custom_force_vector(name)
+    def clear_custom_force_vectors(self, source: str | None = None):
+        """custom vector 제거. source=None 이면 전부, 지정 시 그 source 만."""
+        if source is not None:
+            source = str(source).lower()
+        keys_to_remove = []
+        for key, rec in self._custom_force_prims.items():
+            if source is None or rec.get("source") == source:
+                keys_to_remove.append((rec["name"], rec["source"]))
+        for name, src in keys_to_remove:
+            self.remove_custom_force_vector(name, source=src)
 
-    def list_custom_force_vectors(self):
-        """등록된 custom vector 이름 리스트."""
-        return list(self._custom_force_prims.keys())
+    def list_custom_force_vectors(self, source: str | None = None):
+        """등록된 custom vector 이름 리스트. source=None 이면 (source, name) 튜플."""
+        if source is None:
+            return [(rec["source"], rec["name"])
+                    for rec in self._custom_force_prims.values()]
+        source = str(source).lower()
+        return [rec["name"]
+                for rec in self._custom_force_prims.values()
+                if rec.get("source") == source]
 
     def _update_custom_force_vectors(self):
         """update() 훅. 현재는 set_*/add_* 가 즉시 반영하므로 no-op.
@@ -1703,7 +1830,7 @@ class ForceTorqueVisualizer:
         """force / torque 가시성 반영. 두 경로 독립.
 
         - torque rings: `_torque_mode` (off/real/sim/both)
-        - force arrows: `_mode` (off/real/sim/both)
+        - force arrows: `_mode` (off/real/sim/both) — 12 link arrow + custom 통합
         """
         # --- torque rings ---
         show_real_torque = self._torque_mode in ("real", "both")
@@ -1712,12 +1839,24 @@ class ForceTorqueVisualizer:
             self._set_visible(pair.get("real"), show_real_torque)
             self._set_visible(pair.get("sim"), show_sim_torque)
 
-        # --- force arrows ---
+        # --- force arrows (per-link) ---
         show_real_force = self._mode in ("real", "both")
         show_sim_force = self._mode in ("sim", "both")
         for pair in self._force_viz_prims.values():
             self._set_visible(pair.get("real"), show_real_force)
             self._set_visible(pair.get("sim"), show_sim_force)
+
+        # --- custom force vectors (source 별) ---
+        # source="user" 는 force mode 와 무관하게 항상 표시 (디버그 / 수동 주입용).
+        # source="real"/"sim" 은 mode 토글 따라감 → CSV 기반 viz 와 통합.
+        show_per_source = {
+            "real": show_real_force,
+            "sim":  show_sim_force,
+            "user": True,
+        }
+        for rec in self._custom_force_prims.values():
+            src = rec.get("source", "user")
+            self._set_visible(rec.get("prim"), show_per_source.get(src, True))
 
     def _set_visible(self, prim, visible):
         """prim 가시성 토글.
