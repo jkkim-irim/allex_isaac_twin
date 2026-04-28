@@ -62,17 +62,30 @@ EOF
 
 ### Newton(MuJoCo Warp) 물리 백엔드
 
-PhysX 대신 `isaacsim.physics.newton` 으로 전환. 모든 물리 설정은 코드 내 구성으로 일원화되어 있습니다.
+PhysX 대신 `isaacsim.physics.newton` 으로 전환. 모든 물리 설정은 JSON 한 곳에서 관리.
 
-- `src/config/physics_settings.py` — `NewtonConfig`, solver(MuJoCo), USD `/physicsScene`, MJCF equality tuning 을 한 곳에서 오버라이드
-- `src/core/newton_bridge.py` — MJCF `<equality>` 제약을 `newton.ModelBuilder.finalize` 후 재주입 (Newton USD importer 가 누락하는 부분 보완)
+- `src/allex/config/physics_config.json` — `NewtonConfig`, solver(MuJoCo), USD `/physicsScene`, MJCF equality tuning, **중력보상 body 리스트** 를 한 곳에서 오버라이드
+- `src/allex/utils/sim_settings_utils.py` — JSON 로더 + `apply_newton_config` / `apply_gravcomp_to_builder` / `apply_usd_physics_scene` 적용 함수
+- `src/allex/core/newton_bridge.py` — MJCF `<equality>` 제약을 `newton.ModelBuilder.finalize` 후 재주입 + `mjc:gravcomp` 인증 (Newton USD importer 가 누락하는 부분 보완)
 - Physics frequency **200 Hz**, 중력 `-9.81 m/s²`, `pd_scale = π/180` 으로 SI 단위 드라이브 게인 일치화
 
-### 실시간 PD 게인 · 토크 리밋 램프 제어 (NEW)
+### MuJoCo Warp 중력보상 (gravity compensation)
+
+USD body 67 개 전체에 `mjc:gravcomp = 1.0` 인증되어 매 스텝 `qfrc_gravcomp` 커널이 자세 의존 모멘트까지 자동 계산. `mjc:actuatorgravcomp = false` (passive 라우팅) 이라 다음 분리 가능:
+
+| MuJoCo array (`mjw_data.*`) | 의미 |
+|---|---|
+| `qfrc_actuator` | PD 컨트롤러 출력만 |
+| `qfrc_gravcomp` | 중력보상 토크만 |
+
+- 활성화 게이트: `m.ngravcomp > 0` — 빌드 타임에 최소 1 body 가 nonzero 여야 커널이 도는 구조라 `physics_config.json::newton.gravcomp.bodies` 리스트로 일괄 인증
+- 검증용 probe: `src/allex/core/gravcomp_debug.py::GravcompTorqueProbe` — 특정 joint 의 `PD / Grav / Sum` 분리 출력
+
+### 실시간 PD 게인 · 토크 리밋 램프 제어
 
 CSV 궤적에 파생 컬럼(`K_pos_*`, `K_vel_*`, `trq_lim_*`)을 실어 **via point 마다 PD 게인과 actuator 토크 리밋을 동적으로 교체**할 수 있습니다. 순간적 step 변경이 아니라 **지정 기간(기본 1.0 s) 동안 현재값→목표값으로 선형 보간**(ramp)하여, PD 불연속으로 인한 관절 스냅을 원천 차단합니다.
 
-구현 포인트 (`src/trajectory/trajectory_player.py`):
+구현 포인트 (`src/allex/trajectory_generate/trajectory_player.py`):
 
 - Newton `Model.joint_target_ke / joint_target_kd / joint_effort_limit` 에 **zero-copy torch view** 로 GPU 메모리를 직접 갱신 → `ArticulationView.set_dof_*` (콜당 ~140 ms) 오버헤드 완전 제거
 - 매 physics step 당 1회 `solver._update_joint_dof_properties` 로 MuJoCo `gainprm/biasprm` 동기화
@@ -92,15 +105,29 @@ duration, joint_1..N, trq_lim_1..N, K_pos_1..N, K_vel_1..N
 - 비어있는 셀은 NaN → 해당 항목은 변경하지 않음 (이전 값 유지)
 - Position 은 degree → rad 변환, PD 게인 · 토크 리밋은 CSV 원본 단위 그대로
 
-내부적으로 Hermite 스플라인으로 via point 를 보간 (`src/trajectory/hermite_spline.py`).
+내부적으로 Hermite 스플라인으로 via point 를 보간 (`src/allex/trajectory_generate/hermite_spline.py`).
 
-### 조인트 설정 단일화
+### Showcase 데이터 로거
 
-기존 `src/joint_config.json` / `config/physics.toml` 을 통합하여 `src/config/joint_config.json` 하나로 관리:
+Traj Studio 의 Run 시점에 `data/showcase/showcase_sim_data_<ts>.csv` 를 자동 기록. 그룹별 활성화 + rosbag 자세 정렬 지원.
 
-- `drive_gains` — 관절별 `(stiffness, damping)` (SI 단위, MJCF 의도값)
-- `ui` — `EFFECTIVE_JOINTS`, 조인트 각도 범위 등 UI 상수
-- `joint_names`, `coupled_joints` — `tools/regen_joint_config.py` 로 MJCF 에서 자동 재생성 (`drive_gains` 와 `ui` 는 재생성 시 보존)
+- **그룹 allowlist** (`src/allex/config/showcase_logger_config.json::logged_groups`): 등록된 그룹 Run 시에만 CSV 기록. 미등록 그룹은 `[ALLEX][Showcase] group '<name>' not in logged_groups → CSV skipped` 로그 후 skip
+- **Pose-aligned start**: `_ALIGN_ROSBAG` 으로 지정한 rosbag 첫 프레임 자세에 시뮬 자세가 매칭될 때까지 (RMS<0.05 rad) CSV 기록 보류 → CSV `t=0` 이 rosbag `t=0` 과 일치 (ramp-in + transit 자동 크롭)
+- **Torque 컬럼 = `qfrc_actuator + qfrc_gravcomp`**: PD 토크 + 중력보상 합산 — 실제 로봇 `joint_torque` 토픽 (컨트롤러 내부 보상 포함된 모터 명령) 과 같은 reference frame 으로 비교 가능
+
+### 설정 단일화 (JSON + utils 패턴)
+
+런타임 튜닝 가능한 모든 설정은 `src/allex/config/*.json` 으로 통일, 적용 로직은 `src/allex/utils/*_settings_utils.py` 가 담당:
+
+| JSON | 적용 모듈 | 내용 |
+|---|---|---|
+| `physics_config.json` | `sim_settings_utils.py` | NewtonConfig + MuJoCo solver + USD physicsScene + 중력보상 body |
+| `ros2_config.json` | `ros2_settings_utils.py` | Domain ID, 토픽 매핑, 14 outbound topics, joint groups |
+| `ui_config.json` | `ui_settings_utils.py` | UIColors / UILayout / UIConfig (헬퍼 클래스 포함) |
+| `showcase_logger_config.json` | `showcase_logger.is_group_logged()` | CSV 기록 그룹 allowlist |
+| `joint_config.json` | `config/__init__.py` | `drive_gains` (SI 게인) + `ui` (각도 범위) + `coupled_joints` + `equality_constraints` |
+
+`tools/regen_joint_config.py` 로 MJCF 에서 `joint_names`, `coupled_joints`, `equality_constraints` 를 자동 재생성 (`drive_gains` 와 `ui` 는 재생성 시 보존).
 
 ## ROS2 Topics
 
@@ -127,40 +154,46 @@ duration, joint_1..N, trq_lim_1..N, K_pos_1..N, K_vel_1..N
 
 ```
 allex_isaac_twin/
-├── config/extension.toml           # Extension 메타
+├── config/extension.toml          # Extension 메타
 ├── asset/
-│   ├── ALLEX/ALLEX.usd             # ALLEX USD 모델
-│   ├── ALLEX/mjcf/ALLEX.xml        # MJCF 원본 (joint_config 재생성 기반)
-│   ├── prop/                       # one_kg / two_kg / three_kg 덤벨 등
-│   └── utils/                      # force_viz.usd 등
+│   ├── ALLEX/ALLEX.usd            # ALLEX USD 모델 (mjc:gravcomp 인증 포함)
+│   ├── ALLEX/ALLEX_Hand.usd       # 손 단독 USD
+│   ├── ALLEX/mjcf/ALLEX.xml       # MJCF 원본 (joint_config 재생성 기반)
+│   ├── prop/                      # one_kg / two_kg / three_kg 덤벨 등
+│   └── utils/                     # force_viz.usd 등
 ├── src/
-│   ├── extension.py                # Extension 엔트리
-│   ├── scenario.py                 # Real2Sim orchestrator
-│   ├── ui_builder.py               # UI 엔트리 (컨트롤러에 위임)
-│   ├── config/                     # physics_settings · joint_config.json · UI/ROS2 설정
-│   ├── core/                       # asset_manager · joint_controller · newton_bridge
-│   ├── ros2/                       # ROS2 노드 + 통신
-│   ├── trajectory/                 # Hermite 스플라인 · TrajectoryPlayer
-│   └── ui_utils/                   # TrajStudio · VisualizerControls 등
-├── trajectory/
-│   ├── demo1_dynamic_group/        # 궤적 데모 세트 (CES_260102 등)
-│   ├── demo2_dumbbell_group/
-│   └── demo4_powerade_group/
-└── tools/regen_joint_config.py
+│   ├── extension.py               # Isaac Sim Extension 엔트리
+│   ├── global_variables.py        # EXTENSION_TITLE 등
+│   ├── allex/                     # ALLEX 메인 패키지
+│   │   ├── __init__.py
+│   │   ├── scenario.py            # Real2Sim orchestrator
+│   │   ├── ui.py                  # 4 UI 패널 + AllExUI 오케스트레이터 (단일 진입점)
+│   │   ├── config/                # JSON 설정 5개 + joint_config.json + contact_config.json
+│   │   ├── core/                  # asset_manager · joint_controller · newton_bridge · gravcomp_debug
+│   │   ├── ros2/                  # ROS2 노드 + 통신
+│   │   ├── trajectory_generate/   # Hermite 스플라인 · TrajectoryPlayer
+│   │   └── utils/                 # *_settings_utils · constants · showcase_logger · contact_force_viz
+│   └── hysteresis/                # Hysteresis 별도 시나리오 + 전용 윈도우
+├── trajectory/                    # 궤적 데이터 (CSV 그룹)
+│   ├── demo1_dynamic_group/
+│   ├── CES_260102_group/
+│   └── aml_hysteresis_group/      # Hysteresis 시나리오용 (real_data + sim_measured)
+├── data/                          # 런타임 출력 (showcase CSV, 비교 플롯) — gitignored
+├── dvcc/                          # 프로젝트 메타 노트
+└── tools/regen_joint_config.py    # MJCF → joint_config.json 재생성
 ```
 
 ## 로봇 스펙
 
 - 총 관절 수: 60 (49 active + 11 coupled)
-- Coupled joints: master 관절 비율로 자동 계산 (`src/config/joint_config.json`)
+- Coupled joints: master 관절 비율로 자동 계산 (`src/allex/config/joint_config.json::coupled_joints`)
 - 스폰 위치: `(0, 0, 0.685)`
 
 ## 최근 변경사항
 
-- **feat(traj)**: via 이벤트 기반 PD 게인 · 토크 리밋 실시간 ramp 제어 (기본 1.0 s 선형 보간)
-- **feat(traj)**: TrajectoryPlayer 에 `hold_pose` 팩토리 + Reset 버튼 (zero pose 램프)
-- **feat(traj)**: CSV 멀티 섹션 헤더 지원 (`trq_lim_*`, `K_pos_*`, `K_vel_*` 자유 혼용)
-- **perf(traj)**: Newton Model 배열 zero-copy torch view 로 drive property 갱신, CUDA graph capture 유지
-- **refactor(config)**: `physics.toml` 제거 → `src/config/physics_settings.py` 로 통합; `joint_config.json` 을 `src/config/` 하위로 이동 및 `drive_gains`/`ui` 섹션 병합
-- **feat(assets)**: 덤벨 등 prop USD 추가, `demo1/2/4` 궤적 세트 추가
-- **chore(physics)**: 중력 활성화(`-9.81`), physics 200 Hz, `pd_scale = π/180` 로 SI 드라이브 게인 정합
+- **refactor(structure)**: `src/<X>` → `src/allex/<X>` 패키지 재구성, `ui_utils/` + `ui_builder.py` → 단일 `src/allex/ui.py` 통합, `trajectory/` → `trajectory_generate/` rename (데이터 폴더 `trajectory/` 와 구분)
+- **feat(config)**: physics / ros2 / ui / showcase_logger 설정을 JSON + `utils/*_settings_utils.py` 패턴으로 분리
+- **feat(physics)**: MuJoCo Warp 중력보상 67 body 활성화 (USD `mjc:gravcomp` 인증 + `newton_bridge` finalize 후크). `qfrc_actuator` (PD only) 와 `qfrc_gravcomp` (보상 only) 분리 가능
+- **feat(showcase)**: rosbag 첫 프레임 자세 매칭 후 CSV 시작 (`_ALIGN_ROSBAG`), torque 컬럼 = PD + gravcomp 합산, `showcase_logger_config.json::logged_groups` 그룹 allowlist
+- **feat(hysteresis)**: 별도 ScrollingWindow 로 Hysteresis 시나리오 추가 (`src/hysteresis/`)
+- **feat(traj)**: via 이벤트 기반 PD 게인 · 토크 리밋 실시간 ramp 제어 (기본 1.0 s 선형 보간), CSV 멀티 섹션 헤더 지원, zero-copy torch view 로 GPU 직접 갱신 + CUDA graph 유지
