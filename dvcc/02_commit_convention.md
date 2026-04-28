@@ -1,6 +1,6 @@
 # 커밋 컨벤션
 
-Conventional Commits 기반. 메시지만 보고 변경 종류와 범위를 즉시 파악 가능하게.
+Conventional Commits 기반. 메시지만 보고 변경 종류와 범위를 즉시 파악 가능하게. 메시지는 한글로
 
 ## 구조
 

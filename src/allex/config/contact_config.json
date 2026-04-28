@@ -1,0 +1,67 @@
+{
+  "notes": "Per-pair allowlist + aggregated groups for ContactForceVisualizer. Pairs are order-independent (a<->b == b<->a). 'pairs' draw one arrow each. 'aggregate_groups' sum normal-force scalars across an explicit pair list and draw a single bidirectional arrow at origin_shape with axis in the shape's local frame; the shape's live world transform is used so the arrow follows the moving body.",
+  "defaults": {
+    "force_scale":  0.001,
+    "min_force_n":  1.0,
+    "shaft_color_min":         [0.4, 0.95, 0.6, 1.0],
+    "shaft_color_max":         [1.0, 0.0,  0.0, 1.0],
+    "shaft_color_max_force_n": 500.0,
+    "tip_color":               [1.0, 0.0,  0.0, 1.0],
+    "shaft_width":  10.0,
+    "tip_size":     25.0
+  },
+  "pairs": [
+    {
+      "name": "L_Elbow <-> R_Palm_Back",
+      "a": "/ALLEX/L_Elbow_Link/collisions/Elbow_Collision/Elbow_Collision",
+      "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision1/R_Palm_Back_Collision1",
+      "flip_direction": true,
+      "shaft_color_max_force_n": 400.0
+    },
+    {
+      "name": "L_Palm_Back <-> R_Elbow",
+      "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision1/L_Palm_Back_Collision1",
+      "b": "/ALLEX/R_Elbow_Link/collisions/Elbow_Collision/Elbow_Collision",
+      "shaft_color_max_force_n": 400.0
+    }
+  ],
+  "aggregate_groups": [
+    {
+      "name": "R_Palm_Net_Force",
+      "origin_shape": "/ALLEX/R_Palm_Link/collisions/R_Palm_Pad_Collision1/R_Palm_Pad_Collision1",
+      "axis": [1, 0, 0],
+      "force_scale": 0.002,
+      "shaft_color_max_force_n": 100.0,
+      "pairs": [
+        { "a": "/ALLEX/L_Thumb_Yaw_Link/collisions/L_Thumb_Yaw_Collision/L_Thumb_Yaw_Collision",                        "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Frame_Collision7/R_Palm_Frame_Collision7" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Pad_Collision2/L_Palm_Pad_Collision2",                            "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Pad_Collision3/R_Palm_Pad_Collision3" },
+        { "a": "/ALLEX/L_Middle_Proximal_Link/collisions/Finger_Proximal_Collision/Finger_Proximal_Collision",         "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Pad_Collision2/R_Palm_Pad_Collision2" },
+        { "a": "/ALLEX/L_Middle_Proximal_Link/collisions/Finger_Proximal_Collision/Finger_Proximal_Collision",         "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision2/R_Palm_Back_Collision2" },
+        { "a": "/ALLEX/L_Index_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",                "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision1/R_Palm_Back_Collision1" },
+        { "a": "/ALLEX/L_Index_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",                "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision2/R_Palm_Back_Collision2" },
+        { "a": "/ALLEX/L_Middle_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",               "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision1/R_Palm_Back_Collision1" },
+        { "a": "/ALLEX/L_Middle_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",               "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision2/R_Palm_Back_Collision2" },
+        { "a": "/ALLEX/L_Ring_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",                 "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision1/R_Palm_Back_Collision1" },
+        { "a": "/ALLEX/L_Ring_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",                 "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision2/R_Palm_Back_Collision2" },
+        { "a": "/ALLEX/L_Little_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",               "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision1/R_Palm_Back_Collision1" },
+        { "a": "/ALLEX/L_Little_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",               "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision2/R_Palm_Back_Collision2" },
+        { "a": "/ALLEX/L_Ring_Middle_Link/collisions/Finger_Middle_Collision/Finger_Middle_Collision",                 "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision2/R_Palm_Back_Collision2" },
+        { "a": "/ALLEX/L_Middle_Middle_Link/collisions/Finger_Middle_Collision/Finger_Middle_Collision",               "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Back_Collision2/R_Palm_Back_Collision2" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Pad_Collision3/L_Palm_Pad_Collision3",                            "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Frame_Collision5/R_Palm_Frame_Collision5" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Frame_Collision5/L_Palm_Frame_Collision5",                        "b": "/ALLEX/R_Thumb_Yaw_Link/collisions/R_Thumb_Yaw_Collision/R_Thumb_Yaw_Collision" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision2/L_Palm_Back_Collision2",                          "b": "/ALLEX/R_Little_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision1/L_Palm_Back_Collision1",                          "b": "/ALLEX/R_Little_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision2/L_Palm_Back_Collision2",                          "b": "/ALLEX/R_Ring_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision2/L_Palm_Back_Collision2",                          "b": "/ALLEX/R_Ring_Middle_Link/collisions/Finger_Middle_Collision/Finger_Middle_Collision" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision2/L_Palm_Back_Collision2",                          "b": "/ALLEX/R_Middle_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision2/L_Palm_Back_Collision2",                          "b": "/ALLEX/R_Middle_Middle_Link/collisions/Finger_Middle_Collision/Finger_Middle_Collision" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Back_Collision1/L_Palm_Back_Collision1",                          "b": "/ALLEX/R_Ring_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision" },
+        { "a": "/ALLEX/L_Middle_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",               "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Frame_Collision1/R_Palm_Frame_Collision1" },
+        { "a": "/ALLEX/L_Index_Distal_Link/collisions/Finger_Distal_Collision/Finger_Distal_Collision",                "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Frame_Collision1/R_Palm_Frame_Collision1" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Frame_Collision5/L_Palm_Frame_Collision5",                        "b": "/ALLEX/R_Thumb_Proximal_Link/collisions/R_Thumb_Proximal_Collision1/R_Thumb_Proximal_Collision1" },
+        { "a": "/ALLEX/L_Palm_Link/collisions/L_Palm_Frame_Collision5/L_Palm_Frame_Collision5",                        "b": "/ALLEX/R_Thumb_Proximal_Link/collisions/R_Thumb_Proximal_Collision2/R_Thumb_Proximal_Collision2" },
+        { "a": "/ALLEX/L_Little_Middle_Link/collisions/Finger_Middle_Collision/Finger_Middle_Collision",               "b": "/ALLEX/R_Palm_Link/collisions/R_Palm_Pad_Collision2/R_Palm_Pad_Collision2" }
+      ]
+    }
+  ]
+}

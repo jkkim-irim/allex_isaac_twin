@@ -1,0 +1,6 @@
+{
+    "_doc": "Trajectory groups whose 'Run' triggers CSV recording into data/showcase/. Groups not in this list are silently skipped (player still plays, just no CSV).",
+    "logged_groups": [
+        "demo1_dynamic_group"
+    ]
+}

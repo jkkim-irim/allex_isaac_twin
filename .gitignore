@@ -10,3 +10,7 @@
 **/*.swp
 **/*.swo
 temp/
+
+# Repo-local data + docs + trajectory caches (kept out of version control)
+data/
+docs/
