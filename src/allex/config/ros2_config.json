@@ -26,34 +26,34 @@
         }
     },
 
-    "_joint_indices_doc": "dof_names 순서 기준 (2026-04-22 확인). passive joints (제어 안 함): [2]=Waist_Upper_Pitch, [59]=Waist_Pitch_Dummy, L DIP: 13,17,21,25,29 / R DIP: 42,46,50,54,58.",
+    "_joint_indices_doc": "indices 는 src/allex/config/joint_config.json::joint_names (ground truth) 와 src/allex/trajectory_generate/joint_name_map.py::ALLEX_CSV_JOINT_NAMES 의 매핑을 따른다. Hand 는 column-major (L11..L51 = 5 finger 의 1번째 joint, L12..L52 = 2번째, L13..L53 = 3번째). Thumb 1/2/3 = Yaw/CMC/MCP, 다른 finger 1/2/3 = ABAD/MCP/PIP. DIP/IP 는 follower (equality 로 자동 종속) 라 ROS2 미전송. WP = Waist_Lower_Pitch (joint_name_map theOne_waist 기준).",
     "joint_groups": {
         "right_hand": {
-            "indices": [55, 39, 47, 51, 43,  56, 40, 48, 52, 44,  57, 41, 49, 53, 45],
+            "indices": [40, 44, 48, 52, 56,  41, 45, 49, 53, 57,  42, 46, 50, 54, 58],
             "names":   ["R11", "R21", "R31", "R41", "R51",
                         "R12", "R22", "R32", "R42", "R52",
                         "R13", "R23", "R33", "R43", "R53"]
         },
         "left_hand": {
-            "indices": [26, 10, 18, 22, 14,  27, 11, 19, 23, 15,  28, 12, 20, 24, 16],
+            "indices": [13, 17, 21, 25, 29,  14, 18, 22, 26, 30,  15, 19, 23, 27, 31],
             "names":   ["L11", "L21", "L31", "L41", "L51",
                         "L12", "L22", "L32", "L42", "L52",
                         "L13", "L23", "L33", "L43", "L53"]
         },
         "right_arm": {
-            "indices": [32, 33, 34, 35, 36, 37, 38],
+            "indices": [33, 34, 35, 36, 37, 38, 39],
             "names":   ["RSP", "RSR", "RSY", "REP", "RWY", "RWR", "RWP"]
         },
         "left_arm": {
-            "indices": [3, 4, 5, 6, 7, 8, 9],
+            "indices": [6, 7, 8, 9, 10, 11, 12],
             "names":   ["LSP", "LSR", "LSY", "LEP", "LWY", "LWR", "LWP"]
         },
         "waist": {
-            "indices": [0, 1],
+            "indices": [0, 2],
             "names":   ["WY", "WP"]
         },
         "neck": {
-            "indices": [30, 31],
+            "indices": [4, 5],
             "names":   ["NP", "NY"]
         }
     },
