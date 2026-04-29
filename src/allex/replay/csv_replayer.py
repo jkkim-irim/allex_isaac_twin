@@ -117,14 +117,23 @@ class CsvReplayer:
             self._pos_plan.append((csv_joint, idx, arr))
 
         # follower plan — kinematic write 는 set_joint_positions 가 equality constraint
-        # 를 무시하고 즉시 teleport 한다. master 만 CSV 로 쓰고 follower 를 stale 값으로
-        # 두면 매 frame equality 위반 → 솔버가 큰 보정력으로 흔들림 (특히 waist
-        # Lower_Pitch). joint_config.json::equality_constraints 의 polycoef 로
-        # follower q 를 master q 에서 직접 도출해 같이 써준다.
+        # 를 무시하고 즉시 teleport 한다. CSV 에 logged 된 한 쪽만 쓰고 다른 쪽을
+        # stale 값으로 두면 매 frame equality 위반 → 솔버가 큰 보정력으로 흔들림
+        # (waist Lower/Upper, finger PIP/DIP). joint_config.json::equality_constraints
+        # 의 polycoef 로 빠진 쪽 q 를 직접 도출해 같이 써준다.
+        #
+        # bidirectional: regen tool 의 active master 분류가 actuator 기준이라 시간/버전에
+        # 따라 master/follower 가 swap 될 수 있고, 옛 showcase CSV 와 새 CSV 가 logged
+        # 한 쪽이 다를 수 있음 (예: 옛 CSV = Upper_Pitch logged, 새 CSV = Lower_Pitch
+        # logged). 둘 다 지원하기 위해 CSV 에 어느 쪽이 들어있든 빠진 쪽을 도출.
+        # forward (master→follower) 는 polycoef 그대로, reverse (follower→master) 는
+        # 선형 polycoef [c0,c1,0,0,0] 의 inverse [-c0/c1, 1/c1, 0, 0, 0] 사용.
+        # plan entry: (write_idx, source_idx, polycoef_to_apply)
         self._follower_plan: list[tuple[int, int, list[float]]] = []
         try:
             from ..config import load_joint_config_json
             jc = load_joint_config_json()
+            csv_pos_dofs = {idx for _, idx, _ in self._pos_plan}
             for e in jc.get("equality_constraints", []):
                 if not e.get("active", True):
                     continue
@@ -138,7 +147,24 @@ class CsvReplayer:
                     m_idx = self._dof_names.index(m_name)
                 except ValueError:
                     continue
-                self._follower_plan.append((f_idx, m_idx, list(coef)))
+                has_f = f_idx in csv_pos_dofs
+                has_m = m_idx in csv_pos_dofs
+                if has_m and not has_f:
+                    # forward: f = poly(m). CSV 에 master 만 있음 → follower 도출.
+                    self._follower_plan.append((f_idx, m_idx, list(coef)))
+                elif has_f and not has_m:
+                    # reverse: m = inv_poly(f). 선형일 때만 inverse 가능.
+                    c = list(coef)
+                    if (abs(c[2]) > 1e-12 or abs(c[3]) > 1e-12 or abs(c[4]) > 1e-12
+                            or abs(c[1]) < 1e-12):
+                        logger.warning(
+                            f"[replay] non-linear polycoef cannot reverse-derive "
+                            f"{m_name} from {f_name}; skipping"
+                        )
+                        continue
+                    inv = [-c[0] / c[1], 1.0 / c[1], 0.0, 0.0, 0.0]
+                    self._follower_plan.append((m_idx, f_idx, inv))
+                # both / neither in CSV: derivation 불필요/불가
         except Exception as exc:
             logger.debug(f"[replay] follower plan build warn: {exc}")
 
