@@ -610,26 +610,39 @@ class CsvReplayer:
     # Contact-local CSV export (debug)
     # ------------------------------------------------------------------
     def _sample_local_contacts(self, idx: int) -> None:
-        """non-zero contact_pos / aggregate_origin 을 link local frame 으로 변환해 buffer 에 적재."""
+        """non-zero contact_pos / aggregate_origin 을 link local frame 으로 변환해 buffer 에 적재.
+
+        link world transform 은 USDRT (Fabric) 에서 읽어 *replay 시점의 실제 자세*를 반영한다.
+        USD `Usd.TimeCode.Default()` 는 authored rest pose 만 보기 때문에 non-runtime
+        """
         try:
             import omni.usd
-            from pxr import Gf, Usd, UsdGeom
+            import usdrt
         except Exception:
             return
-        stage = omni.usd.get_context().get_stage()
-        if stage is None:
-            return
+
+        # USDRT stage 한 번만 attach 해서 캐시. Newton 이 매 step update_fabric 으로
+        # link prim 의 worldXform 어트리뷰트를 갱신하므로 여기서 읽으면 live pose.
+        if getattr(self, "_rt_stage", None) is None:
+            try:
+                stage_id = omni.usd.get_context().get_stage_id()
+                self._rt_stage = usdrt.Usd.Stage.Attach(stage_id)
+            except Exception as e:
+                if not getattr(self, "_export_rt_warned", False):
+                    logger.warning(f"[replay][export] usdrt stage attach failed: {e}")
+                    self._export_rt_warned = True
+                return
+        rt_stage = self._rt_stage
 
         def _to_local(link_name: str, wx: float, wy: float, wz: float):
             # CSV pair 이름은 collision region 일 수 있음 → 실제 link 로 alias.
             resolved = EXPORT_LINK_ALIAS.get(link_name, link_name)
             prim_path = f"/ALLEX/{resolved}_Link"
-            prim = stage.GetPrimAtPath(prim_path)
-            if not (prim and prim.IsValid()):
-                # 첫 sample 에 한 번 경고 — prim path convention 이 다르면 lookup 전부 fail.
+            rt_prim = rt_stage.GetPrimAtPath(usdrt.Sdf.Path(prim_path))
+            if not rt_prim:
                 if not getattr(self, "_export_link_warned", False):
                     logger.warning(
-                        f"[replay][export] link prim missing: {prim_path} — "
+                        f"[replay][export] fabric prim missing: {prim_path} — "
                         f"local-frame conversion will be skipped for '{link_name}'. "
                         f"Stage 의 articulation root 가 다른 경로면 csv_replayer.py 의 "
                         f"_to_local prim_path 를 수정해야 합니다."
@@ -637,16 +650,30 @@ class CsvReplayer:
                     self._export_link_warned = True
                 return None
             try:
-                xf = UsdGeom.Xformable(prim)
-                mat = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                # Newton FabricManager 는 매 step `omni:fabric:worldMatrix` (Matrix4d)
+                # 한 곳에만 live transform 을 쓴다. WorldPosition/WorldOrientation
+                # 어트리뷰트는 init 시 SetWorldXformFromUsd() 로 한 번 채워진 뒤
+                # 갱신되지 않으므로 여기서 읽으면 회전 부분이 stale identity 됨.
+                # → 매트릭스 어트리뷰트를 직접 읽는다.
+                attr = rt_prim.GetAttribute("omni:fabric:worldMatrix")
+                if not attr or not attr.IsValid():
+                    if not getattr(self, "_export_no_world_warned", False):
+                        logger.warning(
+                            f"[replay][export] {prim_path} has no omni:fabric:worldMatrix — "
+                            f"Newton update_fabric 가 비활성이거나 prim 이 sim graph 밖일 수 있음"
+                        )
+                        self._export_no_world_warned = True
+                    return None
+                mat = attr.Get()                              # usdrt.Gf.Matrix4d (row-major, translation in last row)
                 inv = mat.GetInverse()
-                lp = inv.Transform(Gf.Vec3d(wx, wy, wz))
+                lp = inv.Transform(usdrt.Gf.Vec3d(wx, wy, wz))
                 # 첫 valid 변환 1회 진단 — link world pose 와 변환 결과 dump.
                 if not getattr(self, "_export_dump_done", False):
+                    # Matrix4d 의 마지막 행이 translation (USD/Fabric 컨벤션).
                     t = mat.ExtractTranslation()
                     logger.warning(
-                        f"[replay][export] first convert: link={link_name} "
-                        f"link_world_translate=({float(t[0]):.4f},{float(t[1]):.4f},{float(t[2]):.4f}) "
+                        f"[replay][export] first convert (Fabric runtime): link={link_name} "
+                        f"link_world_pos=({float(t[0]):.4f},{float(t[1]):.4f},{float(t[2]):.4f}) "
                         f"world_pt=({wx:.4f},{wy:.4f},{wz:.4f}) "
                         f"→ local=({float(lp[0]):.4f},{float(lp[1]):.4f},{float(lp[2]):.4f})"
                     )
