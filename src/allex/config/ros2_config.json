@@ -1,0 +1,80 @@
+{
+    "node_name": "isaac_sim_integrated_ros2",
+    "bridge_extension": "isaacsim.ros2.bridge",
+    "default_domain_id": 77,
+    "default_rmw_implementation": "rmw_cyclonedds_cpp",
+    "init_timeout": 5.0,
+    "shutdown_timeout": 1.0,
+    "thread_daemon": true,
+    "executor_timeout": 0.1,
+
+    "qos": {
+        "history_depth": 10
+    },
+
+    "topics": {
+        "robot_state": "/robot_state"
+    },
+
+    "topic_mode": {
+        "current": "joint_positions_deg",
+        "desired": "joint_ang_target_deg",
+        "default": "joint_positions_deg",
+        "display_names": {
+            "joint_positions_deg": "Current",
+            "joint_ang_target_deg": "Desired"
+        }
+    },
+
+    "_joint_indices_doc": "dof_names 순서 기준 (2026-04-22 확인). passive joints (제어 안 함): [2]=Waist_Upper_Pitch, [59]=Waist_Pitch_Dummy, L DIP: 13,17,21,25,29 / R DIP: 42,46,50,54,58.",
+    "joint_groups": {
+        "right_hand": {
+            "indices": [55, 39, 47, 51, 43,  56, 40, 48, 52, 44,  57, 41, 49, 53, 45],
+            "names":   ["R11", "R21", "R31", "R41", "R51",
+                        "R12", "R22", "R32", "R42", "R52",
+                        "R13", "R23", "R33", "R43", "R53"]
+        },
+        "left_hand": {
+            "indices": [26, 10, 18, 22, 14,  27, 11, 19, 23, 15,  28, 12, 20, 24, 16],
+            "names":   ["L11", "L21", "L31", "L41", "L51",
+                        "L12", "L22", "L32", "L42", "L52",
+                        "L13", "L23", "L33", "L43", "L53"]
+        },
+        "right_arm": {
+            "indices": [32, 33, 34, 35, 36, 37, 38],
+            "names":   ["RSP", "RSR", "RSY", "REP", "RWY", "RWR", "RWP"]
+        },
+        "left_arm": {
+            "indices": [3, 4, 5, 6, 7, 8, 9],
+            "names":   ["LSP", "LSR", "LSY", "LEP", "LWY", "LWR", "LWP"]
+        },
+        "waist": {
+            "indices": [0, 1],
+            "names":   ["WY", "WP"]
+        },
+        "neck": {
+            "indices": [30, 31],
+            "names":   ["NP", "NY"]
+        }
+    },
+
+    "outbound_topic_to_joints": {
+        "Arm_R_theOne":      ["RSP", "RSR", "RSY", "REP", "RWY", "RWR", "RWP"],
+        "Hand_R_thumb_wir":  ["R11", "R12", "R13"],
+        "Hand_R_index_wir":  ["R21", "R22", "R23"],
+        "Hand_R_middle_wir": ["R31", "R32", "R33"],
+        "Hand_R_ring_wir":   ["R41", "R42", "R43"],
+        "Hand_R_little_wir": ["R51", "R52", "R53"],
+        "Arm_L_theOne":      ["LSP", "LSR", "LSY", "LEP", "LWY", "LWR", "LWP"],
+        "Hand_L_thumb_wir":  ["L11", "L12", "L13"],
+        "Hand_L_index_wir":  ["L21", "L22", "L23"],
+        "Hand_L_middle_wir": ["L31", "L32", "L33"],
+        "Hand_L_ring_wir":   ["L41", "L42", "L43"],
+        "Hand_L_little_wir": ["L51", "L52", "L53"],
+        "theOne_waist":      ["WY", "WP"],
+        "theOne_neck":       ["NP", "NY"]
+    },
+
+    "_outbound_torque_topic_to_joints_doc": "Real torque (real2sim 시각화용). rosbag torque 토픽 패턴 확정 시 outbound_topic_to_joints 와 같은 형식으로 채울 것. 비어있으면 ros2_node 가 아무 subscribe 도 안 함.",
+    "outbound_torque_topic_to_joints": {}
+}

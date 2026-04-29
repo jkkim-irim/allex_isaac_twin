@@ -1,0 +1,48 @@
+{
+  "notes": "Hysteresis 시나리오 전용 R-hand 5쌍 equality constraints. 런타임에는 HysteresisScenario.load_example_assets() 가 newton_bridge.set_equality_config(...) 으로 이 파일을 올린다.",
+  "source_mjcf": "asset/ALLEX/mjcf/ALLEX.xml",
+  "schema": {
+    "solref": "MJCF [timeconst_sec, dampratio] — Newton forwards as mujoco:eq_solref. timeconst >= 2*sim_dt (50 Hz 면 0.04 이상). 값이 클수록 soft, 작을수록 stiff.",
+    "solimp": "MJCF [dmin, dmax, width, midpoint, power] — Newton forwards as mujoco:eq_solimp. dmin/dmax 가 작을수록 soft.",
+    "equality_constraints[i]": {
+      "follower": "joint name driven by equality (string)",
+      "master": "joint name that follower mirrors (string)",
+      "polycoef": "MJCF polycoef [c0..c4] — follower = sum_i c_i * master^i",
+      "active": "set false to skip injection (bool)"
+    }
+  },
+  "solref": [0.01, 1.0],
+  "solimp": [0.98, 0.99, 0.001, 0.5, 2.0],
+  "equality_constraints": [
+    {
+      "follower": "R_Thumb_IP_Joint",
+      "master": "R_Thumb_MCP_Joint",
+      "polycoef": [-0.0015, 0.6651, 0.0186, 0.1224, -0.0696],
+      "active": true
+    },
+    {
+      "follower": "R_Index_DIP_Joint",
+      "master": "R_Index_PIP_Joint",
+      "polycoef": [-0.003849, 0.4269, 0.06589, 0.136, -0.04621],
+      "active": true
+    },
+    {
+      "follower": "R_Middle_DIP_Joint",
+      "master": "R_Middle_PIP_Joint",
+      "polycoef": [-0.003849, 0.4269, 0.06589, 0.136, -0.04621],
+      "active": true
+    },
+    {
+      "follower": "R_Ring_DIP_Joint",
+      "master": "R_Ring_PIP_Joint",
+      "polycoef": [-0.003849, 0.4269, 0.06589, 0.136, -0.04621],
+      "active": true
+    },
+    {
+      "follower": "R_Little_DIP_Joint",
+      "master": "R_Little_PIP_Joint",
+      "polycoef": [-0.003849, 0.4269, 0.06589, 0.136, -0.04621],
+      "active": true
+    }
+  ]
+}

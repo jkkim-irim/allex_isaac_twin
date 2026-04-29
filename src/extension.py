@@ -22,17 +22,17 @@ from isaacsim.gui.components.menu import MenuItemDescription
 from omni.kit.menu.utils import add_menu_items, remove_menu_items
 from omni.usd import StageEventType
 
-from .global_variables import EXTENSION_DESCRIPTION, EXTENSION_TITLE
-from .ui_builder import UIBuilder
+from .global_variables import EXTENSION_DESCRIPTION, EXTENSION_TITLE, HYSTERESIS_TITLE
+from .allex.ui import AllExUI
 
 """
 This file serves as a basic template for the standard boilerplate operations
 that make a UI-based extension appear on the toolbar.
 
 This implementation is meant to cover most use-cases without modification.
-Various callbacks are hooked up to a seperate class UIBuilder in .ui_builder.py
-Most users will be able to make their desired UI extension by interacting solely with
-UIBuilder.
+Various callbacks are hooked up to the AllExUI class in .allex.ui (4 UI
+panels + orchestrator + Hysteresis window). Most users will be able to make
+their desired UI extension by interacting solely with AllExUI.
 
 This class sets up standard useful callback functions in UIBuilder:
     on_menu_callback: Called when extension is opened
@@ -60,7 +60,7 @@ class Extension(omni.ext.IExt):
         self.ext_id = ext_id
         self._usd_context = omni.usd.get_context()
 
-        # Build Window
+        # Build main ALLEX window
         self._window = ScrollingWindow(
             title=EXTENSION_TITLE,
             width=400,
@@ -72,6 +72,16 @@ class Extension(omni.ext.IExt):
         )
         self._window.set_visibility_changed_fn(self._on_window)
 
+        # Build Hysteresis standalone window (Robotics_Study_python pattern)
+        self._hysteresis_window = ScrollingWindow(
+            title=HYSTERESIS_TITLE,
+            width=420,
+            height=520,
+            visible=False,
+            dockPreference=ui.DockPreference.LEFT_BOTTOM,
+        )
+        self._hysteresis_ui_built = False
+
         action_registry = omni.kit.actions.core.get_action_registry()
         action_registry.register_action(
             ext_id,
@@ -79,14 +89,21 @@ class Extension(omni.ext.IExt):
             self._menu_callback,
             description=f"Add {EXTENSION_TITLE} Extension to UI toolbar",
         )
+        action_registry.register_action(
+            ext_id,
+            f"CreateUIExtension:{HYSTERESIS_TITLE}",
+            self._hysteresis_callback,
+            description=f"Add {HYSTERESIS_TITLE} Extension to UI toolbar",
+        )
         self._menu_items = [
-            MenuItemDescription(name=EXTENSION_TITLE, onclick_action=(ext_id, f"CreateUIExtension:{EXTENSION_TITLE}"))
+            MenuItemDescription(name=EXTENSION_TITLE, onclick_action=(ext_id, f"CreateUIExtension:{EXTENSION_TITLE}")),
+            MenuItemDescription(name=HYSTERESIS_TITLE, onclick_action=(ext_id, f"CreateUIExtension:{HYSTERESIS_TITLE}")),
         ]
 
         add_menu_items(self._menu_items, EXTENSION_TITLE)
 
         # Filled in with User Functions
-        self.ui_builder = UIBuilder()
+        self.ui_builder = AllExUI()
 
         # Events
         self._usd_context = omni.usd.get_context()
@@ -95,40 +112,51 @@ class Extension(omni.ext.IExt):
         self._timeline = omni.timeline.get_timeline_interface()
 
         # Newton: inject MJCF equality constraints before finalize.
-        from .core import newton_bridge
-        joint_config = Path(__file__).parent / "config" / "joint_config.json"
+        from .allex.core import newton_bridge
+        joint_config = Path(__file__).parent / "allex" / "config" / "joint_config.json"
         newton_bridge.install(joint_config)
 
     def on_shutdown(self):
         self._models = {}
         self._deregister_physics_step()
-        from .core import newton_bridge
+        from .allex.core import newton_bridge
         newton_bridge.uninstall()
         remove_menu_items(self._menu_items, EXTENSION_TITLE)
 
         action_registry = omni.kit.actions.core.get_action_registry()
         action_registry.deregister_action(self.ext_id, f"CreateUIExtension:{EXTENSION_TITLE}")
+        action_registry.deregister_action(self.ext_id, f"CreateUIExtension:{HYSTERESIS_TITLE}")
 
         if self._window:
             self._window = None
+        if self._hysteresis_window:
+            self._hysteresis_window.visible = False
+            self._hysteresis_window = None
+        self._hysteresis_ui_built = False
         self.ui_builder.cleanup()
         gc.collect()
 
     def _on_window(self, visible):
         if self._window.visible:
-            # Subscribe to Stage and Timeline Events
-            self._usd_context = omni.usd.get_context()
-            events = self._usd_context.get_stage_event_stream()
-            self._stage_event_sub = events.create_subscription_to_pop(self._on_stage_event)
-            stream = self._timeline.get_timeline_event_stream()
-            self._timeline_event_sub = stream.create_subscription_to_pop(self._on_timeline_event)
-
+            self._setup_event_subscriptions()
             self._build_ui()
         else:
-            self._usd_context = None
-            self._stage_event_sub = None
-            self._timeline_event_sub = None
-            self.ui_builder.cleanup()
+            # Keep subscriptions alive if the Hysteresis window is still open.
+            if not (self._hysteresis_window and self._hysteresis_window.visible):
+                self._usd_context = None
+                self._stage_event_sub = None
+                self._timeline_event_sub = None
+                self.ui_builder.cleanup()
+
+    def _setup_event_subscriptions(self):
+        """Timeline / stage 이벤트 구독을 한 번만 설치."""
+        self._usd_context = omni.usd.get_context()
+        if self._stage_event_sub is None:
+            events = self._usd_context.get_stage_event_stream()
+            self._stage_event_sub = events.create_subscription_to_pop(self._on_stage_event)
+        if getattr(self, "_timeline_event_sub", None) is None:
+            stream = self._timeline.get_timeline_event_stream()
+            self._timeline_event_sub = stream.create_subscription_to_pop(self._on_timeline_event)
 
     def _build_ui(self):
         with self._window.frame:
@@ -157,6 +185,15 @@ class Extension(omni.ext.IExt):
     def _menu_callback(self):
         self._window.visible = not self._window.visible
         self.ui_builder.on_menu_callback()
+
+    def _hysteresis_callback(self):
+        """Hysteresis 메뉴 토글 — 최초 클릭 시에만 UI 빌드, 이후엔 visible 토글."""
+        if not self._hysteresis_ui_built:
+            self.ui_builder.build_hysteresis_ui(self._hysteresis_window)
+            self._hysteresis_ui_built = True
+        self._hysteresis_window.visible = not self._hysteresis_window.visible
+        if self._hysteresis_window.visible:
+            self._setup_event_subscriptions()
 
     def _on_timeline_event(self, event):
         if event.type == int(omni.timeline.TimelineEventType.PLAY):
@@ -187,9 +224,11 @@ class Extension(omni.ext.IExt):
             self._deregister_physics_step()
             self.ui_builder.cleanup()
 
-            # ← 추가: 창이 열려있다면 UI 즉시 재구축
             if self._window and self._window.visible:
                 self._build_ui()
+            if (self._hysteresis_window and self._hysteresis_window.visible
+                    and self._hysteresis_ui_built):
+                self.ui_builder.build_hysteresis_ui(self._hysteresis_window)
 
         self.ui_builder.on_stage_event(event)
 

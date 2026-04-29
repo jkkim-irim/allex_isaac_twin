@@ -21,8 +21,7 @@ import omni.ui as ui
 from isaacsim.gui.components.element_wrappers import CollapsableFrame
 from isaacsim.gui.components.ui_utils import get_style
 
-from .ui_components import UIComponentFactory
-from ..config.ui_config import UILayout
+from .ui_settings_utils import UIComponentFactory, UILayout
 from ..replay import CsvReplayer, ShowcaseReader
 
 _EXT_ROOT = Path(__file__).resolve().parent.parent.parent

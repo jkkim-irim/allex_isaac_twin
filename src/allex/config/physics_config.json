@@ -1,0 +1,115 @@
+{
+    "world": {
+        "physics_dt": 0.025,
+        "rendering_dt": 0.01667,
+        "gravity": [0.0, 0.0, -9.81]
+    },
+    "usd": {
+        "physics_scene": {
+            "physx": {}
+        }
+    },
+    "newton": {
+        "pd_scale": 0.017453292519943295,
+        "use_cuda_graph": false,
+        "contact_mu": 0.5,
+        "gravcomp": {
+            "scale": 1.0,
+            "bodies": [
+                "Base_Link",
+
+                "Waist_Yaw_Link",
+                "Waist_Pitch_Back_Link",
+                "Waist_Lower_Pitch_Link",
+                "Waist_Upper_Pitch_Link",
+
+                "Chest_Origin_Link",
+
+                "Neck_Pitch_Link",
+                "Neck_Yaw_Link",
+
+                "realsense_link",
+                "orbbec_link",
+                "zed_camera_link",
+
+                "L_Shoulder_Pitch_Link",
+                "L_Shoulder_Roll_Link",
+                "L_Shoulder_Yaw_Link",
+                "L_Elbow_Link",
+                "L_Wrist_Yaw_Link",
+                "L_Wrist_Roll_Link",
+                "L_Wrist_Pitch_Link",
+                "L_Palm_Link",
+
+                "L_Thumb_Yaw_Link",
+                "L_Thumb_Proximal_Link",
+                "L_Thumb_Middle_Link",
+                "L_Thumb_Distal_Link",
+
+                "L_Index_Roll_Link",
+                "L_Index_Proximal_Link",
+                "L_Index_Middle_Link",
+                "L_Index_Distal_Link",
+
+                "L_Middle_Roll_Link",
+                "L_Middle_Proximal_Link",
+                "L_Middle_Middle_Link",
+                "L_Middle_Distal_Link",
+
+                "L_Ring_Roll_Link",
+                "L_Ring_Proximal_Link",
+                "L_Ring_Middle_Link",
+                "L_Ring_Distal_Link",
+
+                "L_Little_Roll_Link",
+                "L_Little_Proximal_Link",
+                "L_Little_Middle_Link",
+                "L_Little_Distal_Link",
+
+                "R_Shoulder_Pitch_Link",
+                "R_Shoulder_Roll_Link",
+                "R_Shoulder_Yaw_Link",
+                "R_Elbow_Link",
+                "R_Wrist_Yaw_Link",
+                "R_Wrist_Roll_Link",
+                "R_Wrist_Pitch_Link",
+                "R_Palm_Link",
+
+                "R_Thumb_Yaw_Link",
+                "R_Thumb_Proximal_Link",
+                "R_Thumb_Middle_Link",
+                "R_Thumb_Distal_Link",
+
+                "R_Index_Roll_Link",
+                "R_Index_Proximal_Link",
+                "R_Index_Middle_Link",
+                "R_Index_Distal_Link",
+
+                "R_Middle_Roll_Link",
+                "R_Middle_Proximal_Link",
+                "R_Middle_Middle_Link",
+                "R_Middle_Distal_Link",
+
+                "R_Ring_Roll_Link",
+                "R_Ring_Proximal_Link",
+                "R_Ring_Middle_Link",
+                "R_Ring_Distal_Link",
+
+                "R_Little_Roll_Link",
+                "R_Little_Proximal_Link",
+                "R_Little_Middle_Link",
+                "R_Little_Distal_Link"
+            ]
+        },
+        "solver": {
+            "njmax": 150,
+            "nconmax": 200
+        }
+    },
+    "allex": {
+        "actuator_gravcomp": {
+            "enabled": false,
+            "joints": []
+        }
+    }
+}

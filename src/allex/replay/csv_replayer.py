@@ -143,7 +143,7 @@ class CsvReplayer:
         # joint_name → abbr (plotter LUT 활용; lazy import 로 의존성 경량화).
         self._joint_to_abbr: dict[str, str] = {}
         try:
-            from ..ui_utils.torque_plotter import _build_dof_name_to_abbr_lut
+            from ..utils.torque_plotter import _build_dof_name_to_abbr_lut
             self._joint_to_abbr = _build_dof_name_to_abbr_lut() or {}
         except Exception as exc:
             logger.debug(f"[replay] joint→abbr LUT load warn: {exc}")
