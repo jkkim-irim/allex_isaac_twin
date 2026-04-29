@@ -38,8 +38,8 @@ TORQUE_MAX_SCALE = 3.0
 # ========================================
 TORQUE_GAIN_SHOULDER = 0.02   # 어깨 — 토크가 커서 기본값보다 줄임
 TORQUE_GAIN_ELBOW    = 0.02   # 팔꿈치
-TORQUE_GAIN_WRIST    = 0.08   # 손목 — 토크가 작아서 기본값보다 키움
-TORQUE_GAIN_FINGER   = 0.15   # 손가락 — 토크가 매우 작음
+TORQUE_GAIN_WRIST    = 0.05   # 손목 — 토크가 작아서 기본값보다 키움
+TORQUE_GAIN_FINGER   = 0.2   # 손가락 — 토크가 매우 작음
 
 
 # ========================================
@@ -94,11 +94,11 @@ TORQUE_RING_SIM_NAME = "torque_ring_sim"
 # ========================================
 # 에셋 경로
 # ========================================
-# 이 파일: <EXT_ROOT>/src/config/viz_config.py
+# 이 파일: <EXT_ROOT>/src/allex/config/viz_config.py
 # 확장 루트: <EXT_ROOT>
 # torque_viz.usd / force_viz.usd 위치: <EXT_ROOT>/asset/utils/
 _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
-EXT_ROOT = os.path.abspath(os.path.join(_CONFIG_DIR, "..", ".."))
+EXT_ROOT = os.path.abspath(os.path.join(_CONFIG_DIR, "..", "..", ".."))
 TORQUE_VIZ_USD_PATH = os.path.join(EXT_ROOT, "asset", "utils", "torque_viz.usd")
 # force 화살표 asset 교체: 정적 force_viz.usd → 길이 가변 force_vec.usda (Arrow/Shaft + Arrow/Head)
 # - FORCE_VIZ_USD_PATH      : 손에 붙은 12 link 자동 force_viz 용 (가는 shaft, 작은 head)

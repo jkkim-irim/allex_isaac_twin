@@ -116,6 +116,32 @@ class CsvReplayer:
                 continue
             self._pos_plan.append((csv_joint, idx, arr))
 
+        # follower plan — kinematic write 는 set_joint_positions 가 equality constraint
+        # 를 무시하고 즉시 teleport 한다. master 만 CSV 로 쓰고 follower 를 stale 값으로
+        # 두면 매 frame equality 위반 → 솔버가 큰 보정력으로 흔들림 (특히 waist
+        # Lower_Pitch). joint_config.json::equality_constraints 의 polycoef 로
+        # follower q 를 master q 에서 직접 도출해 같이 써준다.
+        self._follower_plan: list[tuple[int, int, list[float]]] = []
+        try:
+            from ..config import load_joint_config_json
+            jc = load_joint_config_json()
+            for e in jc.get("equality_constraints", []):
+                if not e.get("active", True):
+                    continue
+                f_name = e.get("follower")
+                m_name = e.get("master")
+                coef = e.get("polycoef", [])
+                if not (f_name and m_name and coef):
+                    continue
+                try:
+                    f_idx = self._dof_names.index(f_name)
+                    m_idx = self._dof_names.index(m_name)
+                except ValueError:
+                    continue
+                self._follower_plan.append((f_idx, m_idx, list(coef)))
+        except Exception as exc:
+            logger.debug(f"[replay] follower plan build warn: {exc}")
+
         # torque plan: (dof_idx, csv_arr) — main + secondary 둘 다. plot 갱신용.
         # plotter 는 sim 채널은 (num_dof,) array, real 채널은 dict[abbr -> tau].
         self._main_torque_dof_plan: list[tuple[int, np.ndarray]] = []
@@ -133,6 +159,22 @@ class CsvReplayer:
                 except ValueError:
                     continue
                 self._sec_torque_dof_plan.append((idx, arr))
+
+        # CSV 에 torque 컬럼이 없는 ring joint (DIP/IP follower 등) — replay 동안
+        # viz.update() 가 _external_torque_sources lock 으로 skip 되어 push 도 안 되면
+        # ring 이 base_scale=(1,1,1) 초기값 그대로 거대하게 고정된다. 매 frame 0 push
+        # 해서 MIN_SCALE 로 floor 시킴.
+        self._unpushed_torque_joints: list[str] = []
+        try:
+            from ..config.viz_config import HAND_JOINT_TORQUE_RING_MAP
+            csv_torque_joints = set(self._main.torque.keys())
+            if self._sec is not None:
+                csv_torque_joints |= set(self._sec.torque.keys())
+            for e in HAND_JOINT_TORQUE_RING_MAP:
+                if e["usd_joint_name"] not in csv_torque_joints:
+                    self._unpushed_torque_joints.append(e["usd_joint_name"])
+        except Exception as exc:
+            logger.debug(f"[replay] enumerate unpushed torque joints warn: {exc}")
 
         # plot override 버퍼 — replayer 가 mutate, plotter 가 reference 로 read.
         self._plot_sim_tau: Optional[np.ndarray] = (
@@ -444,6 +486,16 @@ class CsvReplayer:
                     break
             self._push_force_frame(self._sec, sec_idx, self._sec_src)
 
+        # 5) CSV 에 없는 follower (DIP/IP) ring 은 0 push → base_scale 거대값 → floor.
+        if self._unpushed_torque_joints:
+            for jn in self._unpushed_torque_joints:
+                try:
+                    viz.push_external_torque(jn, 0.0, source=self._main_src)
+                    if self._sec is not None:
+                        viz.push_external_torque(jn, 0.0, source=self._sec_src)
+                except Exception:
+                    pass
+
     def _kinematic_write(self, idx: int) -> None:
         if self._num_dof == 0 or self._q_buf is None:
             return
@@ -470,6 +522,18 @@ class CsvReplayer:
         # 2) CSV 로 매핑된 joint 만 덮어쓰기.
         for _name, dof_idx, arr in self._pos_plan:
             self._q_buf[dof_idx] = float(arr[idx])
+
+        # 2b) Equality follower 는 master q 에서 polycoef 로 도출해 같이 쓴다.
+        # set_joint_positions 가 equality 무시하고 teleport 하므로 follower 를
+        # 직접 일관된 값으로 안 채우면 다음 step 에서 큰 위반력 → 흔들림.
+        for f_idx, m_idx, coef in self._follower_plan:
+            m = float(self._q_buf[m_idx])
+            v = 0.0
+            mp = 1.0
+            for c in coef:
+                v += float(c) * mp
+                mp *= m
+            self._q_buf[f_idx] = v
 
         # 3) Newton set_joint_positions 는 torch tensor 요구 (.to(device) 호출).
         try:

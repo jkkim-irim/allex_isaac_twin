@@ -24,7 +24,7 @@ from isaacsim.gui.components.ui_utils import get_style
 from .ui_settings_utils import UIComponentFactory, UILayout
 from ..replay import CsvReplayer, ShowcaseReader
 
-_EXT_ROOT = Path(__file__).resolve().parent.parent.parent
+_EXT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _TRAJECTORY_DIR = _EXT_ROOT / "trajectory"
 
 
@@ -60,7 +60,7 @@ class ShowcaseReplayControls:
     # UI build
     # ------------------------------------------------------------------
     def build(self) -> None:
-        frame = CollapsableFrame("Showcase Replay", collapsed=True)
+        frame = CollapsableFrame("Real/Sim Replay", collapsed=True)
         with frame:
             with ui.VStack(style=get_style(), spacing=UILayout.SPACING_SMALL, height=0):
                 with ui.HStack(height=UILayout.BUTTON_HEIGHT):

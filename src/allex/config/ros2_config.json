@@ -26,7 +26,7 @@
         }
     },
 
-    "_joint_indices_doc": "indices 는 src/allex/config/joint_config.json::joint_names (ground truth) 와 src/allex/trajectory_generate/joint_name_map.py::ALLEX_CSV_JOINT_NAMES 의 매핑을 따른다. Hand 는 column-major (L11..L51 = 5 finger 의 1번째 joint, L12..L52 = 2번째, L13..L53 = 3번째). Thumb 1/2/3 = Yaw/CMC/MCP, 다른 finger 1/2/3 = ABAD/MCP/PIP. DIP/IP 는 follower (equality 로 자동 종속) 라 ROS2 미전송. WP = Waist_Lower_Pitch (joint_name_map theOne_waist 기준).",
+    "_joint_indices_doc": "indices 는 src/allex/config/joint_config.json::joint_names 의 DOF 순서와 src/allex/trajectory_generate/joint_name_map.py::ALLEX_CSV_JOINT_NAMES 의 매핑을 따른다. Hand 는 column-major (L11..L51 = 5 finger 의 1번째 joint, L12..L52 = 2번째, L13..L53 = 3번째). Thumb 1/2/3 = Yaw/CMC/MCP, 다른 finger 1/2/3 = ABAD/MCP/PIP. DIP/IP 는 follower (equality 로 자동 종속) 라 ROS2 미전송. WP = Waist_Lower_Pitch_Joint (DOF idx 2) — MJCF actuator 가 Lower 에 부착되어 있어 active master. Upper_Pitch(idx 3) 는 passive follower. joint_config.json::active_joints 가 idx 3 (Upper) 을 active 로 표기하는 것은 regen tool 이 MJCF equality joint1=Lower 를 follower 로 분류한 라벨링 오류이며 실제 motor 위치(MJCF actuator)와 다르므로 무시.",
     "joint_groups": {
         "right_hand": {
             "indices": [40, 44, 48, 52, 56,  41, 45, 49, 53, 57,  42, 46, 50, 54, 58],
