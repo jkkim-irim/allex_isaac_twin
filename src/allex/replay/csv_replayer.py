@@ -382,6 +382,12 @@ class CsvReplayer:
                     plotter.set_external_real_by_abbr(None)
                 if hasattr(plotter, "set_replay_mode"):
                     plotter.set_replay_mode(True)
+                # Clear subprocess deques — without this, a new run's [0..T']
+                # samples stack on top of the previous run's [0..T] and the
+                # resulting non-monotonic t makes one legend entry look like
+                # multiple traces. No-op when the plotter isn't running yet.
+                if hasattr(plotter, "reset_buffer"):
+                    plotter.reset_buffer()
             except Exception as exc:
                 logger.debug(f"[replay] plotter replay mode set warn: {exc}")
 

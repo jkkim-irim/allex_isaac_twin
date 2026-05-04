@@ -120,6 +120,19 @@ def _stdin_reader_loop(
             break
         if cmd == "init":
             continue
+        if cmd == "reset":
+            # Clear all deques so a non-monotonic t (e.g. on replay restart)
+            # doesn't draw a back-line. Line objects and axis structure from
+            # init stay intact.
+            shared_t.clear()
+            for jdq_list in group_joint_dqs:
+                for dq in jdq_list:
+                    dq.clear()
+            if group_real_dqs is not None:
+                for rdq_list in group_real_dqs:
+                    for dq in rdq_list:
+                        dq.clear()
+            continue
         y = obj.get("y")
         t = obj.get("t")
         if y is None or t is None:

@@ -332,6 +332,23 @@ class TorquePlotter:
         """
         self._replay_mode = bool(on)
 
+    def reset_buffer(self) -> None:
+        """Clear all deques in the subprocess.
+
+        On replay stop→start the replayer pushes t from 0 again, so subprocess
+        ``shared_t`` accumulates ``[old 0..T_old, new 0..T_new]``. ``set_data``
+        then receives a non-monotonic t and matplotlib draws a back-line from
+        the last to the first point, making one legend entry look like
+        multiple traces. Call this once on restart to prevent that.
+        """
+        if not self.is_running():
+            return
+        self._send({"cmd": "reset"})
+        # Reset Kit-side time/counter too so a stale value isn't used on
+        # re-entry into apply_step (sim mode).
+        self._sim_time = 0.0
+        self._step_count = 0
+
     def push_replay_frame(
         self,
         t: float,
