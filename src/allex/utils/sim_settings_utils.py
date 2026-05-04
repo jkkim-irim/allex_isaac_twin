@@ -204,6 +204,30 @@ def get_actuator_gravcomp_cfg() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Equality-joint armature floor (allex.armature)
+# ---------------------------------------------------------------------------
+
+def get_armature_overrides() -> dict[str, float]:
+    """Return allex.armature.armature_overrides section as {joint_short_name: floor}."""
+    arm = _load().get("allex", {}).get("armature", {}) or {}
+    overrides = arm.get("armature_overrides", {}) or {}
+    try:
+        return {str(k): float(v) for k, v in overrides.items()}
+    except Exception as exc:
+        print(f"[ALLEX][Cfg] invalid armature_overrides: {exc}")
+        return {}
+
+
+def get_default_armature() -> float:
+    """Return allex.armature.default_armature (default 0.01)."""
+    arm = _load().get("allex", {}).get("armature", {}) or {}
+    try:
+        return float(arm.get("default_armature", 0.01))
+    except Exception:
+        return 0.01
+
+
+# ---------------------------------------------------------------------------
 # USD /physicsScene applier
 # ---------------------------------------------------------------------------
 

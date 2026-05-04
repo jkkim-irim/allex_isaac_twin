@@ -296,6 +296,83 @@ def _apply_gravcomp(builder) -> None:
         print(f"[ALLEX][Gravcomp] apply_gravcomp_to_builder failed: {exc}")
 
 
+def _patch_equality_armature(builder, min_armature: Optional[float] = None) -> None:
+    """Equality 에 참여하는 joint 의 armature 를 floor 값까지 끌어올림.
+
+    Newton finalize 가 large dt 에서 발산하는 것을 막기 위한 조치. 실제 측정된
+    armature 값이 너무 작아 PD 제어 + equality 보정력이 결합될 때 explicit
+    integrator 가 unstable. waist 처럼 heavy-load joint 는 per-joint override
+    값으로 더 크게 boost.
+
+    physics_config.json::allex.armature 섹션:
+      - default_armature: equality 참여 joint 의 floor (기본 0.01)
+      - armature_overrides: per-joint floor 값 (이 값이 우선)
+
+    적용 정책: floor — 현재 armature 가 floor 보다 작을 때만 floor 로 교체.
+
+    builder.finalize() 내부 (즉, equality inject 직후, _orig_finalize 호출 직전)
+    에서 호출되어야 함.
+    """
+    joint_armature = getattr(builder, "joint_armature", None)
+    joint_qd_start = list(getattr(builder, "joint_qd_start", []) or [])
+    if joint_armature is None or not joint_qd_start:
+        return
+
+    try:
+        from ..utils import sim_settings_utils as _ps
+        overrides = _ps.get_armature_overrides()
+        default_floor = _ps.get_default_armature() if min_armature is None else float(min_armature)
+    except Exception as exc:
+        print(f"[ALLEX][Eq] armature config load failed: {exc}")
+        overrides = {}
+        default_floor = 0.01 if min_armature is None else float(min_armature)
+
+    # equality 에 참여하는 joint indices 수집 — Newton builder 는 parallel list
+    # 형태로 저장한다 (equality_constraint_joint1 / _joint2). _inject 가 이미
+    # add_equality_constraint_joint(joint1=f, joint2=m) 으로 채워둠.
+    eq_j1 = list(getattr(builder, "equality_constraint_joint1", []) or [])
+    eq_j2 = list(getattr(builder, "equality_constraint_joint2", []) or [])
+    eq_joint_indices: set[int] = set()
+    for ji in eq_j1 + eq_j2:
+        if isinstance(ji, int) and ji >= 0:
+            eq_joint_indices.add(ji)
+
+    if not eq_joint_indices:
+        return
+
+    joint_labels = list(getattr(builder, "joint_label", []) or [])
+    total_dof = int(getattr(builder, "joint_dof_count", 0) or 0)
+
+    changed = []
+    for ji in eq_joint_indices:
+        if ji >= len(joint_qd_start):
+            continue
+        qd_start = int(joint_qd_start[ji])
+        qd_end = int(joint_qd_start[ji + 1]) if ji + 1 < len(joint_qd_start) else total_dof
+        if qd_end <= qd_start:
+            continue
+
+        label = joint_labels[ji] if ji < len(joint_labels) else f"joint[{ji}]"
+        short = label.rsplit("/", 1)[-1] if isinstance(label, str) else f"joint[{ji}]"
+        floor = overrides[short] if short in overrides else default_floor
+
+        for k in range(qd_start, qd_end):
+            try:
+                cur = float(joint_armature[k])
+            except Exception:
+                continue
+            if cur < floor:
+                joint_armature[k] = floor
+                changed.append((short, cur, floor))
+
+    if changed:
+        sample = changed[:5]
+        print(
+            f"[ALLEX][Eq] armature floor applied to {len(changed)} dof(s); "
+            f"sample: {sample}"
+        )
+
+
 def _inject(builder) -> None:
     if not _equality_table:
         return
@@ -552,6 +629,10 @@ def install(joint_config_path: Path) -> None:
             _inject(self)
         except Exception as exc:
             print(f"[ALLEX] equality injection raised: {exc}")
+        try:
+            _patch_equality_armature(self)
+        except Exception as exc:
+            print(f"[ALLEX][Eq] armature patch failed: {exc}")
         try:
             _inject_friction(self)
         except Exception as exc:

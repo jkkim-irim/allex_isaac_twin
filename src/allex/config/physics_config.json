@@ -1,7 +1,7 @@
 {
     "world": {
-        "physics_dt": 0.001,
-        "rendering_dt": 0.01,
+        "physics_dt": 0.02,
+        "rendering_dt": 0.0125,
         "gravity": [0.0, 0.0, -9.81]
     },
     "usd": {
@@ -110,6 +110,14 @@
         "actuator_gravcomp": {
             "enabled": true,
             "joints": []
+        },
+        "armature": {
+            "default_armature": 0.00,
+            "armature_overrides": {
+                "Waist_Upper_Pitch_Joint": 2.0,
+                "Waist_Pitch_Dummy_Joint": 2.0,
+                "Waist_Lower_Pitch_Joint": 0.5
+            }
         }
     }
 }
