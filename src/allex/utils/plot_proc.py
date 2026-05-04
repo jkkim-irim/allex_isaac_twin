@@ -235,40 +235,51 @@ def main() -> int:
     if n_rows == 1:
         axes = [axes]
 
-    # Per-axis line objects. Legend entries are pickable — clicking one
-    # toggles the corresponding sim line's visibility (dimmed legend marker
-    # indicates hidden). The paired real line (dashed, same color) tracks
-    # the sim line's visibility 1:1. Double-click anywhere on an axes
-    # resets all lines (sim + real).
+    # Per-axis line objects. Visual convention:
+    #   - real channel: solid line, in the legend
+    #   - sim channel:  dashed, same color as its real twin, not in the legend
+    # When has_real=False there is only the sim channel, drawn solid + in
+    # legend (no partner line exists).
+    #
+    # Legend entries are pickable — clicking one toggles the labeled line's
+    # visibility (dimmed legend marker indicates hidden). The paired partner
+    # line (sim dashed, when has_real) tracks the labeled line's visibility
+    # 1:1. Double-click anywhere on an axes resets all lines.
     #
     # axis_specs entry: (ax, sim_lines, real_lines_or_None)
     # real_lines is None for the entire run when has_real=False.
     axis_specs: list[tuple[object, list, Optional[list]]] = []
-    # Map id(sim_line) -> real_line so toggle handler can sync. Empty when
-    # has_real is False.
-    sim_to_real: dict = {}
+    # Map id(labeled_line) -> partner_line so toggle handler can sync.
+    # When has_real, labeled = real, partner = sim. When not has_real, the
+    # dict is empty (sim is the sole line).
+    label_to_partner: dict = {}
     leg_to_orig: dict = {}
     for ax, grp in zip(axes, groups):
         sim_lines = []
         real_lines: Optional[list] = [] if has_real else None
         for jname in grp.get("joints", []):
-            (ln_sim,) = ax.plot([], [], label=str(jname), linewidth=1.0)
-            sim_lines.append(ln_sim)
-            if real_lines is not None:
-                # Same color as the sim line, dashed, slightly thinner. Not
-                # added to legend so the legend stays compact.
-                color = ln_sim.get_color()
-                (ln_real,) = ax.plot(
+            if has_real:
+                # real solid + legend label, sim dashed + same color, no label.
+                (ln_real,) = ax.plot([], [], label=str(jname), linewidth=1.0)
+                real_lines.append(ln_real)
+                color = ln_real.get_color()
+                (ln_sim,) = ax.plot(
                     [], [], color=color, linestyle="--", linewidth=0.9,
                     alpha=0.85,
                 )
-                real_lines.append(ln_real)
-                sim_to_real[id(ln_sim)] = ln_real
+                sim_lines.append(ln_sim)
+                label_to_partner[id(ln_real)] = ln_sim
+            else:
+                # No real channel — sim is the sole solid line with the label.
+                (ln_sim,) = ax.plot([], [], label=str(jname), linewidth=1.0)
+                sim_lines.append(ln_sim)
         ax.set_title(str(grp.get("name", "")))
         ax.set_ylabel(y_label)
         ax.grid(True, alpha=0.3)
         leg = ax.legend(loc="upper left", fontsize="x-small", ncol=2)
-        for leg_line, orig_line in zip(leg.get_lines(), sim_lines):
+        # Legend markers are zipped with whichever array carries the label.
+        labeled_lines = real_lines if has_real else sim_lines
+        for leg_line, orig_line in zip(leg.get_lines(), labeled_lines):
             leg_line.set_picker(True)
             leg_line.set_pickradius(5)
             leg_to_orig[id(leg_line)] = orig_line
@@ -286,9 +297,9 @@ def main() -> int:
                 orig = leg_to_orig.get(id(leg_line))
                 if orig is not None:
                     orig.set_visible(visible)
-                    real = sim_to_real.get(id(orig))
-                    if real is not None:
-                        real.set_visible(visible)
+                    partner = label_to_partner.get(id(orig))
+                    if partner is not None:
+                        partner.set_visible(visible)
                 leg_line.set_alpha(1.0 if visible else 0.25)
         fig.canvas.draw_idle()
 
@@ -377,10 +388,10 @@ def main() -> int:
             return
         visible = not orig.get_visible()
         orig.set_visible(visible)
-        # Sync the paired dashed real line (if any) with the sim line.
-        real = sim_to_real.get(id(orig))
-        if real is not None:
-            real.set_visible(visible)
+        # Sync the paired dashed sim line (if any) with the labeled real line.
+        partner = label_to_partner.get(id(orig))
+        if partner is not None:
+            partner.set_visible(visible)
         leg_line.set_alpha(1.0 if visible else 0.25)
         fig.canvas.draw_idle()
 
@@ -388,9 +399,9 @@ def main() -> int:
         if event.dblclick:
             for _leg_id, orig in leg_to_orig.items():
                 orig.set_visible(True)
-                real = sim_to_real.get(id(orig))
-                if real is not None:
-                    real.set_visible(True)
+                partner = label_to_partner.get(id(orig))
+                if partner is not None:
+                    partner.set_visible(True)
             for ax in axes:
                 leg = ax.get_legend()
                 if leg is not None:
