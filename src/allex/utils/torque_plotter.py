@@ -39,7 +39,6 @@ logger = logging.getLogger("allex.torque_plotter")
 # Tunables
 # ---------------------------------------------------------------------------
 _DEFAULT_WINDOW_SECONDS = 5.0
-_DEFAULT_PHYSICS_HZ = 200.0
 
 # Regex patterns selecting the "body" joint set (arm L/R + waist + neck).
 _BODY_RE = re.compile(r"Shoulder|Elbow|Wrist|Waist|Neck", re.IGNORECASE)
@@ -184,8 +183,10 @@ class TorquePlotter:
         ``FeedforwardTorqueManager.get_last``.
     subset : "body" | "hand"
     physics_hz : float
-        Passed to the subprocess as the assumed sample rate when sizing
-        the rolling buffer.
+        Physics step rate. Required — caller must pass the actual rate
+        derived from ``physics_config.json::world.physics_dt`` (e.g.
+        ``1.0 / get_world_settings()["physics_dt"]``). Used to compute the
+        ``apply_step`` decim ratio (physics_hz / plot_hz). Must be > 0.
     window_s : float
         Visible time window (seconds).
     """
@@ -193,9 +194,9 @@ class TorquePlotter:
     def __init__(
         self,
         articulation,
+        physics_hz: float,
         ff_provider: Optional[Callable[[], np.ndarray]] = None,
         subset: str = "body",
-        physics_hz: float = _DEFAULT_PHYSICS_HZ,
         window_s: float = _DEFAULT_WINDOW_SECONDS,
         plot_hz: float = 50.0,
         ff_manager=None,
@@ -203,6 +204,11 @@ class TorquePlotter:
         save_on_exit: bool = False,
         real_provider: Optional[Callable[[], dict]] = None,
     ):
+        if physics_hz is None or float(physics_hz) <= 0.0:
+            raise ValueError(
+                "TorquePlotter: physics_hz must be > 0; pass "
+                "1.0 / get_world_settings()['physics_dt']"
+            )
         self._articulation = articulation
         self._ff_provider = ff_provider
         # FeedforwardTorqueManager — ``apply_step`` 에서 ``read_current()`` 로

@@ -236,26 +236,25 @@ class ALLEXDigitalTwin:
         def _traj_active():
             return self._trajectory_player is not None and self._trajectory_player.is_active()
 
+        # physics_config.json::world.physics_dt 을 single source of truth 로
+        # 사용. plotter 의 decim ratio (physics_hz / plot_hz) 와 apply_step 의
+        # 시간축 dt 둘 다에 같은 값 derive.
+        from .utils.sim_settings_utils import get_world_settings
+        physics_dt = float(get_world_settings().get("physics_dt", 1.0 / 200.0))
+        physics_hz = 1.0 / physics_dt
+
         # Build / rebuild torque plotters against the current articulation
         # so they pick up the fresh dof_names list. Plotters stay dormant
         # until start() is called (UI button or python console).
-        self._setup_torque_plotters()
-
-        # Per-step dt for plotter time axis — falls back to physics_config.json's
-        # world.physics_dt.
-        try:
-            from .utils.sim_settings_utils import get_world_settings
-            _plot_dt = float(get_world_settings().get("physics_dt", 1.0 / 200.0))
-        except Exception:
-            _plot_dt = 1.0 / 200.0
+        self._setup_torque_plotters(physics_hz)
 
         def _push_torque_sample():
             body = self._torque_plotter_body
             hand = self._torque_plotter_hand
             if body is not None and body.is_running():
-                body.apply_step(_plot_dt)
+                body.apply_step(physics_dt)
             if hand is not None and hand.is_running():
-                hand.apply_step(_plot_dt)
+                hand.apply_step(physics_dt)
 
         generator = self._joint_controller.create_joint_control_generator(
             articulation=self._articulation,
@@ -282,12 +281,15 @@ class ALLEXDigitalTwin:
                 logger.debug(f"torque plotter stop warn: {exc}")
             setattr(self, attr, None)
 
-    def _setup_torque_plotters(self):
+    def _setup_torque_plotters(self, physics_hz: float):
         """(Re)create TorquePlotter instances for body + hand subsets.
 
         If plotters were already running when articulation is reinitialized
         (e.g. after Stop/Play), we tear them down first so the new instance
         binds to the fresh articulation view.
+
+        physics_hz: derived from physics_config.json::world.physics_dt by the
+        caller. Required by TorquePlotter to compute its decim ratio.
         """
         if self._articulation is None:
             return
@@ -307,6 +309,7 @@ class ALLEXDigitalTwin:
         try:
             self._torque_plotter_body = TorquePlotter(
                 articulation=self._articulation,
+                physics_hz=physics_hz,
                 ff_provider=ff_provider,
                 subset="body",
                 ff_manager=self._ff_manager,
@@ -320,6 +323,7 @@ class ALLEXDigitalTwin:
         try:
             self._torque_plotter_hand = TorquePlotter(
                 articulation=self._articulation,
+                physics_hz=physics_hz,
                 ff_provider=ff_provider,
                 subset="hand",
                 ff_manager=self._ff_manager,
