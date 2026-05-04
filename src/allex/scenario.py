@@ -100,6 +100,27 @@ class ALLEXDigitalTwin:
         # 기존 plotter subprocess 는 articulation 재바인딩 전에 반드시 정리.
         self._stop_torque_plotters()
 
+        # CSV replayer / trajectory player / FF manager 도 articulation 재바인딩 전에
+        # 정리해야 stale subscription, external_torque_sources lock, 잔존 FF 토크가
+        # 다음 articulation 인스턴스로 새지 않음.
+        if self._csv_replayer is not None:
+            try:
+                self._csv_replayer.stop()
+            except Exception as exc:
+                logger.debug(f"reset csv_replayer stop warn: {exc}")
+            self._csv_replayer = None
+        if self._trajectory_player is not None:
+            try:
+                self._trajectory_player.stop()
+            except Exception as exc:
+                logger.debug(f"reset trajectory_player stop warn: {exc}")
+            self._trajectory_player = None
+        try:
+            if self._ff_manager is not None:
+                self._ff_manager.clear()
+        except Exception as exc:
+            logger.debug(f"reset ff_manager clear warn: {exc}")
+
         self._initializer.reset(self._articulation)
         self._simulation_loop.reset()
 
@@ -384,3 +405,24 @@ class ALLEXDigitalTwin:
         orphan Tk windows around after the Kit extension is unloaded.
         """
         self._stop_torque_plotters()
+
+        # Replayer / player 도 stop — extension reload 시 subscription 누수 방지.
+        if self._csv_replayer is not None:
+            try:
+                self._csv_replayer.stop()
+            except Exception as exc:
+                logger.debug(f"shutdown csv_replayer stop warn: {exc}")
+            self._csv_replayer = None
+        if self._trajectory_player is not None:
+            try:
+                self._trajectory_player.stop()
+            except Exception as exc:
+                logger.debug(f"shutdown trajectory_player stop warn: {exc}")
+            self._trajectory_player = None
+
+        # 모듈 레벨 singleton 등록부도 비워서 reload 후 stale plotter 참조 제거.
+        try:
+            from .utils.torque_plotter import clear_singletons
+            clear_singletons()
+        except Exception:
+            pass

@@ -267,6 +267,10 @@ class TorquePlotter:
         self._external_sim_tau: Optional[np.ndarray] = None
         self._external_real_by_abbr: Optional[dict] = None
 
+        # CSV replay 모드 — set_replay_mode(True) 면 apply_step 의 자동 push 끄고
+        # push_replay_frame 으로 모든 CSV 샘플을 직접 받음.
+        self._replay_mode: bool = False
+
         # Decimate physics step → plotter sampling. FuncAnimation renders at
         # 20 Hz so much higher than ~50 Hz is wasted GPU→CPU sync.
         self._decim = self._compute_decim(self._plot_hz)
@@ -315,6 +319,64 @@ class TorquePlotter:
         clears the override.
         """
         self._external_real_by_abbr = None if d is None else d
+
+    # ------------------------------------------------------------------
+    # Replay mode (called by CsvReplayer) — bypass apply_step's auto push,
+    # accept direct frame pushes at native CSV sample rate.
+    # ------------------------------------------------------------------
+    def set_replay_mode(self, on: bool) -> None:
+        """Replay 모드: ``apply_step`` 의 physics-tick 자동 push 비활성.
+
+        On=True 인 동안 plotter 는 ``push_replay_frame`` 만 받아서 그린다.
+        replayer 가 모든 CSV 샘플을 자기 t 로 직접 push 하므로 decim/throttle 무관.
+        """
+        self._replay_mode = bool(on)
+
+    def push_replay_frame(
+        self,
+        t: float,
+        sim_tau_full: Optional[np.ndarray],
+        real_by_abbr: Optional[dict],
+        dof_name_to_idx: dict,
+    ) -> None:
+        """Replay 전용 직접 push — decim/step counter 무시.
+
+        Parameters
+        ----------
+        t
+            CSV 샘플의 절대 시간 (초). plot X 축에 그대로 사용.
+        sim_tau_full
+            (num_dof,) numpy 배열. None 이면 sim 채널은 0.
+        real_by_abbr
+            ``dict[abbr -> tau]``. None 이면 real 채널 omit (`y_real` 미전송).
+        dof_name_to_idx
+            sim_tau_full 의 dof_name → idx 매핑. plotter 의 `_joint_order` 정렬용.
+        """
+        if not self.is_running():
+            return
+        # Build sim list (joint_order 정렬).
+        sim_list: list[float] = []
+        if sim_tau_full is not None and sim_tau_full.size > 0:
+            for name in self._joint_order:
+                idx = dof_name_to_idx.get(name)
+                if idx is None or idx >= sim_tau_full.size:
+                    return
+                sim_list.append(float(sim_tau_full[idx]))
+        else:
+            sim_list = [0.0] * len(self._joint_order)
+
+        # Build real list (joint_order_abbrs 정렬). 누락 abbr 는 0.
+        real_list: Optional[list] = None
+        if real_by_abbr is not None:
+            real_list = [
+                float(real_by_abbr.get(abbr, 0.0)) if abbr is not None else 0.0
+                for abbr in self._joint_order_abbrs
+            ]
+
+        frame: dict = {"t": float(t), "y": sim_list}
+        if real_list is not None:
+            frame["y_real"] = real_list
+        self._send(frame)
 
     @property
     def plot_hz(self) -> float:
@@ -465,6 +527,13 @@ class TorquePlotter:
                 except Exception:
                     pass
         self._proc = None
+        # 인스턴스 재사용 시 stale state 방지 — counter / 시간축 / replay flag /
+        # 외부 override 버퍼 모두 리셋. 다음 start() 가 깨끗한 state 로 시작.
+        self._step_count = 0
+        self._sim_time = 0.0
+        self._replay_mode = False
+        self._external_sim_tau = None
+        self._external_real_by_abbr = None
         logger.info("TorquePlotter stopped")
 
     # ------------------------------------------------------------------
@@ -491,6 +560,9 @@ class TorquePlotter:
         if not self.is_running():
             return
         if not self._plot_indices:
+            return
+        # Replay 모드면 push_replay_frame 으로만 받음 — physics tick 자동 push 차단.
+        if getattr(self, "_replay_mode", False):
             return
         # Throttle GPU→CPU reads to the plotter's render rate.
         if self._step_count % self._decim != 0:
@@ -665,8 +737,29 @@ _SINGLETONS: dict[str, TorquePlotter] = {}
 
 
 def register_singleton(key: str, plotter: TorquePlotter) -> None:
+    """동일 key 에 이미 다른 plotter 가 등록돼 있으면 먼저 stop 시킨 뒤 교체.
+
+    Reset / articulation 재바인딩 시 이전 인스턴스의 subprocess 가 누수돼 Tk
+    창이 남는 걸 방지.
+    """
+    prev = _SINGLETONS.get(key)
+    if prev is not None and prev is not plotter:
+        try:
+            prev.stop()
+        except Exception:
+            pass
     _SINGLETONS[key] = plotter
 
 
 def get_singleton(key: str = "body") -> Optional[TorquePlotter]:
     return _SINGLETONS.get(key)
+
+
+def clear_singletons() -> None:
+    """Extension shutdown 시 호출 — 모든 등록된 plotter stop + dict clear."""
+    for _name, plotter in list(_SINGLETONS.items()):
+        try:
+            plotter.stop()
+        except Exception:
+            pass
+    _SINGLETONS.clear()

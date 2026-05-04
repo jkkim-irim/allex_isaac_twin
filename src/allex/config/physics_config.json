@@ -1,7 +1,7 @@
 {
     "world": {
-        "physics_dt": 0.005,
-        "rendering_dt": 0.01667,
+        "physics_dt": 0.001,
+        "rendering_dt": 0.01,
         "gravity": [0.0, 0.0, -9.81]
     },
     "usd": {
@@ -11,7 +11,7 @@
     },
     "newton": {
         "pd_scale": 0.017453292519943295,
-        "use_cuda_graph": false,
+        "use_cuda_graph": true,
         "contact_mu": 0.5,
         "gravcomp": {
             "scale": 1.0,
@@ -108,7 +108,7 @@
     },
     "allex": {
         "actuator_gravcomp": {
-            "enabled": false,
+            "enabled": true,
             "joints": []
         }
     }

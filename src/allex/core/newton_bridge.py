@@ -16,8 +16,15 @@ from typing import Optional
 import carb
 
 _orig_finalize = None
-_patched = False
 _equality_table: list[tuple[str, str, list[float], str]] = []
+
+# Sentinel attribute 이름 — 패치된 함수 자체에 박아 두고 재패치 가드로 사용.
+# Module-level `_patched` flag 는 extension reload 시 module 새로 로드되어 False 로
+# 리셋되지만 newton.ModelBuilder.finalize 는 이미 patched 상태라 두 번째 install 이
+# patched-of-patched chain 을 만들 수 있다. 함수 객체에 직접 attribute 부착하면
+# reload 와 무관하게 정확히 검출.
+_FINALIZE_SENTINEL = "_allex_finalize_patched"
+_ARTICULATION_RESET_SENTINEL = "_allex_on_post_reset_patched"
 
 # Top-level MJCF softness from the active joint_config.json. Forwarded to
 # Newton/MuJoCo as `custom_attributes={"mujoco:eq_solref", "mujoco:eq_solimp"}`
@@ -38,7 +45,6 @@ _friction_table: dict[str, float] = {}
 _gravcomp_cfg: dict = {"enabled": False, "joints": []}
 
 _orig_on_post_reset = None
-_articulation_patched = False
 
 
 def set_equality_config(path: Path | None) -> None:
@@ -375,10 +381,12 @@ def _install_articulation_reset_patch() -> None:
     returns CUDA tensors under Newton — causing a device-mismatch RuntimeError
     during world.reset_async(). Passing kps=None, kds=None takes the safe branch
     that reads stiffnesses from the physics view on the matching device.
+
+    Re-install 가드는 함수 객체 자체에 sentinel attribute 부착으로 처리 — extension
+    reload 로 module 이 새로 로드돼도 이미 패치된 상태를 정확히 감지해 patched-of-
+    patched chain 을 막는다.
     """
-    global _orig_on_post_reset, _articulation_patched
-    if _articulation_patched:
-        return
+    global _orig_on_post_reset
     try:
         from isaacsim.core.prims.impl.articulation import Articulation
         from isaacsim.core.prims.impl.xform_prim import XFormPrim
@@ -386,7 +394,14 @@ def _install_articulation_reset_patch() -> None:
         print(f"[ALLEX] cannot import Articulation for reset patch: {exc}")
         return
 
-    _orig_on_post_reset = Articulation._on_post_reset
+    cur = Articulation._on_post_reset
+    if getattr(cur, _ARTICULATION_RESET_SENTINEL, False):
+        # 이미 patched 인 함수 — uninstall/restore 를 위한 _orig 만 채워두고 종료.
+        if _orig_on_post_reset is None:
+            _orig_on_post_reset = getattr(cur, "_allex_orig", None)
+        return
+
+    _orig_on_post_reset = cur
 
     def _patched_on_post_reset(self, event):
         XFormPrim._on_post_reset(self, event)
@@ -395,24 +410,28 @@ def _install_articulation_reset_patch() -> None:
         Articulation.set_joint_efforts(self, self._default_joints_state.efforts)
         Articulation.set_gains(self, kps=None, kds=None)
 
+    setattr(_patched_on_post_reset, _ARTICULATION_RESET_SENTINEL, True)
+    setattr(_patched_on_post_reset, "_allex_orig", _orig_on_post_reset)
     Articulation._on_post_reset = _patched_on_post_reset
-    _articulation_patched = True
     print("[ALLEX] patched Articulation._on_post_reset for Newton device consistency")
 
 
 def _uninstall_articulation_reset_patch() -> None:
-    global _orig_on_post_reset, _articulation_patched
-    if not _articulation_patched:
-        return
+    global _orig_on_post_reset
     try:
         from isaacsim.core.prims.impl.articulation import Articulation
     except ImportError:
-        _articulation_patched = False
+        _orig_on_post_reset = None
         return
-    if _orig_on_post_reset is not None:
-        Articulation._on_post_reset = _orig_on_post_reset
+    cur = Articulation._on_post_reset
+    if not getattr(cur, _ARTICULATION_RESET_SENTINEL, False):
+        # 패치되지 않은 상태 — 할 일 없음.
+        _orig_on_post_reset = None
+        return
+    orig = getattr(cur, "_allex_orig", None) or _orig_on_post_reset
+    if orig is not None:
+        Articulation._on_post_reset = orig
     _orig_on_post_reset = None
-    _articulation_patched = False
 
 
 def configure_newton_from_toml() -> bool:
@@ -468,19 +487,23 @@ def _configure_newton_from_toml() -> None:
 
 
 def install(joint_config_path: Path) -> None:
-    global _orig_finalize, _patched, _equality_table
+    global _orig_finalize, _equality_table
     global _config_solref, _config_solimp, _master_joint_config_path
     global _friction_table, _gravcomp_cfg
     _install_articulation_reset_patch()
     _configure_newton_from_toml()
     _master_joint_config_path = Path(joint_config_path)
-    if _patched:
-        return
+
     try:
         import newton
     except ImportError:
         print("[ALLEX] newton not importable; skipping equality constraint hook")
         return
+
+    # Re-install 가드는 함수 자체에 박힌 sentinel 로 검사 (module reload 후에도 정확).
+    cur_finalize = newton.ModelBuilder.finalize
+    already_patched = getattr(cur_finalize, _FINALIZE_SENTINEL, False)
+
     try:
         _equality_table, _config_solref, _config_solimp = _load_equality(joint_config_path)
     except Exception as exc:
@@ -510,7 +533,15 @@ def install(joint_config_path: Path) -> None:
         f"joints={len(_gravcomp_cfg.get('joints', []))} target(s)"
     )
 
-    _orig_finalize = newton.ModelBuilder.finalize
+    if already_patched:
+        # 이미 patched 인 finalize — 같은 sentinel 발견 시 _orig_finalize 만 복원해서
+        # uninstall 이 정상 동작하게 두고 재설치는 skip. equality table 등은 위에서
+        # reload 됐으므로 다음 finalize 호출이 새 값을 쓴다.
+        if _orig_finalize is None:
+            _orig_finalize = getattr(cur_finalize, "_allex_orig", None)
+        return
+
+    _orig_finalize = cur_finalize
 
     def _patched_finalize(self, *args, **kwargs):
         try:
@@ -536,21 +567,24 @@ def install(joint_config_path: Path) -> None:
             print(f"[ALLEX][Eq] post-finalize dump failed: {exc}")
         return model
 
+    setattr(_patched_finalize, _FINALIZE_SENTINEL, True)
+    setattr(_patched_finalize, "_allex_orig", _orig_finalize)
     newton.ModelBuilder.finalize = _patched_finalize
-    _patched = True
 
 
 def uninstall() -> None:
-    global _patched, _orig_finalize
+    global _orig_finalize
     _uninstall_articulation_reset_patch()
-    if not _patched:
-        return
     try:
         import newton
     except ImportError:
-        _patched = False
+        _orig_finalize = None
         return
-    if _orig_finalize is not None:
-        newton.ModelBuilder.finalize = _orig_finalize
+    cur = newton.ModelBuilder.finalize
+    if not getattr(cur, _FINALIZE_SENTINEL, False):
+        _orig_finalize = None
+        return
+    orig = getattr(cur, "_allex_orig", None) or _orig_finalize
+    if orig is not None:
+        newton.ModelBuilder.finalize = orig
     _orig_finalize = None
-    _patched = False

@@ -192,6 +192,9 @@ class ForceTorqueVisualizer:
         self._articulation = None
         self._joint_controller = None
         self._abbr_to_dof_idx.clear()
+        # Replay 가 켜둔 lock/flag 가 살아있으면 다음 일반 sim 의 ring 갱신을 막는다.
+        self._external_torque_sources = set()
+        self._replay_force_visible = False
 
 
     # ========================================
@@ -732,6 +735,14 @@ class ForceTorqueVisualizer:
         self._last_scale_cache.clear()
         self._force_length_cache.clear()
         self._prims_initialized = False
+
+        # 같은 인스턴스 재사용 안전화 — replay 잔존 lock / threshold 캐시 / lazy LUT 도
+        # 모두 초기 상태로 되돌린다. _joint_to_abbr_cache 는 lazy 생성 (`is None` 체크)
+        # 이라 None 으로 둬야 다음 _joint_name_to_abbr 호출이 다시 rebuild.
+        self._external_torque_sources = set()
+        self._replay_force_visible = False
+        self._threshold_hide_state = {}
+        self._joint_to_abbr_cache = None
 
     # ========================================
     # Internal — prim 생성

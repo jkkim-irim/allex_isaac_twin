@@ -239,6 +239,16 @@ class CsvReplayer:
             float(self._sec.t[0]) if (self._sec is not None and self._sec.num_samples) else 0.0
         )
 
+        # Plot push range tracking — 매 _apply_at 에서 prev_idx_main+1 ~ idx_main 사이의
+        # 모든 CSV 샘플을 plotter 로 push 한다. -1 sentinel = 첫 호출에서 0 부터 시작.
+        self._prev_idx_main_for_plot: int = -1
+        self._dof_name_to_idx: dict = {n: i for i, n in enumerate(self._dof_names)}
+        # 매 sample 마다 np.zeros 재할당 피하기 — 같은 buffer 재사용.
+        self._replay_sim_tau_buf: Optional[np.ndarray] = (
+            np.zeros(self._num_dof, dtype=np.float32) if self._num_dof else None
+        )
+        self._replay_real_dict_buf: dict = {}
+
         # rendering tick subscription — kinematic replay 는 physics 와 무관하게
         # 매 rendering frame 마다 진행해야 함 (timeline pause / physics rate 변경에 영향 X).
         self._update_sub = None
@@ -275,6 +285,13 @@ class CsvReplayer:
         return self._main.duration_s
 
     def start(self) -> None:
+        # 이미 ongoing 이면 깔끔히 stop 후 진행 — start 두 번 누름/exception 후 재시도 안전.
+        if self._update_sub is not None or self._t0 is not None:
+            try:
+                self.stop()
+            except Exception as exc:
+                logger.debug(f"[replay] start() reset-stop warn: {exc}")
+
         self._t0 = time.monotonic()
         self._finished = False
         self._step_count = 0
@@ -287,6 +304,28 @@ class CsvReplayer:
             f"secondary={sec_tag}"
         )
 
+        # 재시작 안전화: 이전 run 이 남긴 stale state 명시 reset.
+        self._registered_force_keys.clear()
+        self._paused = False
+        self._pause_t = None
+        self._prev_idx_main_for_plot = -1
+        # contact-local export 캐시 — flag on 일 때만 records 재생성.
+        if EXPORT_CONTACT_LOCAL_CSV:
+            self._export_records = []
+        # 1회성 warning/dump flag 와 USDRT stage 캐시도 clear.
+        for _attr in (
+            "_export_rt_warned",
+            "_export_link_warned",
+            "_export_no_world_warned",
+            "_export_dump_done",
+            "_export_xform_warned",
+        ):
+            if hasattr(self, _attr):
+                try:
+                    delattr(self, _attr)
+                except Exception:
+                    setattr(self, _attr, False)
+        self._rt_stage = None
 
         # rendering tick (= 매 frame) subscription. 성공하면 scenario.update() 의
         # physics-step driven advance 호출은 skip 됨 (is_self_ticking() 이 True).
@@ -328,21 +367,23 @@ class CsvReplayer:
             except Exception as exc:
                 logger.debug(f"[replay] set_replay_force_visible warn: {exc}")
 
-        # TorquePlotter override — plot 도 articulation qfrc 대신 CSV 값을 그리게.
-        # 첫 frame 으로 1회 채워두고 reference 등록 (이후 advance 에서 매 step 갱신).
-        self._refresh_plot_buffers(idx_main=0, idx_sec=0 if self._sec is not None else None)
+        # TorquePlotter replay 모드 — apply_step (physics tick) 의 자동 push 차단,
+        # _apply_at 매 호출 시 prev_idx_main+1 ~ idx_main 사이의 모든 CSV 샘플을
+        # push_replay_frame 으로 직접 push. CSV 의 native 시간축 (1 kHz 등) 을 그대로
+        # plot. real CSV rate 가 다르더라도 매 main sample 의 t 에 맞춰 nearest sec
+        # sample 로 paired frame 생성.
+        self._prev_idx_main_for_plot = -1   # 첫 _apply_at 에서 0 부터 시작
         for plotter in self._plotters:
             try:
+                # 기존 external override 는 비우고 (push_replay_frame 으로 직접 push).
                 if hasattr(plotter, "set_external_sim_tau"):
-                    if self._main_src == "sim":
-                        plotter.set_external_sim_tau(self._plot_sim_tau)
-                    elif self._sec is not None and self._sec_src == "sim":
-                        plotter.set_external_sim_tau(self._plot_sim_tau)
+                    plotter.set_external_sim_tau(None)
                 if hasattr(plotter, "set_external_real_by_abbr"):
-                    if self._main_src == "real" or (self._sec is not None and self._sec_src == "real"):
-                        plotter.set_external_real_by_abbr(self._plot_real_by_abbr)
+                    plotter.set_external_real_by_abbr(None)
+                if hasattr(plotter, "set_replay_mode"):
+                    plotter.set_replay_mode(True)
             except Exception as exc:
-                logger.debug(f"[replay] plotter override register warn: {exc}")
+                logger.debug(f"[replay] plotter replay mode set warn: {exc}")
 
     def stop(self) -> None:
         # rendering tick subscription 먼저 해제 — 더 이상 advance 안 불리도록.
@@ -358,8 +399,9 @@ class CsvReplayer:
             self._update_sub = None
         self._self_ticking = False
 
-        if self._t0 is None and not self._registered_force_keys:
-            return
+        # NOTE: early-return guard removed — plotter cleanup, replay-force visibility
+        # 해제, external_torque_sources 해제는 t0/registered keys 와 무관하게
+        # 항상 실행되어야 (이전 run 이 어떤 단계에서 중단됐든) stale state 남지 않음.
         self._t0 = None
         self._finished = True
 
@@ -383,15 +425,17 @@ class CsvReplayer:
                     viz.set_replay_force_visible(False)
                 except Exception as exc:
                     logger.debug(f"[replay] clear_replay_force_visible warn: {exc}")
-        # plotter override 해제 — articulation 폴링 경로 복귀.
+        # plotter replay 모드 해제 — articulation 폴링 경로 복귀.
         for plotter in self._plotters:
             try:
+                if hasattr(plotter, "set_replay_mode"):
+                    plotter.set_replay_mode(False)
                 if hasattr(plotter, "set_external_sim_tau"):
                     plotter.set_external_sim_tau(None)
                 if hasattr(plotter, "set_external_real_by_abbr"):
                     plotter.set_external_real_by_abbr(None)
             except Exception as exc:
-                logger.debug(f"[replay] plotter override clear warn: {exc}")
+                logger.debug(f"[replay] plotter mode clear warn: {exc}")
         self._registered_force_keys.clear()
         # contact-local CSV flush (flag on 일 때만).
         if self._export_records is not None:
@@ -399,6 +443,8 @@ class CsvReplayer:
                 self._write_export_csv()
             except Exception as exc:
                 logger.warning(f"[replay] export CSV flush warn: {exc}")
+        # USDRT stage 캐시 해제 — 다음 start() 가 새 stage 로 attach 하도록.
+        self._rt_stage = None
         logger.info("[replay] stopped")
 
     def is_self_ticking(self) -> bool:
@@ -476,8 +522,10 @@ class CsvReplayer:
         # 1) Kinematic position write.
         self._kinematic_write(idx_main)
 
-        # 1.5) plot 버퍼 매 step 갱신 (plotter 가 reference 로 read).
-        self._refresh_plot_buffers(idx_main, sec_idx)
+        # 1.5) Plot push — prev_idx_main+1 ~ idx_main 의 모든 CSV 샘플을 plotter 로
+        # 직접 push. CSV native rate (1 kHz) 그대로 plot 됨. real CSV 가 있으면
+        # 매 main sample 의 t 에 맞춰 nearest real sample 페어링.
+        self._push_replay_plot_range(idx_main)
 
         viz = self._viz
         if viz is None:
@@ -529,6 +577,21 @@ class CsvReplayer:
         if articulation is None:
             return
 
+        # Physics sim view 가 만들어진 뒤에만 set_* 호출. timeline 이 stop 이거나
+        # 첫 physics step 이전에 render-tick 이 fire 되면 view 의 wrapper 가
+        # carb.log_warn("Physics Simulation View is not created yet ...") 를
+        # 찍는다. 같은 가드를 미리 점검해서 wasted CPU + 노이즈 방지.
+        view = getattr(articulation, "_articulation_view", None)
+        if view is None:
+            if self._step_count == 0:
+                logger.warning("[replay] articulation has no _articulation_view — skip kinematic write")
+            return
+        try:
+            if not view.is_physics_handle_valid():
+                return
+        except Exception:
+            pass
+
         # 1) 현재 articulation 상태로 init — 매핑 안 된 joint 는 그대로 유지.
         cur_t = None
         try:
@@ -574,11 +637,6 @@ class CsvReplayer:
         # expand_dims 단계에서 torch→numpy 로 변환 후 inner move_data(.to()) 가
         # numpy 에서 fail 함. → inner view 를 직접 호출하면서 (1, K) shape +
         # inner 의 device 에 맞춘 torch tensor 를 넘긴다.
-        view = getattr(articulation, "_articulation_view", None)
-        if view is None:
-            if self._step_count == 0:
-                logger.warning("[replay] articulation has no _articulation_view — skip kinematic write")
-            return
         view_device = getattr(view, "_device", None) or "cpu"
 
         # (1, num_dof) shape, inner view 의 device 로 lazy alloc.
@@ -763,6 +821,91 @@ class CsvReplayer:
             )
         except Exception as exc:
             logger.warning(f"[replay] export CSV write failed: {exc}")
+
+    def _push_replay_plot_range(self, idx_main: int) -> None:
+        """``self._prev_idx_main_for_plot+1 ~ idx_main`` 사이의 모든 main CSV 샘플을
+        plotter 로 직접 push.
+
+        sim/real 두 CSV 의 sampling rate 가 달라도 무관 — 매 main sample 의 t 로
+        nearest secondary sample 을 찾아 paired frame 으로 push. plot 의 X 축은
+        ``frame['t']`` (sample 의 절대 시간) 이라 두 stream 이 같은 시간축에 정렬됨.
+
+        한 번의 호출에서 push 되는 frame 수 = idx_main - prev + 1 (보통 16~17 개,
+        rendering tick 사이의 1 kHz CSV 샘플들).
+        """
+        if not self._plotters:
+            self._prev_idx_main_for_plot = idx_main
+            return
+        start = self._prev_idx_main_for_plot + 1
+        if start > idx_main:
+            return
+
+        main = self._main
+        sec = self._sec
+        main_src = self._main_src
+        sim_buf = self._replay_sim_tau_buf
+        real_buf = self._replay_real_dict_buf
+
+        # main_src 에 따라 sim/real 채널을 어디서 읽을지 한 번만 결정.
+        # main_src=="sim": main reader → sim, sec reader → real (있을 때).
+        # main_src=="real": main reader → real, sec reader → sim (있을 때).
+        sim_plan_main = self._main_torque_dof_plan if main_src == "sim" else None
+        real_reader_main = main if main_src == "real" else None
+        sim_plan_sec = self._sec_torque_dof_plan if (sec is not None and self._sec_src == "sim") else None
+        real_reader_sec = sec if (sec is not None and self._sec_src == "real") else None
+
+        # main CSV 의 모든 새 sample 마다 push.
+        for i in range(start, idx_main + 1):
+            t = float(main.t[i])
+
+            # sim 채널 채우기.
+            sim_tau: Optional[np.ndarray] = None
+            if sim_plan_main is not None and sim_buf is not None:
+                sim_buf.fill(0.0)
+                for dof_idx, arr in sim_plan_main:
+                    sim_buf[dof_idx] = float(arr[i])
+                sim_tau = sim_buf
+            elif sim_plan_sec is not None and sim_buf is not None:
+                # main 이 real 인 경우 sec 에서 sim. 시간 매칭.
+                s_idx = sec.index_at(t)
+                sim_buf.fill(0.0)
+                for dof_idx, arr in sim_plan_sec:
+                    sim_buf[dof_idx] = float(arr[s_idx])
+                sim_tau = sim_buf
+
+            # real 채널 채우기.
+            real_dict: Optional[dict] = None
+            if real_reader_main is not None:
+                real_buf.clear()
+                for csv_joint, arr in real_reader_main.torque.items():
+                    abbr = self._joint_to_abbr.get(csv_joint)
+                    if abbr is None:
+                        continue
+                    real_buf[abbr] = float(arr[i])
+                real_dict = real_buf
+            elif real_reader_sec is not None:
+                # main 이 sim 인 경우 sec 에서 real. 시간 매칭.
+                r_idx = sec.index_at(t)
+                real_buf.clear()
+                for csv_joint, arr in real_reader_sec.torque.items():
+                    abbr = self._joint_to_abbr.get(csv_joint)
+                    if abbr is None:
+                        continue
+                    real_buf[abbr] = float(arr[r_idx])
+                real_dict = real_buf
+
+            for plotter in self._plotters:
+                try:
+                    if hasattr(plotter, "push_replay_frame"):
+                        plotter.push_replay_frame(
+                            t, sim_tau, real_dict, self._dof_name_to_idx,
+                        )
+                except Exception as exc:
+                    if self._step_count % 200 == 0:
+                        logger.debug(f"[replay] push_replay_frame warn: {exc}")
+                    break
+
+        self._prev_idx_main_for_plot = idx_main
 
     def _refresh_plot_buffers(self, idx_main: int, idx_sec: Optional[int]) -> None:
         """plotter override 버퍼를 현재 frame 기준으로 다시 채운다.
