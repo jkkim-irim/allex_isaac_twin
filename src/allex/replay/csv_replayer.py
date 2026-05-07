@@ -31,6 +31,25 @@ logger = logging.getLogger("allex.replay.csv")
 
 _ZERO_VEC_EPS = 1e-6
 
+# Sim active channel → real ext_force topic_id routing.
+# motion 별 demo 시나리오 매핑 (요구 사항 기반):
+#   Motion 1: 왼팔↔오른손등 (sim pair `L_Elbow__R_Palm_Back`) → real `arm_r`
+#   Motion 2: 오른팔↔왼손등 (sim pair `L_Palm_Back__R_Elbow`) → real `arm_l`
+#   Motion 3: 양손 clasp     (sim aggregate `R_Palm_Net_Force`)  → real `arm_r`
+# value = (force_topic_id, contact_pos_topic_id) — 둘 다 real CSV 의 ext_force /
+# contact_pos topic_id (ShowcaseReader.topic_force_vec / topic_contact_pos 키).
+SIM_TO_REAL_FORCE_ROUTE: dict = {
+    "L_Elbow__R_Palm_Back": ("arm_r", "arm_r"),
+    "L_Palm_Back__R_Elbow": ("arm_l", "arm_l"),
+    "R_Palm_Net_Force":     ("arm_r", "arm_r"),
+}
+
+# Sim 채널 magnitude 가 이 이상이면 "active" — real 화살표 visible 게이트.
+# pair_force_vec 의 |F| 또는 aggregate 의 |mag| 기준. 1 mN 이상이면 contact 발생
+# 으로 간주 (showcase_logger 가 efc.force=0 인 step 은 0 으로 기록하므로 노이즈
+# 없음 — eps 만 넘기면 OK).
+_SIM_ACTIVE_FORCE_EPS = 1e-3
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 디버그 export — replay 동안 매 sample 의 contact_pos / aggregate_origin 을
@@ -552,14 +571,17 @@ class CsvReplayer:
                     logger.debug(f"[replay] push_external_torque main warn: {exc}")
                 break
 
-        # 3) main force vectors (per-pair + aggregates) → main_src.
-        self._push_force_frame(self._main, idx_main, self._main_src)
+        # 3) Sim force vectors (pair + aggregate) → "sim" channel. Sim CSV 가
+        # main 이든 secondary 든 sim source 인 reader 만 골라 그린다.
+        sim_reader, sim_idx = self._reader_idx_for("sim", idx_main, sec_idx)
+        if sim_reader is not None and sim_idx is not None:
+            self._push_force_frame_sim(sim_reader, sim_idx)
 
         # 3.5) contact-local CSV export (debug flag on 일 때만).
         if self._export_records is not None:
             self._sample_local_contacts(idx_main)
 
-        # 4) secondary (optional) — visibility 는 visualizer set_mode 가 결정.
+        # 4) secondary torque push (force 는 위 sim path / 아래 routed real path 가 처리).
         if self._sec is not None and sec_idx is not None:
             for csv_joint, arr in self._sec.torque.items():
                 try:
@@ -569,7 +591,13 @@ class CsvReplayer:
                     if self._step_count % 200 == 0:
                         logger.debug(f"[replay] push_external_torque sec warn: {exc}")
                     break
-            self._push_force_frame(self._sec, sec_idx, self._sec_src)
+
+        # 4.5) Real force vectors → "real" channel. sim active channel 기반 routing
+        # (SIM_TO_REAL_FORCE_ROUTE). sim/real 둘 다 로드돼야 routing 가능.
+        real_reader, real_idx = self._reader_idx_for("real", idx_main, sec_idx)
+        if (sim_reader is not None and sim_idx is not None
+                and real_reader is not None and real_idx is not None):
+            self._push_real_force_routed(sim_reader, sim_idx, real_reader, real_idx)
 
         # 5) CSV 에 없는 follower (DIP/IP) ring 은 0 push → base_scale 거대값 → floor.
         if self._unpushed_torque_joints:
@@ -1019,40 +1047,33 @@ class CsvReplayer:
                 x * mat[0][1] + y * mat[1][1] + z * mat[2][1] + mat[3][1],
                 x * mat[0][2] + y * mat[1][2] + z * mat[2][2] + mat[3][2])
 
-    def _push_force_frame(self, reader: ShowcaseReader, idx: int, source: str) -> None:
+    def _reader_idx_for(self, source: str, idx_main: int,
+                        sec_idx: Optional[int]) -> tuple:
+        """source ('sim'/'real') 에 해당하는 (reader, idx) 리턴. 없으면 (None, None)."""
+        if self._main_src == source:
+            return self._main, idx_main
+        if self._sec_src == source and self._sec is not None and sec_idx is not None:
+            return self._sec, sec_idx
+        return None, None
+
+    def _push_force_frame_sim(self, reader: ShowcaseReader, idx: int) -> None:
+        """Sim CSV 의 force vector 채널들 push (source='sim'). World frame 그대로 — chest 변환 없음.
+
+        Channel:
+          - pair_force_vec[<pair>] : showcase_logger 의 contact pair (allowlist).
+          - aggregate[<tag>]       : R_Palm_Net_Force 등 그룹 합산.
+        """
         viz = self._viz
         if viz is None:
             return
 
-        # chest world matrix 한 번만 query — 이 frame 의 모든 _to_ pair 가 공유.
-        chest_mat = None
-        any_chest_pair = any("_to_" in p for p in reader.pair_force_vec.keys())
-        if any_chest_pair:
-            chest_mat = self._get_chest_world_matrix()
-
-        # ---- per-pair contact force vectors ----
         for sanitized_pair, vec_arr in reader.pair_force_vec.items():
             vec = vec_arr[idx]
             origin_arr = reader.pair_contact_pos.get(sanitized_pair)
             origin = origin_arr[idx] if origin_arr is not None else (0.0, 0.0, 0.0)
+            self._set_or_add(viz, sanitized_pair, "sim", origin, vec)
 
-            # rosbag→CSV 변환의 ext_force/contact_pos 페어는 chest_origin frame 으로
-            # 저장됨 → runtime chest world matrix 로 변환 후 push.
-            if "_to_" in sanitized_pair and chest_mat is not None:
-                vec = self._xform_vec_chest_to_world(vec, chest_mat)
-                if origin_arr is not None:
-                    origin = self._xform_pt_chest_to_world(origin, chest_mat)
-                else:
-                    # contact_pos 없으면 chest_origin 자체 위치 (mat 의 translation row).
-                    origin = (float(chest_mat[3][0]),
-                              float(chest_mat[3][1]),
-                              float(chest_mat[3][2]))
-            self._set_or_add(viz, sanitized_pair, source, origin, vec)
-
-        # ---- aggregate (R_Palm_Net_Force 등) ----
-        # 부호 반전 — CSV 의 normal 은 contact 면이 받는 reaction 기준이라 palm 안쪽
-        # (= 손바닥 아래) 으로 향함. 시각적으로 손등 위로 솟는 게 보기 좋아 -1 곱한다.
-        # 양쪽 동시 표시가 필요하면 두 개 prim 으로 분리하면 됨.
+        # aggregate — CSV 의 normal 은 reaction 기준이라 -1 곱해 손등 위로 향하게.
         for tag, agg in reader.aggregate.items():
             mag = float(agg["mag"][idx])
             normal = agg["normal"][idx]
@@ -1060,7 +1081,63 @@ class CsvReplayer:
             vec = (-float(normal[0]) * mag,
                    -float(normal[1]) * mag,
                    -float(normal[2]) * mag)
-            self._set_or_add(viz, tag, source, origin, vec)
+            self._set_or_add(viz, tag, "sim", origin, vec)
+
+    def _push_real_force_routed(self, sim_reader: ShowcaseReader, sim_idx: int,
+                                real_reader: ShowcaseReader, real_idx: int) -> None:
+        """Sim active channel 기반으로 real ext_force topic 을 매핑해서 push.
+
+        SIM_TO_REAL_FORCE_ROUTE 의 sim 채널이 active (|F| > eps) 면, 매핑된
+        real topic 의 ext_force / contact_pos 를 sim 채널과 같은 이름의 'real'
+        prim 에 푸시. 비활성이면 hide. 같은 이름을 쓰는 덕분에 force visualizer
+        의 mode (real/sim/both/off) 토글이 source 별로 그대로 적용됨.
+        """
+        viz = self._viz
+        if viz is None:
+            return
+
+        # chest_origin → world matrix — real CSV 의 force/pos 는 chest frame.
+        chest_mat = self._get_chest_world_matrix()
+        if chest_mat is None:
+            return
+
+        for sim_channel, route in SIM_TO_REAL_FORCE_ROUTE.items():
+            force_id, cpos_id = route
+
+            # Sim 채널 magnitude → active 판정.
+            if sim_channel in sim_reader.pair_force_vec:
+                v = sim_reader.pair_force_vec[sim_channel][sim_idx]
+                sim_mag = float((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5)
+            elif sim_channel in sim_reader.aggregate:
+                sim_mag = abs(float(sim_reader.aggregate[sim_channel]["mag"][sim_idx]))
+            else:
+                # Sim CSV 에 이 채널이 없으면 게이트 신호 부재 → real 도 안 그림.
+                continue
+
+            active = sim_mag > _SIM_ACTIVE_FORCE_EPS
+
+            force_arr = real_reader.topic_force_vec.get(force_id)
+            if force_arr is None:
+                continue
+
+            if not active:
+                # Hide — _set_force_prim_visible 가 mode 무관 항상 적용 (force=0).
+                self._set_force_prim_visible(viz, sim_channel, "real", False)
+                continue
+
+            f_chest = force_arr[real_idx]
+            f_world = self._xform_vec_chest_to_world(f_chest, chest_mat)
+
+            cpos_arr = real_reader.topic_contact_pos.get(cpos_id)
+            if cpos_arr is not None:
+                p_chest = cpos_arr[real_idx]
+                p_world = self._xform_pt_chest_to_world(p_chest, chest_mat)
+            else:
+                p_world = (float(chest_mat[3][0]),
+                           float(chest_mat[3][1]),
+                           float(chest_mat[3][2]))
+
+            self._set_or_add(viz, sim_channel, "real", p_world, f_world)
 
     def _set_or_add(self, viz, name: str, source: str, origin, vec) -> None:
         """``set_custom_force_vector`` 호출. 첫 호출이면 ``add_custom_force_vector``."""

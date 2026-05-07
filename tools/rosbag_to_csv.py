@@ -80,52 +80,35 @@ TOPIC_TO_SUBDIR = {
 # communication_code, 그리고 /rosout, /parameter_events 등 전역 topic
 
 # ──────────────────────────────────────────────────────────────────────────────
-# External force 토픽 (showcase 모드 전용 — Real/Sim Replay 의 force vector overlay)
+# External force / contact_pos 토픽 (showcase 모드 전용 — Real/Sim Replay overlay)
 #
-# 모든 ext_force 데이터는 **Chest_Origin_Link frame** 으로 publish 된다고
-# 가정한다 (controller 측 spec). showcase format 의 force_vec_* 는 world frame
-# 을 기대하므로 timestep 마다 R_world_chest 를 곱해 rotate 해서 기록한다.
+# 모든 ext_force / position 데이터는 **Chest_Origin_Link frame** 으로 publish 된다.
+# CSV 에는 chest frame 그대로 저장하고, runtime 에 CsvReplayer 가 sim 의
+# Chest_Origin_Link USD prim 의 world matrix 를 Fabric API 로 query 해서 변환한다.
+# (waist joint 에 따라 chest 위치가 변하므로 정적 offset 근사 불가 — pitch 4-bar
+#  linkage 의 평행이동까지 잡으려면 runtime sim transform 이 정답.)
 #
-# Pair 이름 규약 ("<from>_to_<to>" — force 가 어디서 어디로 가하는지 명시):
-#   /result/Arm_L_theOne/ee/ext_force         = R_Shoulder → L_Palm
-#   /result/Arm_R_theOne/ee/ext_force         = L_Shoulder → R_Palm
-#   /result/frames/left_shoulder/ee/ext_force = R_Palm   → L_Shoulder
-#   /result/frames/right_shoulder/ee/ext_force= L_Palm   → R_Shoulder
+# 컬럼명은 토픽 출처를 그대로 반영하는 단순한 id 로 통일. motion-별 채널 선택은
+# replay 시점에 sim active channel 기반으로 routing (csv_replayer.py 참조).
 #
-# Newton 3rd law 상 1↔4, 2↔3 은 부호 반대 측정 (같은 contact pair 의 양쪽 끝).
-# 4 개 모두 별도 컬럼으로 기록 → overlay 시 어느 쪽 body 위에 화살표를 그릴지
-# 자유롭게 선택 가능.
+# topic id 매핑:
+#   /result/Arm_L_theOne/ee/ext_force         → arm_l       (L_Palm 이 받는 외력)
+#   /result/Arm_R_theOne/ee/ext_force         → arm_r       (R_Palm 이 받는 외력)
+#   /result/frames/left_shoulder/ee/ext_force → shoulder_l  (3rd-law mirror)
+#   /result/frames/right_shoulder/ee/ext_force→ shoulder_r  (3rd-law mirror)
+#   /result/Arm_L_theOne/ee/position          → arm_l       (L_Palm contact pos)
+#   /result/Arm_R_theOne/ee/position          → arm_r       (R_Palm contact pos)
 EXT_FORCE_TOPICS: dict[str, str] = {
-    # topic 풀네임 → showcase pair_name (sanitized, sep "_to_")
-    "/result/Arm_L_theOne/ee/ext_force":          "R_Shoulder_to_L_Palm",
-    "/result/Arm_R_theOne/ee/ext_force":          "L_Shoulder_to_R_Palm",
-    "/result/frames/left_shoulder/ee/ext_force":  "R_Palm_to_L_Shoulder",
-    "/result/frames/right_shoulder/ee/ext_force": "L_Palm_to_R_Shoulder",
+    "/result/Arm_L_theOne/ee/ext_force":          "arm_l",
+    "/result/Arm_R_theOne/ee/ext_force":          "arm_r",
+    "/result/frames/left_shoulder/ee/ext_force":  "shoulder_l",
+    "/result/frames/right_shoulder/ee/ext_force": "shoulder_r",
 }
 
-# Contact point 토픽 — 양 팔의 end-effector position 2 개만 publish 됨 (각 팔의 손바닥
-# 위치). 3rd-law mirror 페어들은 같은 물리적 contact point 를 공유하므로, 1 토픽이
-# 2 페어에 매핑됨 (예: L_arm/ee/position 은 R_Sh→L_Palm 과 그 mirror L_Palm→R_Sh
-# 둘 다 같은 contact 위치).
-#
-# 모든 position 도 chest_origin frame 으로 publish 가정 (force 와 동일).
-EXT_CONTACT_POS_TOPIC_TO_PAIRS: dict[str, list[str]] = {
-    "/result/Arm_L_theOne/ee/position": [
-        "R_Shoulder_to_L_Palm",   # L_palm 이 받는 force — contact 위치 = L_palm
-        "L_Palm_to_R_Shoulder",   # mirror, 같은 contact point
-    ],
-    "/result/Arm_R_theOne/ee/position": [
-        "L_Shoulder_to_R_Palm",   # R_palm 이 받는 force — contact 위치 = R_palm
-        "R_Palm_to_L_Shoulder",   # mirror, 같은 contact point
-    ],
+EXT_CONTACT_POS_TOPICS: dict[str, str] = {
+    "/result/Arm_L_theOne/ee/position": "arm_l",
+    "/result/Arm_R_theOne/ee/position": "arm_r",
 }
-
-# NOTE: ext_force / contact_pos 값은 rosbag 의 chest_origin frame 그대로 CSV 에 저장.
-#       offline 에서 변환 안 함 (waist joint 에 따라 chest 위치가 변하는데 정적 offset
-#       으로 근사하면 pitch 4-bar linkage 의 parallelogram 평행이동을 못 잡음).
-#       runtime 시 CsvReplayer 가 Isaac Sim 의 chest_origin USD prim 의 world
-#       transform 을 Fabric API 로 query 해서 chest→world 변환을 적용한다.
-#       (정확한 분기 키워드: pair_name 에 "_to_" 포함 → chest frame 으로 인식.)
 
 
 def _parse_bag(input_dir: str):
@@ -162,16 +145,15 @@ def _parse_bag(input_dir: str):
             keep.append(name)
             topic_meta[name] = (group, suffix)
             continue
-        # ext_force 토픽 — pair 이름은 EXT_FORCE_TOPICS 매핑에서.
+        # ext_force 토픽 — topic_id 가 그대로 CSV 컬럼 suffix.
         if name in EXT_FORCE_TOPICS:
             keep.append(name)
             topic_meta[name] = ("_ext_force", EXT_FORCE_TOPICS[name])
             continue
-        # contact_pos 토픽 — 2 개 (L/R EE position) 가 4 개 페어로 fan-out.
-        if name in EXT_CONTACT_POS_TOPIC_TO_PAIRS:
+        # contact_pos 토픽 — 1:1 매핑 (각 팔의 EE position).
+        if name in EXT_CONTACT_POS_TOPICS:
             keep.append(name)
-            # suffix 자리에 pair list 를 그대로 넣고 _write_showcase_csv 에서 unpack.
-            topic_meta[name] = ("_contact_pos", tuple(EXT_CONTACT_POS_TOPIC_TO_PAIRS[name]))
+            topic_meta[name] = ("_contact_pos", EXT_CONTACT_POS_TOPICS[name])
             continue
 
     if not keep:
@@ -323,38 +305,34 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     #             동일 group 별 ordering 가정이라 매핑 자체는 변경 불필요.
     pos_streams: dict[str, list] = {n: [] for n in column_joint_order}
     trq_streams: dict[str, list] = {n: [] for n in column_joint_order}
-    # ext force streams: pair_name → list[(t_ns, [fx, fy, fz])]   (chest_origin frame)
+    # ext_force streams: topic_id → list[(t_ns, [fx, fy, fz])]   (chest_origin frame)
     ext_force_streams: dict[str, list] = {
-        pair: [] for pair in EXT_FORCE_TOPICS.values()
+        tid: [] for tid in EXT_FORCE_TOPICS.values()
     }
-    # contact pos streams: pair_name → list[(t_ns, [px, py, pz])] (chest_origin frame).
-    # 같은 토픽이 2 페어로 fan-out 되므로 list 가 동일하게 양쪽에 채워짐.
-    _all_cpos_pairs: list[str] = [
-        p for plist in EXT_CONTACT_POS_TOPIC_TO_PAIRS.values() for p in plist
-    ]
-    contact_pos_streams: dict[str, list] = {pair: [] for pair in _all_cpos_pairs}
+    # contact_pos streams: topic_id → list[(t_ns, [px, py, pz])] (chest_origin frame)
+    contact_pos_streams: dict[str, list] = {
+        tid: [] for tid in EXT_CONTACT_POS_TOPICS.values()
+    }
 
     for topic, samples in data.items():
         group, suffix = topic_meta[topic]
         if group == "_ext_force":
-            # suffix 자리에 pair_name 이 들어 있음 (EXT_FORCE_TOPICS 매핑).
-            pair_name = suffix
+            topic_id = suffix
             for t_ns, vals in samples:
                 if len(vals) < 3:
                     continue
-                ext_force_streams[pair_name].append(
+                ext_force_streams[topic_id].append(
                     (t_ns, [float(vals[0]), float(vals[1]), float(vals[2])])
                 )
             continue
         if group == "_contact_pos":
-            # suffix 자리에 pair_name tuple — 같은 (t, pos) 를 모든 매핑된 페어로 복제.
-            pair_names = suffix
+            topic_id = suffix
             for t_ns, vals in samples:
                 if len(vals) < 3:
                     continue
-                pt = [float(vals[0]), float(vals[1]), float(vals[2])]
-                for pn in pair_names:
-                    contact_pos_streams[pn].append((t_ns, pt))
+                contact_pos_streams[topic_id].append(
+                    (t_ns, [float(vals[0]), float(vals[1]), float(vals[2])])
+                )
             continue
         joint_names = ALLEX_CSV_JOINT_NAMES.get(group)
         if joint_names is None:
@@ -390,12 +368,12 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
 
     # 4) Intersection range = max(first_t) ~ min(last_t) — 모든 stream 이 valid 한 구간.
     # ext_force / contact_pos stream 도 있으면 포함시켜 전 컬럼 채워지는 구간만 남김.
-    active_ext_pairs = [p for p, s in ext_force_streams.items() if s]
-    active_cpos_pairs = [p for p, s in contact_pos_streams.items() if s]
+    active_ext_ids = [tid for tid, s in ext_force_streams.items() if s]
+    active_cpos_ids = [tid for tid, s in contact_pos_streams.items() if s]
     all_streams = ([pos_streams[n] for n in active_pos_joints]
                    + [trq_streams[n] for n in active_trq_joints]
-                   + [ext_force_streams[p] for p in active_ext_pairs]
-                   + [contact_pos_streams[p] for p in active_cpos_pairs])
+                   + [ext_force_streams[tid] for tid in active_ext_ids]
+                   + [contact_pos_streams[tid] for tid in active_cpos_ids])
     t_start_ns = max(s[0][0] for s in all_streams)
     t_end_ns = min(s[-1][0] for s in all_streams)
     if t_end_ns <= t_start_ns:
@@ -434,19 +412,12 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
 
     # ─────────────────────────────────────────────────────────────────────
     # 5b) ext_force / contact_pos — chest_origin frame 으로 RAW 저장.
-    #
-    # 이전 버전은 offline 에서 Rz(yaw)·· 근사로 world 변환했으나, ALLEX 의 chest
-    # 위치는 waist joint (특히 pitch 의 4-bar linkage parallelogram) 에 따라
-    # 평행이동까지 발생해 정적 offset 근사로는 부정확. 정확한 transform 은 sim
-    # runtime 의 chest_origin USD prim transform 을 Fabric API 로 query 해서
-    # 적용해야 한다 → CsvReplayer 측에서 처리.
-    #
-    # CSV 컬럼 의미 (showcase format 표준은 world frame 이지만, 본 ext pair 들은
-    # chest frame 으로 박힌다 — pair 이름의 "_to_" 가 식별자):
-    #   force_vec_<pair>_{x,y,z}    — chest_origin frame 의 force vector
-    #   contact_pos_<pair>_{x,y,z}  — chest_origin frame 의 contact point
-    ext_lookup = {p: _build_lookup(ext_force_streams[p]) for p in active_ext_pairs}
-    cpos_lookup = {p: _build_lookup(contact_pos_streams[p]) for p in active_cpos_pairs}
+    # CSV 컬럼:
+    #   ext_force_<topic_id>_{x,y,z}    — chest_origin frame 의 force vector
+    #   contact_pos_<topic_id>_{x,y,z}  — chest_origin frame 의 contact point
+    # runtime 에서 sim chest_origin USD transform 으로 world 로 변환.
+    ext_lookup = {tid: _build_lookup(ext_force_streams[tid]) for tid in active_ext_ids}
+    cpos_lookup = {tid: _build_lookup(contact_pos_streams[tid]) for tid in active_cpos_ids}
 
     # 6) Uniform grid 위에 한 줄씩 emit.
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -456,11 +427,11 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
         header = (["time"]
                   + [f"pos_{n}" for n in active_pos_joints]
                   + [f"torque_{n}" for n in active_trq_joints])
-        # ext_force / contact_pos columns — ShowcaseReader 가 prefix 매칭으로 가져감.
-        for pair in active_ext_pairs:
-            header += [f"force_vec_{pair}_{ax}" for ax in ("x", "y", "z")]
-        for pair in active_cpos_pairs:
-            header += [f"contact_pos_{pair}_{ax}" for ax in ("x", "y", "z")]
+        # ext_force / contact_pos 컬럼 — ShowcaseReader 가 prefix 매칭으로 가져감.
+        for tid in active_ext_ids:
+            header += [f"ext_force_{tid}_{ax}" for ax in ("x", "y", "z")]
+        for tid in active_cpos_ids:
+            header += [f"contact_pos_{tid}_{ax}" for ax in ("x", "y", "z")]
         w.writerow(header)
 
         # +offset: pad 행 들 (모두 t_start_ns 시점 nearest-prior 값).
@@ -473,11 +444,11 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
                 row.append(f"{pos_lookup[n](t_start_ns):.6f}")
             for n in active_trq_joints:
                 row.append(f"{trq_lookup[n](t_start_ns):.6f}")
-            for pair in active_ext_pairs:
-                fx, fy, fz = ext_lookup[pair](t_start_ns)
+            for tid in active_ext_ids:
+                fx, fy, fz = ext_lookup[tid](t_start_ns)
                 row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}"]
-            for pair in active_cpos_pairs:
-                px, py, pz = cpos_lookup[pair](t_start_ns)
+            for tid in active_cpos_ids:
+                px, py, pz = cpos_lookup[tid](t_start_ns)
                 row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}"]
             w.writerow(row)
             n_rows += 1
@@ -494,11 +465,11 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
             for n in active_trq_joints:
                 row.append(f"{trq_lookup[n](t_ns):.6f}")
             # ext_force / contact_pos 는 chest_origin frame 그대로 — runtime 에서 변환.
-            for pair in active_ext_pairs:
-                fx, fy, fz = ext_lookup[pair](t_ns)
+            for tid in active_ext_ids:
+                fx, fy, fz = ext_lookup[tid](t_ns)
                 row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}"]
-            for pair in active_cpos_pairs:
-                px, py, pz = cpos_lookup[pair](t_ns)
+            for tid in active_cpos_ids:
+                px, py, pz = cpos_lookup[tid](t_ns)
                 row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}"]
             w.writerow(row)
             n_rows += 1
@@ -507,13 +478,13 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     print(f"  grid:            {target_hz:.0f} Hz × {(t_end_ns - t_start_ns) / 1e9:.3f} s")
     print(f"  pos columns:     {len(active_pos_joints)} / {len(column_joint_order)} joints")
     print(f"  torque columns:  {len(active_trq_joints)} / {len(column_joint_order)} joints")
-    if active_ext_pairs:
-        print(f"  ext_force pairs: {len(active_ext_pairs)} ({', '.join(active_ext_pairs)})")
-    if active_cpos_pairs:
-        print(f"  contact_pos:     {len(active_cpos_pairs)} pair(s)")
-    if active_ext_pairs or active_cpos_pairs:
+    if active_ext_ids:
+        print(f"  ext_force:       {len(active_ext_ids)} ({', '.join(active_ext_ids)})")
+    if active_cpos_ids:
+        print(f"  contact_pos:     {len(active_cpos_ids)} ({', '.join(active_cpos_ids)})")
+    if active_ext_ids or active_cpos_ids:
         print(f"                   frame: chest_origin (CsvReplayer 가 runtime 에 world 변환)")
-    if not active_ext_pairs and not active_cpos_pairs:
+    if not active_ext_ids and not active_cpos_ids:
         print(f"  ext_force/pos:   없음")
     print(f"  intersection:    {(t_start_ns - min(s[0][0] for s in all_streams)) / 1e6:.1f} ms 늦은 시작 / "
           f"{(max(s[-1][0] for s in all_streams) - t_end_ns) / 1e6:.1f} ms 일찍 끝")

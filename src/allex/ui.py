@@ -156,7 +156,7 @@ class WorldControls:
         dome_light.CreateColorAttr(Gf.Vec3f(0.0, 0.0, 0.0))
 
         fill_light = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/FillLight"))
-        fill_light.CreateIntensityAttr(500)
+        fill_light.CreateIntensityAttr(400)
         fill_light.CreateAngleAttr(2.0)
         UsdGeom.XformCommonAPI(fill_light).SetRotate(Gf.Vec3f(0.0, 30.0, 0.0))
 

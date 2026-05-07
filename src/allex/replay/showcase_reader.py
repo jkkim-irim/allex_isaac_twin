@@ -4,20 +4,27 @@ Parses a `showcase_*` style CSV (1 kHz log of joint pos/torque + per-pair
 contact pos/force vectors + R_Palm aggregate net force) into per-channel
 numpy arrays for kinematic replay overlay.
 
-Column conventions (as produced by the showcase logging pipeline):
+Column conventions:
+
+Sim CSV (from showcase_logger):
   time                                       — seconds
   pos_<joint>                                — rad. follower joints excluded.
-  torque_<joint>                             — Nm. qfrc_actuator (subset of pos joints).
-  contact_pos_<linkA> <-> <linkB>_{x,y,z}    — m, world frame.
+  torque_<joint>                             — Nm. qfrc_actuator + qfrc_gravcomp.
+  contact_pos_<linkA> <-> <linkB>_{x,y,z}    — m, world frame. pair → pair_contact_pos.
   aggregate_origin_{x,y,z}                   — m, world frame.
   force_<linkA> <-> <linkB>                  — scalar, ignored (not loaded).
   force_aggregate_R_Palm_Net_Force           — scalar magnitude, N.
-  force_vec_<linkA> <-> <linkB>_{x,y,z}      — N, world frame.
+  force_vec_<linkA> <-> <linkB>_{x,y,z}      — N, world frame. → pair_force_vec.
   normal_R_Palm_Net_Force_{x,y,z}            — unit normal.
 
-Pair names contain spaces and "<->" separators. They are sanitized to
-``"<linkA>__<linkB>"`` (USD-prim-path safe) and that sanitized form is the
-key used everywhere downstream.
+Real CSV (from rosbag_to_csv.py --format showcase):
+  time, pos_<joint>, torque_<joint>          — same as sim
+  ext_force_<topic_id>_{x,y,z}               — N, chest_origin frame. → topic_force_vec.
+  contact_pos_<topic_id>_{x,y,z}             — m, chest_origin frame. → topic_contact_pos.
+  (topic_id 예: arm_l, arm_r, shoulder_l, shoulder_r — ext_force_topics 매핑)
+
+Sim 의 pair name 은 ``<->`` / 공백 포함 → sanitize 해서 ``<linkA>__<linkB>`` 형태로
+저장. real 의 topic_id 는 ``__`` 없는 단순 식별자라 별도 dict 로 분리한다.
 """
 from __future__ import annotations
 
@@ -90,43 +97,63 @@ class ShowcaseReader:
             elif name.startswith("torque_"):
                 self.torque[name[len("torque_"):]] = data[:, idx].astype(np.float32)
 
-        # --- pair-keyed force_vec / contact_pos -----------------------
-        # pair_force_vec / pair_contact_pos: sanitized_pair → (T, 3)
+        # --- force_vec / contact_pos / ext_force ---------------------
+        # Sim CSV (pair):
+        #   pair_force_vec[sanitized_pair]    ← force_vec_<linkA> <-> <linkB>_*  (world)
+        #   pair_contact_pos[sanitized_pair]  ← contact_pos_<linkA> <-> <linkB>_*  (world)
+        # Real CSV (topic):
+        #   topic_force_vec[topic_id]         ← ext_force_<id>_*  (chest_origin)
+        #   topic_contact_pos[topic_id]       ← contact_pos_<id>_*  (chest_origin)
+        # contact_pos_ 컬럼은 sim/real 모두 같은 prefix 라 raw key 안에 ``<->`` 또는
+        # ``__`` 가 포함됐는지로 분기.
         self.pair_force_vec: Dict[str, np.ndarray] = {}
         self.pair_contact_pos: Dict[str, np.ndarray] = {}
+        self.topic_force_vec: Dict[str, np.ndarray] = {}
+        self.topic_contact_pos: Dict[str, np.ndarray] = {}
 
-        # First, group columns by raw pair name & axis.
-        force_vec_axes: Dict[str, Dict[str, int]] = {}
-        contact_pos_axes: Dict[str, Dict[str, int]] = {}
+        # First, group columns by raw key & axis.
+        force_vec_axes: Dict[str, Dict[str, int]] = {}      # sim only
+        ext_force_axes: Dict[str, Dict[str, int]] = {}      # real only
+        contact_pos_axes: Dict[str, Dict[str, int]] = {}    # sim + real (분기)
         for name, idx in col_idx.items():
-            if name.startswith("force_vec_") and name[-2:] in ("_x", "_y", "_z"):
-                axis = name[-1]
-                raw_pair = name[len("force_vec_"):-2]
-                force_vec_axes.setdefault(raw_pair, {})[axis] = idx
-            elif name.startswith("contact_pos_") and name[-2:] in ("_x", "_y", "_z"):
-                axis = name[-1]
-                raw_pair = name[len("contact_pos_"):-2]
-                contact_pos_axes.setdefault(raw_pair, {})[axis] = idx
+            if not (name[-2:] in ("_x", "_y", "_z")):
+                continue
+            axis = name[-1]
+            if name.startswith("force_vec_"):
+                raw = name[len("force_vec_"):-2]
+                force_vec_axes.setdefault(raw, {})[axis] = idx
+            elif name.startswith("ext_force_"):
+                raw = name[len("ext_force_"):-2]
+                ext_force_axes.setdefault(raw, {})[axis] = idx
+            elif name.startswith("contact_pos_"):
+                raw = name[len("contact_pos_"):-2]
+                contact_pos_axes.setdefault(raw, {})[axis] = idx
+
+        def _stack_xyz(axes_idx):
+            return np.stack(
+                [data[:, axes_idx["x"]], data[:, axes_idx["y"]], data[:, axes_idx["z"]]],
+                axis=1,
+            ).astype(np.float32)
 
         for raw_pair, axes in force_vec_axes.items():
             if not all(a in axes for a in ("x", "y", "z")):
                 continue
-            sanitized = sanitize_pair_name(raw_pair)
-            arr = np.stack(
-                [data[:, axes["x"]], data[:, axes["y"]], data[:, axes["z"]]],
-                axis=1,
-            ).astype(np.float32)
-            self.pair_force_vec[sanitized] = arr
+            self.pair_force_vec[sanitize_pair_name(raw_pair)] = _stack_xyz(axes)
 
-        for raw_pair, axes in contact_pos_axes.items():
+        for raw_id, axes in ext_force_axes.items():
             if not all(a in axes for a in ("x", "y", "z")):
                 continue
-            sanitized = sanitize_pair_name(raw_pair)
-            arr = np.stack(
-                [data[:, axes["x"]], data[:, axes["y"]], data[:, axes["z"]]],
-                axis=1,
-            ).astype(np.float32)
-            self.pair_contact_pos[sanitized] = arr
+            self.topic_force_vec[raw_id] = _stack_xyz(axes)
+
+        for raw, axes in contact_pos_axes.items():
+            if not all(a in axes for a in ("x", "y", "z")):
+                continue
+            arr = _stack_xyz(axes)
+            # raw 가 sim pair (``<->``/공백) 면 pair_contact_pos, 아니면 topic.
+            if (_PAIR_SEP in raw) or (" " in raw):
+                self.pair_contact_pos[sanitize_pair_name(raw)] = arr
+            else:
+                self.topic_contact_pos[raw] = arr
 
         # --- aggregate (R_Palm_Net_Force) ------------------------------
         # name 은 "R_Palm_Net_Force" (이미 sanitize 안전 — 공백/<->없음).
