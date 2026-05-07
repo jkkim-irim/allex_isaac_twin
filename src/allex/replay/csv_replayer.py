@@ -358,12 +358,14 @@ class CsvReplayer:
             except Exception as exc:
                 logger.debug(f"[replay] set_external_torque_sources warn: {exc}")
 
-        # replay 용 custom force prim 가시성 bypass — global force/torque mode 는 건드리지
-        # 않고 (사용자 토글 존중), replayer 가 등록한 prim 만 mode 와 무관하게 항상 보이게.
-        # 이 플래그가 없으면 default mode "off" 일 때 prim 은 만들어져도 invisible.
+        # NOTE: 이전엔 set_replay_force_visible(True) 로 사용자 모드 토글을 bypass 해서
+        # 'off' 일 때도 replay force prim 을 항상 보여줬는데, 그 결과 force vector 를
+        # OFF 해도 replay 중엔 안 꺼지는 UX 이슈가 발생. 사용자가 viz 패널에서 직접
+        # 모드를 정하도록 — 강제 표시 제거 (기본 비활성). replay 중에 force/torque 가
+        # 보이게 하려면 Visualizer 패널에서 mode 를 real/sim/both 로 설정.
         if viz is not None and hasattr(viz, "set_replay_force_visible"):
             try:
-                viz.set_replay_force_visible(True)
+                viz.set_replay_force_visible(False)
             except Exception as exc:
                 logger.debug(f"[replay] set_replay_force_visible warn: {exc}")
 
@@ -431,17 +433,20 @@ class CsvReplayer:
                     viz.set_replay_force_visible(False)
                 except Exception as exc:
                     logger.debug(f"[replay] clear_replay_force_visible warn: {exc}")
-        # plotter replay 모드 해제 — articulation 폴링 경로 복귀.
+        # plotter replay 모드는 끄지 않는다 — set_replay_mode(False) 로 풀면
+        # apply_step 이 articulation 폴링을 재개하면서, stop 직후 PD 가 stale
+        # target (zero pose 등) 을 쫓느라 발생하는 미세 떨림이 plot 으로 계속
+        # 흘러들어와 사용자가 "이전 값이 이어서 들어오는 것처럼" 보였음.
+        # replay_mode True 유지하면 apply_step 이 early-return 하여 plot freeze.
+        # 외부 override 만 해제 (다음 run 에서 push_replay_frame 이 깨끗하게 시작).
         for plotter in self._plotters:
             try:
-                if hasattr(plotter, "set_replay_mode"):
-                    plotter.set_replay_mode(False)
                 if hasattr(plotter, "set_external_sim_tau"):
                     plotter.set_external_sim_tau(None)
                 if hasattr(plotter, "set_external_real_by_abbr"):
                     plotter.set_external_real_by_abbr(None)
             except Exception as exc:
-                logger.debug(f"[replay] plotter mode clear warn: {exc}")
+                logger.debug(f"[replay] plotter override clear warn: {exc}")
         self._registered_force_keys.clear()
         # contact-local CSV flush (flag on 일 때만).
         if self._export_records is not None:
@@ -954,16 +959,94 @@ class CsvReplayer:
             else:
                 _fill_real_from(self._sec, idx_sec)
 
+    # ──────────────────────────────────────────────────────────────────
+    # Chest_Origin_Link runtime transform (Fabric API).
+    # rosbag_to_csv.py 의 ext_force / contact_pos pair 들 (이름에 "_to_" 포함) 은
+    # CSV 에 chest_origin frame 의 RAW 값 그대로 박혀 있다 — sim runtime 의
+    # 실제 chest world transform 으로 매 frame 변환해서 viz 에 push.
+    # parallel 4-bar linkage 의 pitch-induced 평행이동까지 정확히 반영됨.
+    # ──────────────────────────────────────────────────────────────────
+    _CHEST_PRIM_PATH = "/ALLEX/Chest_Origin_Link"
+
+    def _get_chest_world_matrix(self):
+        """Chest_Origin_Link 의 omni:fabric:worldMatrix (usdrt Matrix4d) — 또는 None."""
+        try:
+            import omni.usd
+            import usdrt
+        except Exception:
+            return None
+        if getattr(self, "_rt_stage", None) is None:
+            try:
+                stage_id = omni.usd.get_context().get_stage_id()
+                self._rt_stage = usdrt.Usd.Stage.Attach(stage_id)
+            except Exception as e:
+                if not getattr(self, "_chest_xform_warned", False):
+                    logger.warning(f"[replay] usdrt stage attach failed for chest xform: {e}")
+                    self._chest_xform_warned = True
+                return None
+        try:
+            rt_prim = self._rt_stage.GetPrimAtPath(usdrt.Sdf.Path(self._CHEST_PRIM_PATH))
+            if not rt_prim:
+                if not getattr(self, "_chest_prim_warned", False):
+                    logger.warning(f"[replay] chest prim missing: {self._CHEST_PRIM_PATH} — "
+                                   f"ext_force/contact_pos 변환 불가, raw chest-frame 값 그대로 push.")
+                    self._chest_prim_warned = True
+                return None
+            attr = rt_prim.GetAttribute("omni:fabric:worldMatrix")
+            if not attr or not attr.IsValid():
+                return None
+            return attr.Get()
+        except Exception as e:
+            if not getattr(self, "_chest_xform_runtime_warned", False):
+                logger.warning(f"[replay] chest xform query warn: {e}")
+                self._chest_xform_runtime_warned = True
+            return None
+
+    @staticmethod
+    def _xform_vec_chest_to_world(vec_chest, mat) -> tuple:
+        """Force vector — rotation only (translation 무시).
+        usdrt Matrix4d 는 row-major (translation 이 row 3): rotation 은 0..2 행."""
+        x, y, z = float(vec_chest[0]), float(vec_chest[1]), float(vec_chest[2])
+        return (x * mat[0][0] + y * mat[1][0] + z * mat[2][0],
+                x * mat[0][1] + y * mat[1][1] + z * mat[2][1],
+                x * mat[0][2] + y * mat[1][2] + z * mat[2][2])
+
+    @staticmethod
+    def _xform_pt_chest_to_world(pt_chest, mat) -> tuple:
+        """Contact point — full SE3 (rotation + translation)."""
+        x, y, z = float(pt_chest[0]), float(pt_chest[1]), float(pt_chest[2])
+        return (x * mat[0][0] + y * mat[1][0] + z * mat[2][0] + mat[3][0],
+                x * mat[0][1] + y * mat[1][1] + z * mat[2][1] + mat[3][1],
+                x * mat[0][2] + y * mat[1][2] + z * mat[2][2] + mat[3][2])
+
     def _push_force_frame(self, reader: ShowcaseReader, idx: int, source: str) -> None:
         viz = self._viz
         if viz is None:
             return
+
+        # chest world matrix 한 번만 query — 이 frame 의 모든 _to_ pair 가 공유.
+        chest_mat = None
+        any_chest_pair = any("_to_" in p for p in reader.pair_force_vec.keys())
+        if any_chest_pair:
+            chest_mat = self._get_chest_world_matrix()
 
         # ---- per-pair contact force vectors ----
         for sanitized_pair, vec_arr in reader.pair_force_vec.items():
             vec = vec_arr[idx]
             origin_arr = reader.pair_contact_pos.get(sanitized_pair)
             origin = origin_arr[idx] if origin_arr is not None else (0.0, 0.0, 0.0)
+
+            # rosbag→CSV 변환의 ext_force/contact_pos 페어는 chest_origin frame 으로
+            # 저장됨 → runtime chest world matrix 로 변환 후 push.
+            if "_to_" in sanitized_pair and chest_mat is not None:
+                vec = self._xform_vec_chest_to_world(vec, chest_mat)
+                if origin_arr is not None:
+                    origin = self._xform_pt_chest_to_world(origin, chest_mat)
+                else:
+                    # contact_pos 없으면 chest_origin 자체 위치 (mat 의 translation row).
+                    origin = (float(chest_mat[3][0]),
+                              float(chest_mat[3][1]),
+                              float(chest_mat[3][2]))
             self._set_or_add(viz, sanitized_pair, source, origin, vec)
 
         # ---- aggregate (R_Palm_Net_Force 등) ----
@@ -1039,8 +1122,19 @@ class CsvReplayer:
                 logger.debug(f"[replay] set_custom_force_vector warn: {exc}")
 
     def _set_force_prim_visible(self, viz, name: str, source: str, visible: bool) -> None:
-        """custom force prim 한 개의 visibility 만 토글 — global mode 와 무관.
-        visualizer 의 _custom_force_prims 에서 prim 직접 가져와 MakeVisible/Invisible.
+        """custom force prim 한 개의 visibility 토글.
+
+        Hide (visible=False) 는 mode 와 무관하게 항상 적용 — force=0 이면 화살표
+        무조건 안 보여야 함.
+
+        Show (visible=True) 는 viz 의 force mode 가 해당 source 를 허용하는 경우만
+        적용. user 가 Force Visualizer 를 OFF 했으면 force 가 들어와도 화살표 안
+        나타나야 함.
+
+        ★ visualizer 의 `_set_visible` 을 호출해야 session_edit 컨텍스트로 visibility
+        가 session layer 에 authored 됨. 직접 MakeVisible/MakeInvisible 호출하면
+        root layer 에 쓰여서, prim 자체가 session 에 authored 된 visibility 가
+        있으면 layer composition strength 상 session 이 이겨서 hide/show 가 안 먹힘.
         """
         try:
             key = f"{source}::{name}"
@@ -1050,14 +1144,37 @@ class CsvReplayer:
             prim = rec.get("prim")
             if prim is None:
                 return
-            from pxr import UsdGeom
-            if not prim.IsValid():
-                return
-            imageable = UsdGeom.Imageable(prim)
+            # Show 는 mode 검사 — replay bypass 가 켜져 있으면 무조건 OK.
             if visible:
-                imageable.MakeVisible()
-            else:
-                imageable.MakeInvisible()
+                bypass = getattr(viz, "_replay_force_visible", False)
+                if not bypass:
+                    mode = getattr(viz, "_mode", "off")
+                    src_lc = (source or "").lower()
+                    if src_lc == "real" and mode not in ("real", "both"):
+                        return
+                    if src_lc == "sim" and mode not in ("sim", "both"):
+                        return
+                    # source="user" 또는 미지: 통과 (user 는 항상 visible 약속).
+            set_vis = getattr(viz, "_set_visible", None)
+            if set_vis is None:
+                from pxr import UsdGeom
+                if not prim.IsValid():
+                    return
+                imageable = UsdGeom.Imageable(prim)
+                ctx = getattr(viz, "_session_edit", None)
+                if ctx is not None:
+                    with ctx():
+                        if visible:
+                            imageable.MakeVisible()
+                        else:
+                            imageable.MakeInvisible()
+                else:
+                    if visible:
+                        imageable.MakeVisible()
+                    else:
+                        imageable.MakeInvisible()
+                return
+            set_vis(prim, visible)
         except Exception as exc:
             logger.debug(f"[replay] per-prim visibility toggle warn: {exc}")
 

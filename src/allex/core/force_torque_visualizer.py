@@ -1719,6 +1719,16 @@ class ForceTorqueVisualizer:
         """
         if prim is None:
             return
+
+        # ── Mode-off kill switch ──────────────────────────────────────
+        # 사용자가 Force Visualizer 를 OFF 한 상태에선 force prim 의 visibility/scale
+        # 모두 절대 안 건드림. _apply_visibility 가 session_edit 으로 invisible 박아둔
+        # 상태가 그대로 유지됨. (replay bypass 활성 시에는 동작.)
+        # 이 가드 없으면 threshold transition 이 force 가 들어올 때마다 _set_visible(True)
+        # 을 호출해서 mode-off 토글을 무력화함.
+        if self._mode == "off" and not getattr(self, "_replay_force_visible", False):
+            return
+
         try:
             prim_path = prim.GetPath().pathString
         except Exception:
@@ -1920,6 +1930,12 @@ class ForceTorqueVisualizer:
         UsdGeom.Imageable.MakeVisible/MakeInvisible 은 상위 Xform 의 invisible
         토큰까지 inherited 로 되돌리므로, 이전 세션에서 남은 visibility 상태를
         확실히 재설정할 수 있다 (문제 3의 원인 후보 중 하나).
+
+        ★ 모든 viz prim 은 `_create_force_ref_xform` / `_create_ref_xform` 에서
+        **session layer** 에 authored 된다. visibility 도 session 에 써야
+        layer composition strength 상 root layer 의 inherited 를 덮어쓴다.
+        그렇지 않으면 root 에 invisible 박아도 session 의 inherited 가 이겨서
+        prim 이 계속 visible 인 상태가 됨 (이게 force OFF 토글이 안 먹던 원인).
         """
         if prim is None:
             return
@@ -1928,10 +1944,11 @@ class ForceTorqueVisualizer:
             if not prim.IsValid():
                 return
             imageable = UsdGeom.Imageable(prim)
-            if visible:
-                imageable.MakeVisible()
-            else:
-                imageable.MakeInvisible()
+            with self._session_edit():
+                if visible:
+                    imageable.MakeVisible()
+                else:
+                    imageable.MakeInvisible()
         except Exception as e:
             logger.debug(f"[viz] set_visible warn: {e}")
 

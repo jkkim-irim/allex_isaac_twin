@@ -40,13 +40,13 @@ class ContactForceVisualizer:
     # ------------------------------------------------------------------
     def build(self) -> None:
         UIComponentFactory.create_styled_button(
-            "Contact Forces",
+            "Contact Debug Draw",
             callback=self._toggle,
             color_scheme="blue",
             height=UILayout.BUTTON_HEIGHT,
         )
         self._status_label = UIComponentFactory.create_status_label(
-            "Contact Forces: OFF", UILayout.LABEL_WIDTH_LARGE,
+            "Contact Debug Draw: OFF", UILayout.LABEL_WIDTH_LARGE,
         )
 
     def cleanup(self) -> None:
@@ -80,13 +80,13 @@ class ContactForceVisualizer:
             self._enabled = True
             self._first_render_logged = False
             if self._status_label is not None:
-                self._status_label.text = "Contact Forces: ON"
+                self._status_label.text = "Contact Debug Draw: ON"
             print("[ALLEX][ContactViz] enabled")
         else:
             self._enabled = False
             self._clear_draw()
             if self._status_label is not None:
-                self._status_label.text = "Contact Forces: OFF"
+                self._status_label.text = "Contact Debug Draw: OFF"
             print("[ALLEX][ContactViz] disabled")
 
     def set_enabled(self, enabled: bool) -> None:

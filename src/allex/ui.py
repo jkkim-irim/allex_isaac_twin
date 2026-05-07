@@ -135,7 +135,7 @@ class WorldControls:
         from isaacsim.storage.native.nucleus import get_assets_root_path
         from isaacsim.core.api.world import World
         import omni.usd
-        from pxr import Sdf, UsdLux
+        from pxr import Gf, Sdf, UsdGeom, UsdLux
 
         create_new_stage()
 
@@ -153,6 +153,12 @@ class WorldControls:
         stage = omni.usd.get_context().get_stage()
         dome_light = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
         dome_light.CreateIntensityAttr(1000)
+        dome_light.CreateColorAttr(Gf.Vec3f(0.0, 0.0, 0.0))
+
+        fill_light = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/FillLight"))
+        fill_light.CreateIntensityAttr(500)
+        fill_light.CreateAngleAttr(2.0)
+        UsdGeom.XformCommonAPI(fill_light).SetRotate(Gf.Vec3f(0.0, 30.0, 0.0))
 
         from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
         _set_lighting_mode(lighting_mode="Stage Lights")
@@ -627,9 +633,11 @@ _MODE_CHOICES = [_MODE_REAL, _MODE_SIM, _MODE_BOTH]
 class VisualizerControls:
     """Visualizer section — ALLEX viz toggles.
 
-    Force vector 시각화는 두 가지 백엔드를 가집니다 (mutually exclusive):
-      - debug draw OFF (기본): ForceTorqueVisualizer (USD prim) — viz mode real/sim/both
-      - debug draw ON       : ContactForceVisualizer (debug_draw immediate-mode)
+    Force vector 시각화 두 백엔드 (independent — 동시에 켤 수 있음):
+      - ForceTorqueVisualizer (USD prim, "Force Visualizer" 버튼)
+        외부 push 채널 지원 (CSV replay 등) + per-link 12 화살표
+      - ContactForceVisualizer (debug_draw immediate-mode, "Contact Debug Draw" 버튼)
+        sim 의 contact_config.json pair 들의 normal force 만 immediate-mode 화살표
     """
 
     def __init__(self, scenario=None):
@@ -649,9 +657,8 @@ class VisualizerControls:
         self._torque_plot_body_running: bool = False
         self._torque_plot_hand_running: bool = False
 
-        # Contact force debug-draw backend (mutually exclusive with prim-based force viz)
+        # Contact force debug-draw backend (independent from prim-based force viz).
         self._contact_force_viz = ContactForceVisualizer()
-        self._debug_draw_model = None  # ui.SimpleBoolModel — debug-draw checkbox
 
         # UI refs
         self._force_viz_status_label = None
@@ -711,21 +718,6 @@ class VisualizerControls:
                     "Force Viz: OFF", UILayout.LABEL_WIDTH_LARGE,
                 )
 
-                # Debug-draw mode toggle. Switches force-vector backend between
-                # ForceTorqueVisualizer (prim, default) and ContactForceVisualizer
-                # (debug_draw immediate-mode, drawn from contact_config.json pairs).
-                # Switching disables whichever backend was active.
-                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
-                    ui.Label("Debug draw:", width=UILayout.LABEL_WIDTH_LARGE)
-                    self._debug_draw_model = ui.SimpleBoolModel(False)
-                    ui.CheckBox(self._debug_draw_model)
-                    try:
-                        self._debug_draw_model.add_value_changed_fn(
-                            self._on_debug_draw_change
-                        )
-                    except Exception:
-                        pass
-
                 ui.Separator(height=4)
 
                 UIComponentFactory.create_styled_button(
@@ -767,8 +759,9 @@ class VisualizerControls:
 
                 ui.Separator(height=4)
 
-                # ContactForceVisualizer (debug_draw) — its own button + status
-                # label. Activated only when the "Debug draw" checkbox is on.
+                # ContactForceVisualizer (debug_draw immediate-mode) — independent
+                # toggle. Coexists with USD-prim Force Visualizer (no longer
+                # mutually exclusive — both backends 같이 켜둘 수 있음).
                 self._contact_force_viz.build()
 
                 ui.Separator(height=4)
@@ -825,15 +818,6 @@ class VisualizerControls:
     # Toggle — Force Visualizer (prim-based ForceTorqueVisualizer)
     # ========================================
     def _toggle_force_viz(self):
-        if self._is_debug_draw_mode():
-            # Debug draw 모드일 때는 ContactForceVisualizer 버튼이 진짜 토글.
-            # Force Visualizer 버튼은 비활성으로 안내.
-            if self._force_viz_status_label:
-                self._force_viz_status_label.text = (
-                    "Force Viz: (debug-draw mode — use Contact Forces button)"
-                )
-            return
-
         visualizer = self._get_visualizer()
         prev_enabled = self._force_viz_enabled
         self._force_viz_enabled = not self._force_viz_enabled
@@ -874,7 +858,7 @@ class VisualizerControls:
             return
         self._viz_mode = _MODE_CHOICES[idx]
         visualizer = self._get_visualizer()
-        if visualizer is not None and self._force_viz_enabled and not self._is_debug_draw_mode():
+        if visualizer is not None and self._force_viz_enabled:
             try:
                 visualizer.set_mode(self._viz_mode)
             except Exception as e:
@@ -882,53 +866,6 @@ class VisualizerControls:
         if self._force_viz_status_label and self._force_viz_enabled:
             self._force_viz_status_label.text = f"Force Viz: ON ({self._viz_mode})"
         print(f"[Visualizer] Mode -> {self._viz_mode}")
-
-    # ========================================
-    # Debug-draw backend toggle (mutually exclusive force-vector backend)
-    # ========================================
-    def _is_debug_draw_mode(self) -> bool:
-        if self._debug_draw_model is None:
-            return False
-        try:
-            return bool(self._debug_draw_model.as_bool)
-        except Exception:
-            return False
-
-    def _on_debug_draw_change(self, model):
-        try:
-            checked = bool(model.as_bool)
-        except Exception:
-            return
-        if checked:
-            # Tear down ForceTorqueVisualizer prim mode if active.
-            if self._force_viz_enabled:
-                visualizer = self._get_visualizer()
-                if visualizer is not None:
-                    try:
-                        visualizer.set_mode(_MODE_OFF)
-                    except Exception as exc:
-                        print(f"[Visualizer] set_mode(off) on debug-draw enable failed: {exc}")
-                self._force_viz_enabled = False
-                if self._force_viz_status_label:
-                    self._force_viz_status_label.text = (
-                        "Force Viz: (debug-draw mode — use Contact Forces button)"
-                    )
-            else:
-                if self._force_viz_status_label:
-                    self._force_viz_status_label.text = (
-                        "Force Viz: (debug-draw mode — use Contact Forces button)"
-                    )
-            print("[Visualizer] backend -> debug-draw (ContactForceVisualizer)")
-        else:
-            # Tear down ContactForceVisualizer if active.
-            if self._contact_force_viz.is_enabled:
-                try:
-                    self._contact_force_viz.set_enabled(False)
-                except Exception as exc:
-                    print(f"[Visualizer] contact_force_viz set_enabled(False) failed: {exc}")
-            if self._force_viz_status_label:
-                self._force_viz_status_label.text = "Force Viz: OFF"
-            print("[Visualizer] backend -> prim (ForceTorqueVisualizer)")
 
     # ========================================
     # Torque rings

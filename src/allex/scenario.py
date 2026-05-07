@@ -358,6 +358,15 @@ class ALLEXDigitalTwin:
             except Exception:
                 pass
             self._csv_replayer = None
+        # 이전 CsvReplayer 가 plotter 를 replay 모드로 두고 freeze 시켜놨을 수 있음 —
+        # TrajStudio 는 articulation 폴링이 필요하므로 명시적으로 해제.
+        if player is not None:
+            for plotter in (self._torque_plotter_body, self._torque_plotter_hand):
+                if plotter is not None and hasattr(plotter, "set_replay_mode"):
+                    try:
+                        plotter.set_replay_mode(False)
+                    except Exception:
+                        pass
         self._trajectory_player = player
 
     def get_trajectory_player(self):
