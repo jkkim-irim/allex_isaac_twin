@@ -247,6 +247,10 @@ class CsvReplayer:
         # custom force vector 등록 상태 — (sanitized_pair, source) 가 add 됐는지.
         self._registered_force_keys: set[tuple[str, str]] = set()
 
+        # Real arrow 의 origin 을 sim 의 contact_pos 로 대체하는 모드 (UI toggle).
+        # vector 자체는 real ext_force 그대로, 위치만 sim 에서 가져와 overlay.
+        self._real_force_use_sim_contact_pos: bool = False
+
         # debug pause/resume 용 — wall-clock baseline 보정.
         self._pause_t: Optional[float] = None
 
@@ -1047,6 +1051,10 @@ class CsvReplayer:
                 x * mat[0][1] + y * mat[1][1] + z * mat[2][1] + mat[3][1],
                 x * mat[0][2] + y * mat[1][2] + z * mat[2][2] + mat[3][2])
 
+    def set_real_force_use_sim_contact_pos(self, enable: bool) -> None:
+        """Real force arrow 의 origin 을 sim contact_pos 로 대체 (vector 는 real 그대로)."""
+        self._real_force_use_sim_contact_pos = bool(enable)
+
     def _reader_idx_for(self, source: str, idx_main: int,
                         sec_idx: Optional[int]) -> tuple:
         """source ('sim'/'real') 에 해당하는 (reader, idx) 리턴. 없으면 (None, None)."""
@@ -1128,14 +1136,26 @@ class CsvReplayer:
             f_chest = force_arr[real_idx]
             f_world = self._xform_vec_chest_to_world(f_chest, chest_mat)
 
-            cpos_arr = real_reader.topic_contact_pos.get(cpos_id)
-            if cpos_arr is not None:
-                p_chest = cpos_arr[real_idx]
-                p_world = self._xform_pt_chest_to_world(p_chest, chest_mat)
-            else:
-                p_world = (float(chest_mat[3][0]),
-                           float(chest_mat[3][1]),
-                           float(chest_mat[3][2]))
+            # Origin: 기본은 real CSV 의 contact_pos (chest→world 변환), 모드 on 이면
+            # sim 의 contact_pos (이미 world frame) 로 대체. sim 채널이 pair 인지
+            # aggregate 인지에 따라 dict 분기.
+            p_world = None
+            if self._real_force_use_sim_contact_pos:
+                if sim_channel in sim_reader.pair_contact_pos:
+                    sp = sim_reader.pair_contact_pos[sim_channel][sim_idx]
+                    p_world = (float(sp[0]), float(sp[1]), float(sp[2]))
+                elif sim_channel in sim_reader.aggregate:
+                    so = sim_reader.aggregate[sim_channel]["origin"][sim_idx]
+                    p_world = (float(so[0]), float(so[1]), float(so[2]))
+            if p_world is None:
+                cpos_arr = real_reader.topic_contact_pos.get(cpos_id)
+                if cpos_arr is not None:
+                    p_chest = cpos_arr[real_idx]
+                    p_world = self._xform_pt_chest_to_world(p_chest, chest_mat)
+                else:
+                    p_world = (float(chest_mat[3][0]),
+                               float(chest_mat[3][1]),
+                               float(chest_mat[3][2]))
 
             self._set_or_add(viz, sim_channel, "real", p_world, f_world)
 

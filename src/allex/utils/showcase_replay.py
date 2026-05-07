@@ -55,6 +55,8 @@ class ShowcaseReplayControls:
         self._availability_label: ui.Label | None = None
         self._main_combo: ui.ComboBox | None = None
         self._status_label: ui.Label | None = None
+        # Real arrow 의 origin 을 sim contact_pos 로 강제 — vector 는 real 그대로.
+        self._use_sim_cp_check: ui.CheckBox | None = None
 
     # ------------------------------------------------------------------
     # UI build
@@ -84,6 +86,15 @@ class ShowcaseReplayControls:
                     ui.Label("Main source:", width=UILayout.LABEL_WIDTH_LARGE)
                     self._main_combo = ui.ComboBox(0, "sim", "real",
                                                    height=UILayout.BUTTON_HEIGHT)
+
+                # Real force arrow 의 origin 을 sim contact_pos 로 대체. vector 는
+                # real ext_force 유지 — 위치만 sim 시뮬레이션 contact 위치에 overlay.
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Real arrow @ sim contact:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._use_sim_cp_check = ui.CheckBox()
+                    self._use_sim_cp_check.model.add_value_changed_fn(
+                        self._on_use_sim_cp_change
+                    )
 
                 UIComponentFactory.create_separator(UILayout.SEPARATOR_HEIGHT)
 
@@ -127,6 +138,7 @@ class ShowcaseReplayControls:
         self._main_combo = None
         self._status_label = None
         self._availability_label = None
+        self._use_sim_cp_check = None
 
     # ------------------------------------------------------------------
     # Dropdown
@@ -293,6 +305,14 @@ class ShowcaseReplayControls:
         except Exception as exc:
             self._set_status(f"Status: scenario.set_csv_replayer failed: {exc}")
             return
+        # 시작 시점의 체크박스 상태 반영.
+        if self._use_sim_cp_check is not None:
+            try:
+                replayer.set_real_force_use_sim_contact_pos(
+                    bool(self._use_sim_cp_check.model.get_value_as_bool())
+                )
+            except Exception:
+                pass
         replayer.start()
 
         sec_tag = "none" if reader_sec is None else f"{'real' if main_src == 'sim' else 'sim'}"
@@ -300,6 +320,24 @@ class ShowcaseReplayControls:
             f"Status: Playing main={main_src} ({reader_main.duration_s:.2f}s, "
             f"sec={sec_tag})"
         )
+
+    def _on_use_sim_cp_change(self, model) -> None:
+        """체크박스 값 변경 시 실행 중인 replayer 에 즉시 적용."""
+        try:
+            val = bool(model.get_value_as_bool())
+        except Exception:
+            return
+        scenario = getattr(self._ui, "_scenario", None)
+        if scenario is None or not hasattr(scenario, "get_csv_replayer"):
+            return
+        replayer = scenario.get_csv_replayer()
+        if replayer is None:
+            return
+        if hasattr(replayer, "set_real_force_use_sim_contact_pos"):
+            try:
+                replayer.set_real_force_use_sim_contact_pos(val)
+            except Exception:
+                pass
 
     def _on_stop(self) -> None:
         scenario = getattr(self._ui, "_scenario", None)
