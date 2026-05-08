@@ -109,6 +109,18 @@ class ForceTorqueVisualizer:
         # 원소: "sim" / "real". 비어있으면 기존 동작과 동일.
         self._external_torque_sources: set = set()
 
+        # CSV replay 의 torque_ring_triggers 가 활성화한 trigger-gating 상태.
+        # 키: (source, region) — source ∈ {real, sim}, region 은 dof 그룹 이름
+        #   (None / "_all_" = 그 source 의 모든 ring).
+        # 값: bool — True=active, False=hide.
+        # entry 없는 (source, region) 은 "gate 안 걸림" → mode 만 보고 결정.
+        # 한 dof 의 visibility = (mode 허용) AND (
+        #   매칭되는 gate 없음 OR 매칭되는 gate 중 하나라도 True
+        # ) AND (매칭되는 모든 gate 가 False 가 아님).
+        self._torque_region_gate: dict = {}
+        # dof_abbr → 그 dof 가 속한 region 이름들의 frozenset. init 시 1회 빌드.
+        self._dof_abbr_regions: dict = {}
+
         # CSV replay 동안 custom force prim 을 force-mode 와 무관하게 보이게 하는 bypass.
         # True 이면 _apply_visibility() 가 source="sim"/"real" custom prim 도 항상 visible
         # 처리. user 가 force/torque mode 토글을 안 켜도 replay 가 등록한 화살표는 보임.
@@ -364,6 +376,130 @@ class ForceTorqueVisualizer:
     def get_torque_mode(self) -> str:
         return self._torque_mode
 
+    # Arm joint dof_abbr → 친숙한 region 이름 매핑.
+    _ARM_INDIVIDUAL_NAMES = {
+        "SP": "shoulder_pitch", "SR": "shoulder_roll", "SY": "shoulder_yaw",
+        "EP": "elbow",
+        "WY": "wrist_yaw", "WR": "wrist_roll", "WP": "wrist_pitch",
+    }
+    # 개별 joint 이 속한 sub-group (있으면). EP 는 sub-group 없음.
+    _ARM_SUBGROUP_OF = {
+        "SP": "shoulder", "SR": "shoulder", "SY": "shoulder",
+        "WY": "wrist",    "WR": "wrist",    "WP": "wrist",
+    }
+
+    @classmethod
+    def _dof_abbr_to_regions(cls, abbr: str) -> frozenset:
+        """dof_abbr → 속한 region 들 (frozenset). 빌드 시 1회 호출.
+
+        매핑:
+          L11..L54 / R11..R54 → {"Hand_<side>", "Hand_<side>_<finger>"}
+          L(SP|SR|SY) / R(...) → {"Arm_<side>", "Arm_<side>_shoulder",
+                                  "Arm_<side>_shoulder_pitch" 등 개별}
+          L(WY|WR|WP) / R(...) → {"Arm_<side>", "Arm_<side>_wrist",
+                                  "Arm_<side>_wrist_yaw" 등 개별}
+          L(EP) / R(EP)        → {"Arm_<side>", "Arm_<side>_elbow"}
+          그 외 → 빈 set
+        """
+        if not abbr or len(abbr) < 2:
+            return frozenset()
+        side = abbr[0]
+        if side not in ("L", "R"):
+            return frozenset()
+        rest = abbr[1:]
+        if rest.isdigit() and len(rest) >= 2:
+            finger_map = {"1": "thumb", "2": "index", "3": "middle", "4": "ring", "5": "little"}
+            finger = finger_map.get(rest[0])
+            if finger:
+                return frozenset({f"Hand_{side}", f"Hand_{side}_{finger}"})
+        elif rest in cls._ARM_INDIVIDUAL_NAMES:
+            out = {f"Arm_{side}", f"Arm_{side}_{cls._ARM_INDIVIDUAL_NAMES[rest]}"}
+            sub = cls._ARM_SUBGROUP_OF.get(rest)
+            if sub:
+                out.add(f"Arm_{side}_{sub}")
+            return frozenset(out)
+        return frozenset()
+
+    def _ensure_dof_region_map(self) -> None:
+        """torque_ring_prims 가 처음 채워졌을 때 1회 빌드. 매 _apply_visibility 에서 lazy 호출."""
+        if self._dof_abbr_regions:
+            return
+        for abbr in self._torque_ring_prims.keys():
+            self._dof_abbr_regions[abbr] = self._dof_abbr_to_regions(abbr)
+
+    def set_torque_region_gate(self, source: str, region, active) -> None:
+        """torque ring 의 (source, region) 별 trigger-gate.
+
+        source : "real" | "sim"
+        region : str (예 "Arm_L", "Hand_L", "Hand_L_thumb") 또는 None / "_all_" (그 source 의 모든 ring)
+        active : True (visible) / False (hide) / None (gate entry 제거 = mode 만 보고 결정)
+        """
+        src = str(source).lower()
+        if src not in ("real", "sim"):
+            logger.warning(f"[viz] set_torque_region_gate: invalid source {source!r}")
+            return
+        region_key = region if region is not None else "_all_"
+        key = (src, region_key)
+        if active is None:
+            if key in self._torque_region_gate:
+                del self._torque_region_gate[key]
+                self._apply_torque_ring_visibility()
+            return
+        new_v = bool(active)
+        if self._torque_region_gate.get(key) != new_v:
+            self._torque_region_gate[key] = new_v
+            self._apply_torque_ring_visibility()
+
+    def clear_torque_region_gates(self) -> None:
+        """모든 trigger-gate 제거 — replay stop 등에서 호출."""
+        if self._torque_region_gate:
+            self._torque_region_gate.clear()
+            self._apply_torque_ring_visibility()
+
+    def _apply_torque_ring_visibility(self) -> None:
+        """torque ring prim 만 visibility 재계산. force prim 의 threshold cache 안 건드림.
+
+        ``_apply_visibility()`` 는 force/torque 모두 sweep 하면서 force prim 의
+        ``_threshold_hide_state`` 를 비운다 → 다음 frame 의 _apply_force_scale 까지
+        force prim 이 mode-only visible 로 1 frame 깜빡이는 flicker 유발.
+        torque gate 변경처럼 force 와 무관한 갱신은 이 targeted helper 만 호출.
+        """
+        self._ensure_dof_region_map()
+        for abbr, pair in self._torque_ring_prims.items():
+            show_real = self._torque_ring_visible_for(abbr, "real")
+            show_sim = self._torque_ring_visible_for(abbr, "sim")
+            self._set_visible(pair.get("real"), show_real)
+            self._set_visible(pair.get("sim"), show_sim)
+
+    def _torque_ring_visible_for(self, dof_abbr: str, src: str) -> bool:
+        """매 _apply_visibility 에서 호출 — mode AND region gate (exclusive 시멘틱).
+
+        시멘틱:
+          - source 에 gate 하나도 없음 → mode-only default (visible)
+          - source 에 gate 있음:
+              · dof 가 매칭되는 gate 중 하나라도 True → visible
+              · 매칭은 됐는데 전부 False → hidden
+              · 매칭 자체가 안 됨 → **hidden (exclusive)** — 다른 region 만 명시한 trigger
+                여도 그 source 의 다른 dof 는 자동 숨김
+
+        예: user 가 ``real.Hand_L`` 만 trigger 박으면 → real 의 모든 arm/Hand_R ring
+        은 자동 hide. real 채널 전체를 sim 처럼 "trigger 가 있는 영역만 보여줌" 으로 다룸.
+        """
+        if self._torque_mode not in (src, "both"):
+            return False
+        # 이 source 에 gate 하나라도 있나?
+        src_has_any = any(s == src for (s, _r) in self._torque_region_gate.keys())
+        if not src_has_any:
+            return True   # gate 전혀 없음 → mode-only default
+        regions = self._dof_abbr_regions.get(dof_abbr, frozenset())
+        matched_values = [
+            v for (s, r), v in self._torque_region_gate.items()
+            if s == src and (r == "_all_" or r in regions)
+        ]
+        if not matched_values:
+            return False  # source 에 gate 는 있지만 이 dof 에 매칭 안 됨 → exclusive hide
+        return any(matched_values)
+
     def set_external_torque_sources(self, sources) -> None:
         """CSV replay 등 외부에서 push_external_torque 로 ring 을 갱신하는 동안
         update() 의 자체 articulation 측정이 덮어쓰지 않도록 채널을 잠근다.
@@ -572,12 +708,24 @@ class ForceTorqueVisualizer:
             "name": name,
         }
 
-        # 최초 크기 적용
+        # 최초 크기 적용 — _apply_force_scale 가 threshold 따라 visibility 결정 (this prim).
         self._apply_force_vector(prim, fx, fy, fz,
                                  FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE)
 
-        # 가시성: source 별 force mode 토글에 맞춤. 처음 만들 때 한 번 적용.
-        self._apply_visibility()
+        # 가시성: this prim 만 mode-based override. 전체 _apply_visibility() 호출하면
+        # _threshold_hide_state cache 가 wipe 되어, **다른** force prim 들이 1 frame
+        # mode-only visible 로 flicker 됨 (이게 "픽" 거리는 증상의 원인). this prim 의
+        # threshold-hide 는 _apply_force_vector 가 이미 처리했으므로, mode 가 hide 일
+        # 때만 강제로 invisible 박으면 충분.
+        src_lc = source.lower()
+        mode_allows = (
+            self._replay_force_visible
+            or src_lc == "user"
+            or (src_lc == "real" and self._mode in ("real", "both"))
+            or (src_lc == "sim" and self._mode in ("sim", "both"))
+        )
+        if not mode_allows:
+            self._set_visible(prim, False)
         return prim_path
 
     def set_custom_force_vector(self, name, position=None, vector=None,
@@ -1902,11 +2050,14 @@ class ForceTorqueVisualizer:
         self._threshold_hide_state.clear()
 
         # --- torque rings ---
-        show_real_torque = self._torque_mode in ("real", "both")
-        show_sim_torque = self._torque_mode in ("sim", "both")
-        for pair in self._torque_ring_prims.values():
-            self._set_visible(pair.get("real"), show_real_torque)
-            self._set_visible(pair.get("sim"), show_sim_torque)
+        # 각 dof 별로 (mode 허용) AND (region gate 매칭/active) 검사.
+        # gate 가 그 dof 에 안 걸려 있으면 mode 만 보고 default visible.
+        self._ensure_dof_region_map()
+        for abbr, pair in self._torque_ring_prims.items():
+            show_real = self._torque_ring_visible_for(abbr, "real")
+            show_sim = self._torque_ring_visible_for(abbr, "sim")
+            self._set_visible(pair.get("real"), show_real)
+            self._set_visible(pair.get("sim"), show_sim)
 
         # --- force arrows (per-link) ---
         show_real_force = self._mode in ("real", "both")

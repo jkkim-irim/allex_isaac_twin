@@ -29,7 +29,7 @@
 
   "force": {
     "_doc": "force arrow scale = clip(|F|*gain, min_scale, max_scale). hide_below 미만이면 화살표 prim 을 visible=false 로.",
-    "gain": 2.0,
+    "gain": 5.0,
     "min_scale": -60.0,
     "max_scale":  60.0,
     "hide_below": 1.0

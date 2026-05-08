@@ -33,7 +33,7 @@ _ZERO_VEC_EPS = 1e-6
 
 # Sim 채널 → real ext_force topic_id 매핑. **fallback 게이트 전용** (sim CSV 가 있고
 # trigger 도 없을 때, 어떤 sim 채널의 active 가 어떤 real topic 의 visibility 를 켤지).
-# trigger 게이트는 이 dict 와 무관하게 topic_id 직접 매칭 (force_trigger.json 참조).
+# trigger 게이트는 이 dict 와 무관하게 topic_id 직접 매칭 (viz_scenario_config.json 참조).
 #
 # motion 별 demo 시나리오 매핑:
 #   Motion 1: 왼팔↔오른손등 (sim pair `L_Elbow__R_Palm_Back`) → real `arm_r`
@@ -81,6 +81,41 @@ def _other_source(src: str) -> str:
     return "real" if src == "sim" else "sim"
 
 
+def _validate_ranges(label: str, raw: object) -> list:
+    """Validate list-of-[t_on, t_off] payload. 실패 entry 는 WARNING + skip.
+    리턴: sorted list[tuple[float, float]] (정상 entry 만)."""
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            f"[replay] {label}: value must be list of [t_on, t_off] pairs; "
+            f"got {type(raw).__name__}"
+        )
+        return []
+    out: list[tuple[float, float]] = []
+    for r in raw:
+        if (not isinstance(r, (list, tuple))) or len(r) != 2:
+            logger.warning(f"[replay] {label}: bad range {r!r}, skip")
+            continue
+        try:
+            a, b = float(r[0]), float(r[1])
+        except (TypeError, ValueError):
+            logger.warning(f"[replay] {label}: non-numeric range {r!r}, skip")
+            continue
+        if not (a < b):
+            logger.warning(f"[replay] {label}: t_on>=t_off in {r!r}, skip")
+            continue
+        out.append((a, b))
+    out.sort()
+    return out
+
+
+def _t_in_ranges(t: float, ranges) -> bool:
+    """ranges 중 하나라도 [t_on, t_off] 안에 t 가 들어가면 True."""
+    for t_on, t_off in ranges:
+        if t_on <= t <= t_off:
+            return True
+    return False
+
+
 class CsvReplayer:
     """Per-physics-step kinematic replay + viz push.
 
@@ -113,7 +148,7 @@ class CsvReplayer:
         *,
         main_source: str,
         plotters: Optional[list] = None,
-        force_triggers: Optional[dict] = None,
+        viz_scenario: Optional[dict] = None,
     ):
         if reader_main is None:
             raise ValueError("reader_main is required")
@@ -128,61 +163,41 @@ class CsvReplayer:
         self._main_src = ms
         self._sec_src = _other_source(ms)
 
-        # Real force visualization 의 manual gate annotation.
-        # JSON key 는 **CSV 의 ext_force_<topic_id>_{x,y,z} 컬럼 prefix 와 일치**:
-        #   "ext_force_arm_r": [[t_on, t_off], ...]
-        # (CSV header 보고 그 force 의 컬럼 prefix 를 그대로 키로 씀. 임의로 추가된
-        # 새 ext_force topic 도 같은 패턴이면 자동 인식.)
-        # 시간은 real CSV 'time' 컬럼 기준 (real_reader.t[idx] - real_reader.t[0]).
-        # 내부적으론 prefix 떼고 topic_id (showcase_reader 의 topic_force_vec 키) 로 저장.
-        # topic entry 있으면 trigger ranges 로 게이팅 (sim 없이도 동작).
-        # 없으면 SIM_TO_REAL_FORCE_ROUTE 역방향으로 sim |F|>eps fallback gate.
-        # 둘 다 없으면 그 topic 은 안 그림. force_trigger.json 에서 로드 (UI).
-        self._force_triggers: dict = {}
-        if force_triggers:
-            for raw_key, ranges in force_triggers.items():
-                if not isinstance(raw_key, str):
-                    continue
-                # 'ext_force_<id>' prefix 만 인식 — CSV 의 ext_force_<id>_x/y/z 컬럼과 매칭.
-                # 다른 prefix (force_vec_*, force_aggregate_*) 는 추후 확장 여지로 일단 무시.
-                if not raw_key.startswith("ext_force_"):
-                    logger.warning(
-                        f"[replay] force_trigger key {raw_key!r} 은 'ext_force_<topic_id>' "
-                        f"형태여야 합니다 (CSV 컬럼 prefix 와 일치). skip."
-                    )
-                    continue
-                topic_id = raw_key[len("ext_force_"):]
-                if not topic_id:
-                    logger.warning(f"[replay] force_trigger key {raw_key!r}: topic_id 가 비어있음. skip.")
-                    continue
-                if not isinstance(ranges, (list, tuple)):
-                    logger.warning(
-                        f"[replay] force_trigger '{raw_key}': value must be list of "
-                        f"[t_on, t_off] pairs; got {type(ranges).__name__}"
-                    )
-                    continue
-                clean: list[tuple[float, float]] = []
-                for r in ranges:
-                    if (not isinstance(r, (list, tuple))) or len(r) != 2:
-                        logger.warning(f"[replay] force_trigger '{raw_key}': bad range {r!r}, skip")
-                        continue
-                    try:
-                        a, b = float(r[0]), float(r[1])
-                    except (TypeError, ValueError):
-                        logger.warning(f"[replay] force_trigger '{raw_key}': non-numeric range {r!r}, skip")
-                        continue
-                    if not (a < b):
-                        logger.warning(f"[replay] force_trigger '{raw_key}': t_on>=t_off in {r!r}, skip")
-                        continue
-                    clean.append((a, b))
-                if clean:
-                    clean.sort()
-                    self._force_triggers[topic_id] = clean
-            if self._force_triggers:
-                logger.info(
-                    f"[replay] force_triggers loaded (topic_id basis): "
-                    + ", ".join(f"{k}({len(v)} range)" for k, v in self._force_triggers.items())
-                )
+        # viz_scenario_config.json 에서 로드된 시나리오 dict. 키 (전부 optional):
+        #   "force_triggers":       {<col_prefix>: [[t_on, t_off], ...]}
+        #   "torque_ring_triggers": {"real": [...], "sim": [...]}
+        #   "graph_plots":          [ {plot_spec}, ... ]
+        # 각 섹션은 _parse_*_triggers 헬퍼로 검증·정규화 후 내부 dict 에 저장.
+        viz_scenario = viz_scenario or {}
+
+        # --- force_triggers 파싱 ---
+        # JSON key = CSV 의 ext_force_<topic_id>_{x,y,z} 컬럼 prefix.
+        # 내부 dict 키 = topic_id (prefix 떼고 저장 — showcase_reader.topic_force_vec 와 일치).
+        # entry 있으면 그 topic 은 trigger ranges 로 게이팅 (sim 없이도 동작).
+        # 없으면 SIM_TO_REAL_FORCE_ROUTE 역방향으로 sim |F|>eps fallback.
+        self._force_triggers: dict = self._parse_force_triggers(
+            viz_scenario.get("force_triggers") or {}
+        )
+
+        # --- torque_ring_triggers 파싱 ---
+        # 키 = "real" / "sim", 값 = list of [t_on, t_off]. 매 tick 시간 보고 visualizer 의
+        # 채널별 gate 를 동적 토글. 없으면 visualizer 의 user 모드 그대로.
+        self._torque_ring_triggers: dict = self._parse_channel_triggers(
+            viz_scenario.get("torque_ring_triggers") or {}, "torque_ring"
+        )
+        # 직전 적용된 gate 상태 — transition 만 visualizer 에 push (불필요한 호출 방지).
+        self._torque_gate_prev: dict = {}
+
+        # --- graph_plots: Phase 3 에서 처리 — 현재는 보관만, 미사용. ---
+        self._graph_plot_specs = list(viz_scenario.get("graph_plots") or [])
+
+        if self._force_triggers or self._torque_ring_triggers or self._graph_plot_specs:
+            logger.info(
+                f"[replay] viz_scenario loaded: "
+                f"force={len(self._force_triggers)}ch, "
+                f"torque={len(self._torque_ring_triggers)}ch, "
+                f"plots={len(self._graph_plot_specs)}"
+            )
         # TorquePlotter 인스턴스(들). plot 도 CSV 값을 보여주려면 sim tau / real dict
         # override 를 매 step 흘려야 함.
         self._plotters = list(plotters) if plotters else []
@@ -396,6 +411,7 @@ class CsvReplayer:
 
         # 재시작 안전화: 이전 run 이 남긴 stale state 명시 reset.
         self._registered_force_keys.clear()
+        self._torque_gate_prev.clear()
         self._paused = False
         self._pause_t = None
         self._prev_idx_main_for_plot = -1
@@ -547,6 +563,15 @@ class CsvReplayer:
         # USDRT stage 캐시 해제 — 다음 start() 가 새 stage 로 attach 하도록.
         self._rt_stage = None
 
+        # torque ring trigger gate 전체 해제 — replay stop 후엔 user 토글이 다시 mode
+        # 만 보고 동작하도록.
+        if hasattr(viz, "clear_torque_region_gates"):
+            try:
+                viz.clear_torque_region_gates()
+            except Exception as exc:
+                logger.debug(f"[replay] clear_torque_region_gates warn: {exc}")
+        self._torque_gate_prev.clear()
+
         logger.info("[replay] stopped")
 
     def is_self_ticking(self) -> bool:
@@ -615,7 +640,45 @@ class CsvReplayer:
         if self._sec is not None:
             idx_sec = self._sec.index_at(self._csv_t0_sec + elapsed)
         self._apply_at(idx_main, idx_sec)
+
+        # torque_ring_triggers 평가 (real CSV time 기준 상대시간 t_rel).
+        if self._torque_ring_triggers:
+            self._update_torque_ring_gates(idx_main, idx_sec)
+
         self._step_count += 1
+
+    def _update_torque_ring_gates(self, idx_main: int, idx_sec: Optional[int]) -> None:
+        """현재 t 가 (source, region) 별 active range 안에 있는지 검사 → visualizer
+        region gate 토글.
+
+        시간 기준 = real reader 의 'time' 컬럼 (real CSV 첫 sample 0 으로 한 상대시간).
+        sim only group 이면 sim CSV t 사용. Transition 만 visualizer 에 push.
+        """
+        viz = self._viz
+        if viz is None or not hasattr(viz, "set_torque_region_gate"):
+            return
+        ref_reader, ref_idx = self._reader_idx_for("real", idx_main, idx_sec)
+        if ref_reader is None:
+            ref_reader, ref_idx = self._reader_idx_for("sim", idx_main, idx_sec)
+        if ref_reader is None or ref_idx is None:
+            return
+        try:
+            t_rel = float(ref_reader.t[ref_idx] - ref_reader.t[0])
+        except Exception:
+            return
+
+        # 각 (source, region) entry 별 active 평가 + transition push.
+        for key, ranges in self._torque_ring_triggers.items():
+            new_v = _t_in_ranges(t_rel, ranges)
+            if self._torque_gate_prev.get(key) == new_v:
+                continue
+            self._torque_gate_prev[key] = new_v
+            src, region = key
+            try:
+                viz.set_torque_region_gate(src, region, new_v)
+            except Exception as exc:
+                if self._step_count % 200 == 0:
+                    logger.debug(f"[replay] set_torque_region_gate warn: {exc}")
 
     # ------------------------------------------------------------------
     # Per-step internals
@@ -664,18 +727,12 @@ class CsvReplayer:
                         logger.debug(f"[replay] push_external_torque sec warn: {exc}")
                     break
 
-        # 4.5) Real force vectors → "real" channel. SIM_TO_REAL_FORCE_ROUTE 매핑
-        # 사용. 게이팅 우선순위:
-        #   1) force_triggers 에 채널이 있으면 → 시간 범위로 on/off (sim 없이도 동작)
-        #   2) 없으면 sim |F|>eps active gate (sim_reader 필요)
-        #   3) 둘 다 없으면 해당 채널 skip
+        # 4.5) Real force vectors → "real" channel. real_reader 만 있으면 항상 routing
+        # 호출, 내부에서 topic 별 게이팅. (이전엔 trigger·sim 둘 다 없으면 skip 했지만
+        # real-only 에서 force 가 안 보이는 문제로 수정 — torque 와 동일 시멘틱)
         real_reader, real_idx = self._reader_idx_for("real", idx_main, sec_idx)
         if real_reader is not None and real_idx is not None:
-            need_routing = bool(self._force_triggers) or (
-                sim_reader is not None and sim_idx is not None
-            )
-            if need_routing:
-                self._push_real_force_routed(sim_reader, sim_idx, real_reader, real_idx)
+            self._push_real_force_routed(sim_reader, sim_idx, real_reader, real_idx)
 
         # 5) CSV 에 없는 follower (DIP/IP) ring 은 0 push → base_scale 거대값 → floor.
         if self._unpushed_torque_joints:
@@ -1160,6 +1217,68 @@ class CsvReplayer:
         """Real force arrow 의 origin 을 sim contact_pos 로 대체 (vector 는 real 그대로)."""
         self._real_force_use_sim_contact_pos = bool(enable)
 
+    # ------------------------------------------------------------------
+    # viz_scenario 파싱 헬퍼 (init 시 1회)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_force_triggers(raw: dict) -> dict:
+        """JSON 의 force_triggers section 을 internal dict 로 변환.
+
+        JSON key form: ``ext_force_<topic_id>`` (CSV 컬럼 prefix 와 일치).
+        Internal key: ``<topic_id>`` (showcase_reader.topic_force_vec 와 매칭용).
+        """
+        if not isinstance(raw, dict):
+            return {}
+        out: dict = {}
+        for raw_key, ranges in raw.items():
+            if not isinstance(raw_key, str):
+                continue
+            if not raw_key.startswith("ext_force_"):
+                logger.warning(
+                    f"[replay] force_trigger key {raw_key!r} 은 'ext_force_<topic_id>' "
+                    f"형태여야 합니다 (CSV 컬럼 prefix 와 일치). skip."
+                )
+                continue
+            topic_id = raw_key[len("ext_force_"):]
+            if not topic_id:
+                logger.warning(f"[replay] force_trigger key {raw_key!r}: topic_id 비어있음. skip.")
+                continue
+            clean = _validate_ranges(f"force_trigger '{raw_key}'", ranges)
+            if clean:
+                out[topic_id] = clean
+        return out
+
+    @staticmethod
+    def _parse_channel_triggers(raw: dict, label: str) -> dict:
+        """``{'real': [...], 'sim': [...]}`` 또는 ``{'real.<region>': [...], ...}`` 형태 trigger 파싱.
+
+        Key form:
+          - ``"real"`` / ``"sim"`` : 그 source 의 모든 ring (region=None 으로 저장)
+          - ``"real.<region>"`` / ``"sim.<region>"`` : 특정 region 만
+            (예: "real.Arm_L", "real.Hand_L_thumb")
+
+        Returns: dict[(source, region|None) -> sorted_ranges]
+        """
+        if not isinstance(raw, dict):
+            return {}
+        out: dict = {}
+        for ch_raw, ranges in raw.items():
+            if not isinstance(ch_raw, str):
+                continue
+            if "." in ch_raw:
+                ch, region = ch_raw.split(".", 1)
+                region = region.strip() or None
+            else:
+                ch, region = ch_raw, None
+            if ch not in ("real", "sim"):
+                logger.warning(f"[replay] {label}_trigger: invalid channel {ch_raw!r}, skip "
+                               f"(expected 'real'/'sim' or 'real.<region>'/'sim.<region>')")
+                continue
+            clean = _validate_ranges(f"{label}_trigger.{ch_raw}", ranges)
+            if clean:
+                out[(ch, region)] = clean
+        return out
+
     def _reader_idx_for(self, source: str, idx_main: int,
                         sec_idx: Optional[int]) -> tuple:
         """source ('sim'/'real') 에 해당하는 (reader, idx) 리턴. 없으면 (None, None)."""
@@ -1204,12 +1323,15 @@ class CsvReplayer:
         Iteration: ``real_reader.topic_force_vec.keys()`` — CSV 에 실제 존재하는 모든
         topic_id 순회. 임의로 추가된 새 ext_force_<id>_* 컬럼도 자동 인식.
 
-        Gate 결정 순서 (topic 별 독립):
+        Gate 결정 순서 (topic 별 독립, torque_ring_triggers 와 동일 시멘틱):
           1) self._force_triggers[topic_id] 있음 → 시간 범위 in/out 으로 on/off
              (sim_reader 없어도 동작 — real-only replay 가능)
-          2) sim_reader 있음 + topic 이 SIM_TO_REAL_FORCE_ROUTE 의 target 으로 등장
-             → 매핑된 sim 채널 중 하나라도 |F|>eps 면 active (기존 fallback)
-          3) 둘 다 없음 → skip (안 그림)
+          2) self._force_triggers 가 비어있지 않은데 이 topic 만 미정의
+             → exclusive hide (다른 topic 만 명시한 trigger 의 부수효과)
+          3) self._force_triggers 통째로 비어있음 + sim_reader 있음
+             → 매핑된 sim 채널 |F|>eps active gate (기존 sim 동작 유지)
+          4) self._force_triggers 통째로 비어있음 + sim_reader 없음
+             → default visible (mode-only, threshold-hide 가 알아서 처리)
 
         Prim name = topic_id (예 "arm_r"). source dir 가 sim/real 로 분리되므로
         sim 쪽 prim (sim_channel 이름) 과 충돌 없음. visualizer mode (real/sim/both/off)
@@ -1226,21 +1348,25 @@ class CsvReplayer:
         # trigger 시간 비교용 — real CSV 첫 sample 을 0 으로 한 상대시간 (사용자가
         # CSV/JSON 에서 직접 보는 값과 동일).
         current_t_rel = float(real_reader.t[real_idx] - real_reader.t[0])
+        triggers_section_empty = not self._force_triggers
 
         for topic_id, force_arr in real_reader.topic_force_vec.items():
             # ----- gate 결정 -----
             triggers = self._force_triggers.get(topic_id)
+            active_sim_channel: Optional[str] = None
             if triggers is not None:
+                # (1) 이 topic 의 trigger 정의됨
                 active = any(t_on <= current_t_rel <= t_off for t_on, t_off in triggers)
-                active_sim_channel: Optional[str] = None
+            elif not triggers_section_empty:
+                # (2) 다른 topic 에 trigger 있음, 이 topic 은 미정의 → exclusive hide
+                active = False
             elif sim_reader is not None and sim_idx is not None:
-                # fallback: 이 topic 을 게이트하는 sim 채널 중 active 하나라도 있으면 on.
+                # (3) trigger 통째로 비어있음 + sim 있음 → sim-active gate
                 sim_channels = _FORCE_TOPIC_TO_SIM_CHANNELS.get(topic_id)
                 if not sim_channels:
-                    # routing dict 에 매핑 없음 + trigger 도 없음 → skip
+                    # routing dict 에 매핑 없음 → 이 topic 은 sim gate 신호 없음. skip.
                     continue
                 active = False
-                active_sim_channel = None
                 for sim_ch in sim_channels:
                     if sim_ch in sim_reader.pair_force_vec:
                         v = sim_reader.pair_force_vec[sim_ch][sim_idx]
@@ -1254,7 +1380,9 @@ class CsvReplayer:
                         active_sim_channel = sim_ch
                         break
             else:
-                continue
+                # (4) trigger 비어있고 sim 도 없음 → default visible (mode-only).
+                # threshold-hide 가 |F|<hide_below 이면 알아서 prim 숨김.
+                active = True
 
             if not active:
                 self._set_force_prim_visible(viz, topic_id, "real", False)

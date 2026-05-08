@@ -26,38 +26,39 @@ from .ui_settings_utils import UIComponentFactory, UILayout
 from ..replay import CsvReplayer, ShowcaseReader
 
 
-_FORCE_TRIGGER_FILE = "force_trigger.json"
+_VIZ_SCENARIO_FILE = "viz_scenario_config.json"
 
 
-def _load_force_triggers(group_dir: Path) -> dict:
-    """``<group>/force_trigger.json`` 로드. 없거나 파싱 실패면 빈 dict.
+def _load_viz_scenario(group_dir: Path) -> dict:
+    """``<group>/viz_scenario_config.json`` 로드. 없거나 파싱 실패면 빈 dict.
 
-    스키마:
+    스키마 (전체 optional):
     ```
     {
-      "_notes": "...",                       # 무시 (underscore prefix 키)
-      "<sim_channel_name>": [[t_on, t_off], ...]
+      "_notes": "...",                            # 무시 (underscore prefix 키)
+      "force_triggers":       {<col_prefix>: [[t_on, t_off], ...]},
+      "torque_ring_triggers": {"real": [...], "sim": [...]},
+      "graph_plots":          [ {plot_spec}, ... ]
     }
     ```
+
+    파일이 없으면 빈 dict — 기존 default 동작 (force 는 sim-active gate fallback,
+    torque ring 은 user 토글, graph plot 없음) 그대로 유지.
     """
-    p = group_dir / _FORCE_TRIGGER_FILE
+    p = group_dir / _VIZ_SCENARIO_FILE
     if not p.is_file():
         return {}
     try:
         with p.open("r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception as exc:
-        print(f"[ALLEX][Showcase] force_trigger.json parse fail: {exc}")
+        print(f"[ALLEX][Showcase] {_VIZ_SCENARIO_FILE} parse fail: {exc}")
         return {}
     if not isinstance(raw, dict):
-        print(f"[ALLEX][Showcase] force_trigger.json must be a JSON object, got {type(raw).__name__}")
+        print(f"[ALLEX][Showcase] {_VIZ_SCENARIO_FILE} must be a JSON object, got {type(raw).__name__}")
         return {}
-    out = {}
-    for k, v in raw.items():
-        if isinstance(k, str) and k.startswith("_"):
-            continue   # _notes 등 메타 키 무시
-        out[k] = v
-    return out
+    # underscore prefix (예 "_notes") 키 무시.
+    return {k: v for k, v in raw.items() if not (isinstance(k, str) and k.startswith("_"))}
 
 _EXT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _TRAJECTORY_DIR = _EXT_ROOT / "trajectory"
@@ -322,8 +323,9 @@ class ShowcaseReplayControls:
             if p is not None:
                 plotters.append(p)
 
-        # force_trigger.json (선택) — manual gating annotation. 없으면 빈 dict.
-        force_triggers = _load_force_triggers(_TRAJECTORY_DIR / group)
+        # viz_scenario_config.json (선택) — force / torque / plot 통합 시나리오.
+        # 없으면 빈 dict → 기존 default 동작 그대로.
+        viz_scenario = _load_viz_scenario(_TRAJECTORY_DIR / group)
 
         try:
             replayer = CsvReplayer(
@@ -333,7 +335,7 @@ class ShowcaseReplayControls:
                 visualizer=viz,
                 main_source=main_src,
                 plotters=plotters,
-                force_triggers=force_triggers,
+                viz_scenario=viz_scenario,
             )
         except Exception as exc:
             self._set_status(f"Status: replayer init failed: {exc}")
@@ -355,10 +357,17 @@ class ShowcaseReplayControls:
         replayer.start()
 
         sec_tag = "none" if reader_sec is None else f"{'real' if main_src == 'sim' else 'sim'}"
-        trig_tag = f", triggers={len(force_triggers)}ch" if force_triggers else ""
+        scen_parts = []
+        if viz_scenario.get("force_triggers"):
+            scen_parts.append(f"force={len(viz_scenario['force_triggers'])}ch")
+        if viz_scenario.get("torque_ring_triggers"):
+            scen_parts.append(f"torque={len(viz_scenario['torque_ring_triggers'])}ch")
+        if viz_scenario.get("graph_plots"):
+            scen_parts.append(f"plots={len(viz_scenario['graph_plots'])}")
+        scen_tag = (", scenario={" + ",".join(scen_parts) + "}") if scen_parts else ""
         self._set_status(
             f"Status: Playing main={main_src} ({reader_main.duration_s:.2f}s, "
-            f"sec={sec_tag}{trig_tag})"
+            f"sec={sec_tag}{scen_tag})"
         )
 
     def _on_use_sim_cp_change(self, model) -> None:
