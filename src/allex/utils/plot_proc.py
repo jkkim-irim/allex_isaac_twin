@@ -260,18 +260,18 @@ def main() -> int:
         for jname in grp.get("joints", []):
             if has_real:
                 # real solid + legend label, sim dashed + same color, no label.
-                (ln_real,) = ax.plot([], [], label=str(jname), linewidth=1.0)
+                (ln_real,) = ax.plot([], [], label=str(jname), linewidth=0.8)
                 real_lines.append(ln_real)
                 color = ln_real.get_color()
                 (ln_sim,) = ax.plot(
-                    [], [], color=color, linestyle="--", linewidth=0.9,
+                    [], [], color=color, linestyle="--", linewidth=0.8,
                     alpha=0.85,
                 )
                 sim_lines.append(ln_sim)
                 label_to_partner[id(ln_real)] = ln_sim
             else:
                 # No real channel — sim is the sole solid line with the label.
-                (ln_sim,) = ax.plot([], [], label=str(jname), linewidth=1.0)
+                (ln_sim,) = ax.plot([], [], label=str(jname), linewidth=0.8)
                 sim_lines.append(ln_sim)
         ax.set_title(str(grp.get("name", "")))
         ax.set_ylabel(y_label)

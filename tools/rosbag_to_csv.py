@@ -19,7 +19,7 @@ rosbag2 → CSV 변환기. 두 가지 출력 포맷 지원.
   - 행 = 시점 (rosbag 절대 timestamp 기준 상대시간)
   - 컬럼: time, pos_<joint_full_name> [rad], torque_<joint_full_name> [Nm]
   - Position 출처: joint_positions_deg (current = measured, deg→rad)
-  - Torque 출처:   joint_torque        (real measured)
+  - Torque 출처:   /result/<group>/joint/torque  (필터된 joint torque — outbound 대신)
   - 14 그룹 토픽을 union 시간축으로 합치고, 각 시점에서 해당 토픽의 최신 값 사용.
   - Contact / force_vec 컬럼은 rosbag 에 그 토픽이 없으면 자동 생략.
   Output:
@@ -88,16 +88,18 @@ TOPIC_TO_SUBDIR = {
 # (waist joint 에 따라 chest 위치가 변하므로 정적 offset 근사 불가 — pitch 4-bar
 #  linkage 의 평행이동까지 잡으려면 runtime sim transform 이 정답.)
 #
-# 컬럼명은 토픽 출처를 그대로 반영하는 단순한 id 로 통일. motion-별 채널 선택은
-# replay 시점에 sim active channel 기반으로 routing (csv_replayer.py 참조).
+# 컬럼명은 토픽 출처를 그대로 반영하는 단순한 id 로 통일. CSV 에 추가된 모든 ext_force
+# topic 은 replay 시 ``ext_force_<topic_id>`` 키로 force_trigger.json 에서 게이팅 가능
+# (csv_replayer.py::_push_real_force_routed 참조). routing dict 와 무관하게 임의 추가 OK.
 #
 # topic id 매핑:
-#   /result/Arm_L_theOne/ee/ext_force         → arm_l       (L_Palm 이 받는 외력)
-#   /result/Arm_R_theOne/ee/ext_force         → arm_r       (R_Palm 이 받는 외력)
-#   /result/frames/left_shoulder/ee/ext_force → shoulder_l  (3rd-law mirror)
-#   /result/frames/right_shoulder/ee/ext_force→ shoulder_r  (3rd-law mirror)
-#   /result/Arm_L_theOne/ee/position          → arm_l       (L_Palm contact pos)
-#   /result/Arm_R_theOne/ee/position          → arm_r       (R_Palm contact pos)
+#   /result/Arm_L_theOne/ee/ext_force         → arm_l           (L_Palm 외력 / contact_pos)
+#   /result/Arm_R_theOne/ee/ext_force         → arm_r           (R_Palm 외력 / contact_pos)
+#   /result/frames/left_shoulder/ee/ext_force → shoulder_l      (3rd-law mirror)
+#   /result/frames/right_shoulder/ee/ext_force→ shoulder_r      (3rd-law mirror)
+#   /result/Hand_L_<finger>_wir/ee/ext_force  → hand_l_<finger> (손가락별 외력 + 접촉위치)
+#   /result/Hand_R_<finger>_wir/ee/ext_force  → hand_r_<finger>
+#     finger ∈ {thumb, index, middle, ring, little}
 EXT_FORCE_TOPICS: dict[str, str] = {
     "/result/Arm_L_theOne/ee/ext_force":          "arm_l",
     "/result/Arm_R_theOne/ee/ext_force":          "arm_r",
@@ -110,6 +112,16 @@ EXT_CONTACT_POS_TOPICS: dict[str, str] = {
     "/result/Arm_R_theOne/ee/position": "arm_r",
 }
 
+# 손가락별 ext_force / position — Hand_<L|R>_<finger>_wir 그룹 (5 finger × 2 hand = 10 ea).
+# topic_id = hand_<l|r>_<finger> → CSV 컬럼: ext_force_hand_l_thumb_x ... etc.
+# trigger.json 에서 "ext_force_hand_l_thumb": [[t_on, t_off]] 로 visualize 게이팅.
+for _hand_up, _hand_lo in (("L", "l"), ("R", "r")):
+    for _finger in ("thumb", "index", "middle", "ring", "little"):
+        _tid = f"hand_{_hand_lo}_{_finger}"
+        EXT_FORCE_TOPICS[f"/result/Hand_{_hand_up}_{_finger}_wir/ee/ext_force"] = _tid
+        EXT_CONTACT_POS_TOPICS[f"/result/Hand_{_hand_up}_{_finger}_wir/ee/position"] = _tid
+del _hand_up, _hand_lo, _finger, _tid
+
 
 def _parse_bag(input_dir: str):
     """bag 을 읽어 {topic_name: [(t_ns, [values])...] } 리턴."""
@@ -120,25 +132,35 @@ def _parse_bag(input_dir: str):
     )
     type_map = {t.name: t.type for t in reader.get_all_topics_and_types()}
 
-    # 관심 topic 필터: /robot_outbound_data/<group>/<suffix>
+    # 관심 topic 필터:
     #
-    # joint_torque 출처에 대한 메모 (showcase 모드의 torque 컬럼 입력):
-    #   현재: /robot_outbound_data/<group>/joint_torque  — controller 가 motor torque
-    #         (cmd or measured) 를 gear ratio 로 joint frame 환산한 값. 일부 raw 잔차
-    #         포함될 수 있음.
-    #   대안: /result/<...>/joint/torque — 동일 데이터에 추가 low-pass filter 적용.
-    #         더 부드러운 plot 이 필요하거나 외력 추정 잔차의 high-freq noise 가
-    #         거슬리면 이쪽으로 교체.
-    #   교체 방법: 위 'parts[0] != "robot_outbound_data"' 분기를 result 토픽 트리
-    #         형태에 맞게 수정 + suffix 분리 로직 갱신. CSV_GROUPS / TOPIC_TO_SUBDIR
-    #         그대로 재사용 가능 (값 의미는 동일, 필터링만 다름).
+    # 1) /robot_outbound_data/<group>/<suffix>  — pos / vel / target 등.
+    # 2) /result/<group>/joint/torque           — joint_torque 의 **필터된** 버전.
+    #    /robot_outbound_data/<group>/joint_torque (raw motor cmd 잔차 포함) 대신
+    #    이쪽을 쓴다. 동일 group / 동일 dispatch 경로 (suffix="joint_torque") 로
+    #    내부 처리 → showcase CSV 의 torque_* 컬럼, _torque/<group>.csv 둘 다
+    #    필터된 데이터를 사용하게 됨.
+    # 3) ext_force / contact_pos — 위 dict 매핑 그대로.
     keep = []
     topic_meta = {}  # topic → (group, suffix)
     for name in type_map:
         parts = name.strip("/").split("/")
+        # /result/<group>/joint/torque (필터된 joint torque)
+        if (len(parts) == 4 and parts[0] == "result"
+                and parts[2] == "joint" and parts[3] == "torque"):
+            group = parts[1]
+            if group not in CSV_GROUPS:
+                continue
+            keep.append(name)
+            topic_meta[name] = (group, "joint_torque")
+            continue
+        # /robot_outbound_data/<group>/<suffix>  (단 joint_torque 는 위에서 처리)
         if len(parts) == 3 and parts[0] == "robot_outbound_data":
             group, suffix = parts[1], parts[2]
             if group not in CSV_GROUPS:
+                continue
+            if suffix == "joint_torque":
+                # raw torque skip — 필터된 /result/<group>/joint/torque 만 쓴다.
                 continue
             if suffix not in TOPIC_TO_SUBDIR:
                 continue
@@ -293,16 +315,11 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     # 토픽 → 컬럼 매핑 표 (group 별 N 개 joint, ALLEX_CSV_JOINT_NAMES 순서대로 인덱싱):
     #   /robot_outbound_data/<group>/joint_positions_deg [deg]
     #       → pos_<full_joint_name>   (deg → rad 변환)
-    #   /robot_outbound_data/<group>/joint_torque        [Nm]
+    #   /result/<group>/joint/torque                     [Nm]   ← 필터된 joint torque
     #       → torque_<full_joint_name> (단위 그대로)
-    #
-    # torque 출처 교체 메모 (filter 적용된 값으로 갈아끼울 때):
-    #   현재 source = /robot_outbound_data/<group>/joint_torque (lightly filtered)
-    #   대안 source = /result/<...>/joint/torque               (heavier low-pass)
-    #   교체 방법: _parse_bag 의 topic 필터를 result 트리에 맞게 풀어주고,
-    #             아래 `suffix == "joint_torque"` 분기를 새 suffix 이름으로 교체
-    #             (또는 CLI flag 로 source 선택 분기 추가). joint 인덱싱은
-    #             동일 group 별 ordering 가정이라 매핑 자체는 변경 불필요.
+    # _parse_bag 가 /result/<group>/joint/torque 를 (group, "joint_torque") 로 매핑하므로
+    # 아래 `suffix == "joint_torque"` 분기는 그대로 동작. raw 잔차 포함된
+    # /robot_outbound_data/<group>/joint_torque 는 _parse_bag 에서 skip 됨.
     pos_streams: dict[str, list] = {n: [] for n in column_joint_order}
     trq_streams: dict[str, list] = {n: [] for n in column_joint_order}
     # ext_force streams: topic_id → list[(t_ns, [fx, fy, fz])]   (chest_origin frame)

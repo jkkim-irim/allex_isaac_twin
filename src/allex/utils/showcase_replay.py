@@ -15,6 +15,7 @@ mode (off/real/sim/both).
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import omni.ui as ui
@@ -23,6 +24,40 @@ from isaacsim.gui.components.ui_utils import get_style
 
 from .ui_settings_utils import UIComponentFactory, UILayout
 from ..replay import CsvReplayer, ShowcaseReader
+
+
+_FORCE_TRIGGER_FILE = "force_trigger.json"
+
+
+def _load_force_triggers(group_dir: Path) -> dict:
+    """``<group>/force_trigger.json`` 로드. 없거나 파싱 실패면 빈 dict.
+
+    스키마:
+    ```
+    {
+      "_notes": "...",                       # 무시 (underscore prefix 키)
+      "<sim_channel_name>": [[t_on, t_off], ...]
+    }
+    ```
+    """
+    p = group_dir / _FORCE_TRIGGER_FILE
+    if not p.is_file():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:
+        print(f"[ALLEX][Showcase] force_trigger.json parse fail: {exc}")
+        return {}
+    if not isinstance(raw, dict):
+        print(f"[ALLEX][Showcase] force_trigger.json must be a JSON object, got {type(raw).__name__}")
+        return {}
+    out = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and k.startswith("_"):
+            continue   # _notes 등 메타 키 무시
+        out[k] = v
+    return out
 
 _EXT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _TRAJECTORY_DIR = _EXT_ROOT / "trajectory"
@@ -287,6 +322,9 @@ class ShowcaseReplayControls:
             if p is not None:
                 plotters.append(p)
 
+        # force_trigger.json (선택) — manual gating annotation. 없으면 빈 dict.
+        force_triggers = _load_force_triggers(_TRAJECTORY_DIR / group)
+
         try:
             replayer = CsvReplayer(
                 reader_main=reader_main,
@@ -295,6 +333,7 @@ class ShowcaseReplayControls:
                 visualizer=viz,
                 main_source=main_src,
                 plotters=plotters,
+                force_triggers=force_triggers,
             )
         except Exception as exc:
             self._set_status(f"Status: replayer init failed: {exc}")
@@ -316,9 +355,10 @@ class ShowcaseReplayControls:
         replayer.start()
 
         sec_tag = "none" if reader_sec is None else f"{'real' if main_src == 'sim' else 'sim'}"
+        trig_tag = f", triggers={len(force_triggers)}ch" if force_triggers else ""
         self._set_status(
             f"Status: Playing main={main_src} ({reader_main.duration_s:.2f}s, "
-            f"sec={sec_tag})"
+            f"sec={sec_tag}{trig_tag})"
         )
 
     def _on_use_sim_cp_change(self, model) -> None:

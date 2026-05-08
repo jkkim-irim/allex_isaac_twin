@@ -9,10 +9,10 @@
   "torque": {
     "_doc": "torque ring scale = clip(|τ|*gain, min_scale, max_scale). gain 은 group 별 override; ring_offset_along_axis 는 USD ring prim 을 joint 회전축 방향으로 mm 단위 미세 이동. 없는 joint 는 0.0.",
     "gain_default":  0.1,
-    "gain_shoulder": 0.03,
-    "gain_elbow":    0.02,
-    "gain_wrist":    0.05,
-    "gain_finger":   0.2,
+    "gain_shoulder": 0.05,
+    "gain_elbow":    0.06,
+    "gain_wrist":    0.08,
+    "gain_finger":   0.25,
     "min_scale": 0.03,
     "max_scale": 3.0,
     "ring_offset_along_axis": {
@@ -29,10 +29,10 @@
 
   "force": {
     "_doc": "force arrow scale = clip(|F|*gain, min_scale, max_scale). hide_below 미만이면 화살표 prim 을 visible=false 로.",
-    "gain": 0.3,
+    "gain": 2.0,
     "min_scale": -60.0,
     "max_scale":  60.0,
-    "hide_below": 0.005
+    "hide_below": 2.0
   },
 
   "prim_names": {

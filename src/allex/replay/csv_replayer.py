@@ -31,18 +31,28 @@ logger = logging.getLogger("allex.replay.csv")
 
 _ZERO_VEC_EPS = 1e-6
 
-# Sim active channel → real ext_force topic_id routing.
-# motion 별 demo 시나리오 매핑 (요구 사항 기반):
+# Sim 채널 → real ext_force topic_id 매핑. **fallback 게이트 전용** (sim CSV 가 있고
+# trigger 도 없을 때, 어떤 sim 채널의 active 가 어떤 real topic 의 visibility 를 켤지).
+# trigger 게이트는 이 dict 와 무관하게 topic_id 직접 매칭 (force_trigger.json 참조).
+#
+# motion 별 demo 시나리오 매핑:
 #   Motion 1: 왼팔↔오른손등 (sim pair `L_Elbow__R_Palm_Back`) → real `arm_r`
 #   Motion 2: 오른팔↔왼손등 (sim pair `L_Palm_Back__R_Elbow`) → real `arm_l`
 #   Motion 3: 양손 clasp     (sim aggregate `R_Palm_Net_Force`)  → real `arm_r`
-# value = (force_topic_id, contact_pos_topic_id) — 둘 다 real CSV 의 ext_force /
-# contact_pos topic_id (ShowcaseReader.topic_force_vec / topic_contact_pos 키).
+# value = (force_topic_id, contact_pos_topic_id) — 둘 다 real CSV 의 topic_id.
 SIM_TO_REAL_FORCE_ROUTE: dict = {
     "L_Elbow__R_Palm_Back": ("arm_r", "arm_r"),
     "L_Palm_Back__R_Elbow": ("arm_l", "arm_l"),
     "R_Palm_Net_Force":     ("arm_r", "arm_r"),
 }
+
+# Reverse map: force_topic_id → 그 topic 을 게이트하는 sim 채널 리스트.
+# 같은 topic 이 여러 motion 에 쓰일 수 있어 list (예: arm_r 은 motion 1·3 둘 다).
+# trigger 가 없을 때 fallback 게이트 계산용 — "이 topic 을 게이트하는 sim 채널 중 하나라도
+# active 이면 visible".
+_FORCE_TOPIC_TO_SIM_CHANNELS: dict = {}
+for _sim_ch, (_force_id, _cpos_id) in SIM_TO_REAL_FORCE_ROUTE.items():
+    _FORCE_TOPIC_TO_SIM_CHANNELS.setdefault(_force_id, []).append(_sim_ch)
 
 # Sim 채널 magnitude 가 이 이상이면 "active" — real 화살표 visible 게이트.
 # pair_force_vec 의 |F| 또는 aggregate 의 |mag| 기준. 1 mN 이상이면 contact 발생
@@ -103,6 +113,7 @@ class CsvReplayer:
         *,
         main_source: str,
         plotters: Optional[list] = None,
+        force_triggers: Optional[dict] = None,
     ):
         if reader_main is None:
             raise ValueError("reader_main is required")
@@ -116,6 +127,62 @@ class CsvReplayer:
         self._viz = visualizer
         self._main_src = ms
         self._sec_src = _other_source(ms)
+
+        # Real force visualization 의 manual gate annotation.
+        # JSON key 는 **CSV 의 ext_force_<topic_id>_{x,y,z} 컬럼 prefix 와 일치**:
+        #   "ext_force_arm_r": [[t_on, t_off], ...]
+        # (CSV header 보고 그 force 의 컬럼 prefix 를 그대로 키로 씀. 임의로 추가된
+        # 새 ext_force topic 도 같은 패턴이면 자동 인식.)
+        # 시간은 real CSV 'time' 컬럼 기준 (real_reader.t[idx] - real_reader.t[0]).
+        # 내부적으론 prefix 떼고 topic_id (showcase_reader 의 topic_force_vec 키) 로 저장.
+        # topic entry 있으면 trigger ranges 로 게이팅 (sim 없이도 동작).
+        # 없으면 SIM_TO_REAL_FORCE_ROUTE 역방향으로 sim |F|>eps fallback gate.
+        # 둘 다 없으면 그 topic 은 안 그림. force_trigger.json 에서 로드 (UI).
+        self._force_triggers: dict = {}
+        if force_triggers:
+            for raw_key, ranges in force_triggers.items():
+                if not isinstance(raw_key, str):
+                    continue
+                # 'ext_force_<id>' prefix 만 인식 — CSV 의 ext_force_<id>_x/y/z 컬럼과 매칭.
+                # 다른 prefix (force_vec_*, force_aggregate_*) 는 추후 확장 여지로 일단 무시.
+                if not raw_key.startswith("ext_force_"):
+                    logger.warning(
+                        f"[replay] force_trigger key {raw_key!r} 은 'ext_force_<topic_id>' "
+                        f"형태여야 합니다 (CSV 컬럼 prefix 와 일치). skip."
+                    )
+                    continue
+                topic_id = raw_key[len("ext_force_"):]
+                if not topic_id:
+                    logger.warning(f"[replay] force_trigger key {raw_key!r}: topic_id 가 비어있음. skip.")
+                    continue
+                if not isinstance(ranges, (list, tuple)):
+                    logger.warning(
+                        f"[replay] force_trigger '{raw_key}': value must be list of "
+                        f"[t_on, t_off] pairs; got {type(ranges).__name__}"
+                    )
+                    continue
+                clean: list[tuple[float, float]] = []
+                for r in ranges:
+                    if (not isinstance(r, (list, tuple))) or len(r) != 2:
+                        logger.warning(f"[replay] force_trigger '{raw_key}': bad range {r!r}, skip")
+                        continue
+                    try:
+                        a, b = float(r[0]), float(r[1])
+                    except (TypeError, ValueError):
+                        logger.warning(f"[replay] force_trigger '{raw_key}': non-numeric range {r!r}, skip")
+                        continue
+                    if not (a < b):
+                        logger.warning(f"[replay] force_trigger '{raw_key}': t_on>=t_off in {r!r}, skip")
+                        continue
+                    clean.append((a, b))
+                if clean:
+                    clean.sort()
+                    self._force_triggers[topic_id] = clean
+            if self._force_triggers:
+                logger.info(
+                    f"[replay] force_triggers loaded (topic_id basis): "
+                    + ", ".join(f"{k}({len(v)} range)" for k, v in self._force_triggers.items())
+                )
         # TorquePlotter 인스턴스(들). plot 도 CSV 값을 보여주려면 sim tau / real dict
         # override 를 매 step 흘려야 함.
         self._plotters = list(plotters) if plotters else []
@@ -479,6 +546,7 @@ class CsvReplayer:
                 logger.warning(f"[replay] export CSV flush warn: {exc}")
         # USDRT stage 캐시 해제 — 다음 start() 가 새 stage 로 attach 하도록.
         self._rt_stage = None
+
         logger.info("[replay] stopped")
 
     def is_self_ticking(self) -> bool:
@@ -596,12 +664,18 @@ class CsvReplayer:
                         logger.debug(f"[replay] push_external_torque sec warn: {exc}")
                     break
 
-        # 4.5) Real force vectors → "real" channel. sim active channel 기반 routing
-        # (SIM_TO_REAL_FORCE_ROUTE). sim/real 둘 다 로드돼야 routing 가능.
+        # 4.5) Real force vectors → "real" channel. SIM_TO_REAL_FORCE_ROUTE 매핑
+        # 사용. 게이팅 우선순위:
+        #   1) force_triggers 에 채널이 있으면 → 시간 범위로 on/off (sim 없이도 동작)
+        #   2) 없으면 sim |F|>eps active gate (sim_reader 필요)
+        #   3) 둘 다 없으면 해당 채널 skip
         real_reader, real_idx = self._reader_idx_for("real", idx_main, sec_idx)
-        if (sim_reader is not None and sim_idx is not None
-                and real_reader is not None and real_idx is not None):
-            self._push_real_force_routed(sim_reader, sim_idx, real_reader, real_idx)
+        if real_reader is not None and real_idx is not None:
+            need_routing = bool(self._force_triggers) or (
+                sim_reader is not None and sim_idx is not None
+            )
+            if need_routing:
+                self._push_real_force_routed(sim_reader, sim_idx, real_reader, real_idx)
 
         # 5) CSV 에 없는 follower (DIP/IP) ring 은 0 push → base_scale 거대값 → floor.
         if self._unpushed_torque_joints:
@@ -636,6 +710,10 @@ class CsvReplayer:
             pass
 
         # 1) 현재 articulation 상태로 init — 매핑 안 된 joint 는 그대로 유지.
+        # NaN guard: 이전 physics step 이 explode 해서 joint_q 에 NaN 이 들어오면 여기서
+        # cur_np 가 NaN. pos_plan + follower_plan 이 모든 dof 를 덮으면 다음 단계에서
+        # 전부 overwrite 되지만, 안 그런 경우엔 NaN 이 q_buf 에 그대로 남고 set_joint_positions
+        # 통해 다시 NaN feedback. 진단용 카운트 + 0 fallback 으로 끊어 둔다.
         cur_t = None
         try:
             cur_t = articulation.get_joint_positions()
@@ -645,6 +723,14 @@ class CsvReplayer:
                 else:
                     cur_np = np.asarray(cur_t)
                 cur_np = np.asarray(cur_np, dtype=np.float32).reshape(-1)
+                if not np.all(np.isfinite(cur_np)):
+                    n_bad = int(np.sum(~np.isfinite(cur_np)))
+                    if self._step_count % 60 == 0:
+                        logger.warning(
+                            f"[replay] get_joint_positions returned {n_bad} non-finite "
+                            f"value(s) — physics likely exploded; sanitizing to 0.0"
+                        )
+                    cur_np = np.nan_to_num(cur_np, nan=0.0, posinf=0.0, neginf=0.0)
                 n = min(cur_np.size, self._num_dof)
                 self._q_buf[:n] = cur_np[:n]
         except Exception as exc:
@@ -706,6 +792,25 @@ class CsvReplayer:
                 import traceback
                 tb = traceback.format_exc()
                 logger.warning(f"[replay] set_joint_velocities warn: {exc}\n{tb}")
+
+        # Newton 의 set_dof_positions 는 state.joint_q 만 갱신하고 state.body_q
+        # (link world transform — Fabric worldMatrix 통해 viewport 가 읽음) 는 다음
+        # physics step 까지 stale. clasp 등 mesh 자가-간섭이 큰 자세에서 contact
+        # 솔버가 한 step body_q 를 NaN/extreme 으로 망가뜨리면, 그 후 set_joint_positions
+        # 호출이 아무리 와도 joint_q 만 깨끗할 뿐 body_q 는 망가진 채 — viewport 에는
+        # base_link 외 전 링크가 사라진 것처럼 보인다.
+        # eval_fk 로 매 frame joint_q → body_q 재계산해서 viewport 가 항상 깨끗한
+        # kinematic 결과를 보도록 강제. 다음 physics step 이 다시 덮어쓰지만, 그 출력이
+        # 망가져도 다음 render tick 의 eval_fk 가 회복한다.
+        try:
+            inner = getattr(view, "_physics_view", None)
+            if inner is not None:
+                from newton import eval_fk
+                state = inner._newton_stage.state_0
+                eval_fk(inner._model, state.joint_q, state.joint_qd, state)
+        except Exception as exc:
+            if self._step_count % 200 == 0:
+                logger.debug(f"[replay] eval_fk after kinematic write warn: {exc}")
 
     # ------------------------------------------------------------------
     # Contact-local CSV export (debug)
@@ -1091,64 +1196,87 @@ class CsvReplayer:
                    -float(normal[2]) * mag)
             self._set_or_add(viz, tag, "sim", origin, vec)
 
-    def _push_real_force_routed(self, sim_reader: ShowcaseReader, sim_idx: int,
+    def _push_real_force_routed(self, sim_reader: Optional[ShowcaseReader],
+                                sim_idx: Optional[int],
                                 real_reader: ShowcaseReader, real_idx: int) -> None:
-        """Sim active channel 기반으로 real ext_force topic 을 매핑해서 push.
+        """real CSV 의 모든 ext_force topic 을 'real' 채널에 push (topic_id 1 prim).
 
-        SIM_TO_REAL_FORCE_ROUTE 의 sim 채널이 active (|F| > eps) 면, 매핑된
-        real topic 의 ext_force / contact_pos 를 sim 채널과 같은 이름의 'real'
-        prim 에 푸시. 비활성이면 hide. 같은 이름을 쓰는 덕분에 force visualizer
-        의 mode (real/sim/both/off) 토글이 source 별로 그대로 적용됨.
+        Iteration: ``real_reader.topic_force_vec.keys()`` — CSV 에 실제 존재하는 모든
+        topic_id 순회. 임의로 추가된 새 ext_force_<id>_* 컬럼도 자동 인식.
+
+        Gate 결정 순서 (topic 별 독립):
+          1) self._force_triggers[topic_id] 있음 → 시간 범위 in/out 으로 on/off
+             (sim_reader 없어도 동작 — real-only replay 가능)
+          2) sim_reader 있음 + topic 이 SIM_TO_REAL_FORCE_ROUTE 의 target 으로 등장
+             → 매핑된 sim 채널 중 하나라도 |F|>eps 면 active (기존 fallback)
+          3) 둘 다 없음 → skip (안 그림)
+
+        Prim name = topic_id (예 "arm_r"). source dir 가 sim/real 로 분리되므로
+        sim 쪽 prim (sim_channel 이름) 과 충돌 없음. visualizer mode (real/sim/both/off)
+        토글은 source 단위로 그대로 동작.
         """
         viz = self._viz
         if viz is None:
             return
 
-        # chest_origin → world matrix — real CSV 의 force/pos 는 chest frame.
         chest_mat = self._get_chest_world_matrix()
         if chest_mat is None:
             return
 
-        for sim_channel, route in SIM_TO_REAL_FORCE_ROUTE.items():
-            force_id, cpos_id = route
+        # trigger 시간 비교용 — real CSV 첫 sample 을 0 으로 한 상대시간 (사용자가
+        # CSV/JSON 에서 직접 보는 값과 동일).
+        current_t_rel = float(real_reader.t[real_idx] - real_reader.t[0])
 
-            # Sim 채널 magnitude → active 판정.
-            if sim_channel in sim_reader.pair_force_vec:
-                v = sim_reader.pair_force_vec[sim_channel][sim_idx]
-                sim_mag = float((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5)
-            elif sim_channel in sim_reader.aggregate:
-                sim_mag = abs(float(sim_reader.aggregate[sim_channel]["mag"][sim_idx]))
+        for topic_id, force_arr in real_reader.topic_force_vec.items():
+            # ----- gate 결정 -----
+            triggers = self._force_triggers.get(topic_id)
+            if triggers is not None:
+                active = any(t_on <= current_t_rel <= t_off for t_on, t_off in triggers)
+                active_sim_channel: Optional[str] = None
+            elif sim_reader is not None and sim_idx is not None:
+                # fallback: 이 topic 을 게이트하는 sim 채널 중 active 하나라도 있으면 on.
+                sim_channels = _FORCE_TOPIC_TO_SIM_CHANNELS.get(topic_id)
+                if not sim_channels:
+                    # routing dict 에 매핑 없음 + trigger 도 없음 → skip
+                    continue
+                active = False
+                active_sim_channel = None
+                for sim_ch in sim_channels:
+                    if sim_ch in sim_reader.pair_force_vec:
+                        v = sim_reader.pair_force_vec[sim_ch][sim_idx]
+                        mag = float((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5)
+                    elif sim_ch in sim_reader.aggregate:
+                        mag = abs(float(sim_reader.aggregate[sim_ch]["mag"][sim_idx]))
+                    else:
+                        continue
+                    if mag > _SIM_ACTIVE_FORCE_EPS:
+                        active = True
+                        active_sim_channel = sim_ch
+                        break
             else:
-                # Sim CSV 에 이 채널이 없으면 게이트 신호 부재 → real 도 안 그림.
-                continue
-
-            active = sim_mag > _SIM_ACTIVE_FORCE_EPS
-
-            force_arr = real_reader.topic_force_vec.get(force_id)
-            if force_arr is None:
                 continue
 
             if not active:
-                # Hide — _set_force_prim_visible 가 mode 무관 항상 적용 (force=0).
-                self._set_force_prim_visible(viz, sim_channel, "real", False)
+                self._set_force_prim_visible(viz, topic_id, "real", False)
                 continue
 
             f_chest = force_arr[real_idx]
             f_world = self._xform_vec_chest_to_world(f_chest, chest_mat)
 
-            # Origin: 기본은 real CSV 의 contact_pos (chest→world 변환), 모드 on 이면
-            # sim 의 contact_pos (이미 world frame) 로 대체. sim 채널이 pair 인지
-            # aggregate 인지에 따라 dict 분기.
+            # Origin: real CSV 의 contact_pos (chest→world). sim_contact_pos 모드 ON 이고
+            # 현재 게이트가 sim-active 였으면 그 sim 채널의 contact_pos (world frame) 로 대체.
+            # trigger 게이트 (sim 무관) 일 땐 sim contact_pos 옵션 자동 무효화.
             p_world = None
-            if self._real_force_use_sim_contact_pos:
-                if sim_channel in sim_reader.pair_contact_pos:
-                    sp = sim_reader.pair_contact_pos[sim_channel][sim_idx]
+            if (self._real_force_use_sim_contact_pos and sim_reader is not None
+                    and sim_idx is not None and active_sim_channel is not None):
+                if active_sim_channel in sim_reader.pair_contact_pos:
+                    sp = sim_reader.pair_contact_pos[active_sim_channel][sim_idx]
                     p_world = (float(sp[0]), float(sp[1]), float(sp[2]))
-                elif sim_channel in sim_reader.aggregate:
-                    so = sim_reader.aggregate[sim_channel]["origin"][sim_idx]
+                elif active_sim_channel in sim_reader.aggregate:
+                    so = sim_reader.aggregate[active_sim_channel]["origin"][sim_idx]
                     p_world = (float(so[0]), float(so[1]), float(so[2]))
             if p_world is None:
-                cpos_arr = real_reader.topic_contact_pos.get(cpos_id)
+                cpos_arr = real_reader.topic_contact_pos.get(topic_id)
                 if cpos_arr is not None:
                     p_chest = cpos_arr[real_idx]
                     p_world = self._xform_pt_chest_to_world(p_chest, chest_mat)
@@ -1157,7 +1285,7 @@ class CsvReplayer:
                                float(chest_mat[3][1]),
                                float(chest_mat[3][2]))
 
-            self._set_or_add(viz, sim_channel, "real", p_world, f_world)
+            self._set_or_add(viz, topic_id, "real", p_world, f_world)
 
     def _set_or_add(self, viz, name: str, source: str, origin, vec) -> None:
         """``set_custom_force_vector`` 호출. 첫 호출이면 ``add_custom_force_vector``."""
@@ -1201,19 +1329,16 @@ class CsvReplayer:
                 logger.warning(f"[replay] add_custom_force_vector raised: {exc}\n{traceback.format_exc()}")
             return
 
-        # force ≈ 0 이면 prim hide — set_custom_force_vector 가 _apply_force_vector(mag=0)
-        # 로 shaft scale Z=0 (collapse) + head translate Z=-L_base (mesh 망가짐) 만들어서
-        # collapsed 화살표가 visible 인 채 남는 걸 방지.
-        mag = (fx * fx + fy * fy + fz * fz) ** 0.5
-        zero_force = mag < _ZERO_VEC_EPS
+        # Visibility / scale 결정은 visualizer 에 일임 — visualizer 의 _apply_force_scale 가
+        # FORCE_VEC_HIDE_BELOW 임계 기반으로 visibility 토글 + 캐시 동기화. 여기서
+        # 직접 _set_force_prim_visible 박으면 그 임계 hide 를 덮어쓰거나 (forced True),
+        # 캐시를 stale 로 만들어서 (forced False) hide_below 가 무력화됨.
+        # mag=0 이라도 set_custom_force_vector(vector=(0,0,0)) 호출하면 s=0 < hide_below
+        # 으로 자동 hide 됨 (collapsed mesh 가 visible 인 채로 남지 않음).
         try:
-            if zero_force:
-                self._set_force_prim_visible(viz, name, source, False)
-            else:
-                self._set_force_prim_visible(viz, name, source, True)
-                viz.set_custom_force_vector(
-                    name, position=(ox, oy, oz), vector=(fx, fy, fz), source=source,
-                )
+            viz.set_custom_force_vector(
+                name, position=(ox, oy, oz), vector=(fx, fy, fz), source=source,
+            )
         except Exception as exc:
             if self._step_count % 200 == 0:
                 logger.debug(f"[replay] set_custom_force_vector warn: {exc}")
@@ -1270,8 +1395,21 @@ class CsvReplayer:
                         imageable.MakeVisible()
                     else:
                         imageable.MakeInvisible()
-                return
-            set_vis(prim, visible)
+            else:
+                set_vis(prim, visible)
+
+            # _apply_force_scale 가 관리하는 threshold-hide cache 와 sync.
+            # 이 helper 가 외부에서 visibility 를 강제로 토글하면 그 cache 가
+            # stale 이 되어, 다음 _apply_force_scale 호출이 transition 을 못
+            # 잡아 USD 가 직전 외부 write 상태에 stuck 될 수 있다 (hide_below
+            # 무력화의 원인). visible=True → cache=hidden_False, False → True.
+            try:
+                prim_path = prim.GetPath().pathString
+                cache = getattr(viz, "_threshold_hide_state", None)
+                if cache is not None:
+                    cache[prim_path] = (not visible)
+            except Exception:
+                pass
         except Exception as exc:
             logger.debug(f"[replay] per-prim visibility toggle warn: {exc}")
 

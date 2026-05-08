@@ -463,6 +463,7 @@ class ForceTorqueVisualizer:
         color=None,
         parent_path: str | None = None,
         source: str = "user",
+        thin: bool = False,
     ):
         """임의 위치에 force vector 화살표 prim 을 새로 만든다.
 
@@ -503,11 +504,15 @@ class ForceTorqueVisualizer:
             logger.warning("[viz] add_custom_force_vector: stage unavailable")
             return None
 
-        # custom force vector 는 thick 버전 mesh 사용 (12 link auto force_viz 와 분리).
-        # 없으면 fallback 으로 기본 force_vec.usda 사용.
-        usd_path = (FORCE_VIZ_CUSTOM_USD_PATH
-                    if os.path.exists(FORCE_VIZ_CUSTOM_USD_PATH)
-                    else FORCE_VIZ_USD_PATH)
+        # custom force vector mesh 선택:
+        #  - thin=True  → 기본 force_vec.usda (radius 3mm, 작은 contact 용 — 예: 손가락)
+        #  - thin=False → force_vec_thick.usda (radius 6mm, palm/aggregate 등 큰 force 용)
+        # 둘 다 없으면 남는 쪽으로 fallback.
+        if thin:
+            primary, secondary = FORCE_VIZ_USD_PATH, FORCE_VIZ_CUSTOM_USD_PATH
+        else:
+            primary, secondary = FORCE_VIZ_CUSTOM_USD_PATH, FORCE_VIZ_USD_PATH
+        usd_path = primary if os.path.exists(primary) else secondary
         if not os.path.exists(usd_path):
             logger.warning(f"[viz] force vec asset missing: {usd_path}")
             return None
