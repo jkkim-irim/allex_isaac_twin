@@ -3,8 +3,9 @@
 Run:
     python tools/regen_joint_config.py
 
-The hand-managed ``ui`` and ``drive_gains`` sections of the existing JSON are
-preserved across regeneration; only MJCF-derived keys are overwritten.
+The hand-managed ``ui``, ``drive_gains``, and ``nominal_motor_gains`` sections
+of the existing JSON are preserved across regeneration; only MJCF-derived keys
+are overwritten.
 """
 from __future__ import annotations
 
@@ -16,7 +17,15 @@ from pathlib import Path
 
 EXT_ROOT = Path(__file__).resolve().parent.parent
 MJCF_PATH = EXT_ROOT / "asset" / "ALLEX" / "mjcf" / "ALLEX.xml"
-OUT_PATH = EXT_ROOT / "src" / "config" / "joint_config.json"
+OUT_PATH = EXT_ROOT / "src" / "allex" / "config" / "joint_config.json"
+
+# Joints that exist in the MJCF kinematic chain but are passive — they appear
+# as ``joint2`` (master) in equality constraints so the regular follower
+# detection misses them, yet they are not user-controllable DOFs. Listed by
+# name; excluded from ``active_joints`` together with equality followers.
+PHANTOM_JOINTS: set[str] = {
+    "Waist_Pitch_Dummy_Joint",  # mirrored to Waist_Upper_Pitch via Lower follower
+}
 
 
 def _parse_polycoef(s: str) -> list[float]:
@@ -57,9 +66,11 @@ def regenerate(mjcf_path: Path, out_path: Path) -> dict:
 
     follower_set = {e["follower"] for e in equality if e["active"]}
     follower_list = sorted(follower_set)
+    phantom_present = sorted(PHANTOM_JOINTS & set(joints))
+    inactive_set = follower_set | set(phantom_present)
 
     joint_names = {str(i): n for i, n in enumerate(joints)}
-    active_indices = [str(i) for i, n in enumerate(joints) if n not in follower_set]
+    active_indices = [str(i) for i, n in enumerate(joints) if n not in inactive_set]
 
     cfg = {
         "notes": "Auto-generated from asset/ALLEX/mjcf/ALLEX.xml by tools/regen_joint_config.py. Do not edit by hand (except the 'ui' and 'drive_gains' sections).",
@@ -68,6 +79,7 @@ def regenerate(mjcf_path: Path, out_path: Path) -> dict:
         "joint_names": joint_names,
         "active_joints": active_indices,
         "follower_joints": follower_list,
+        "phantom_joints": phantom_present,
         "equality_constraints": equality,
         "coupled_joints": {},
     }
@@ -79,7 +91,7 @@ def regenerate(mjcf_path: Path, out_path: Path) -> dict:
         except Exception as exc:
             print(f"WARN: could not read existing {out_path}: {exc}", file=sys.stderr)
             existing = {}
-        for key in ("drive_gains", "ui"):
+        for key in ("drive_gains", "nominal_motor_gains", "ui"):
             if key in existing:
                 cfg[key] = existing[key]
 
@@ -97,6 +109,7 @@ def main() -> int:
     print(f"  total_joints: {cfg['total_joints']}")
     print(f"  active: {len(cfg['active_joints'])}")
     print(f"  followers: {len(cfg['follower_joints'])}")
+    print(f"  phantoms: {len(cfg['phantom_joints'])}")
     print(f"  equality_constraints: {len(cfg['equality_constraints'])}")
     return 0
 
