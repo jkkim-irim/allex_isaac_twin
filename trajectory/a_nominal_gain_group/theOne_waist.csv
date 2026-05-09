@@ -1,0 +1,2 @@
+duration, joint_1, joint_2, K_pos_1, K_pos_2, K_vel_1, K_vel_2, trq_lim_1, trq_lim_2
+    20.0,     0.0,     0.0,     3.0,     1.0,    0.01,    0.10,       0.5,       1.0
