@@ -2,6 +2,23 @@
 
 ALLEX 휴머노이드 로봇의 Real2Sim 디지털 트윈 확장(Extension). Isaac Sim 내부에서 Newton(MuJoCo Warp) 물리 엔진으로 ALLEX를 구동하며, **ROS2 실시간 미러링**과 **CSV 기반 궤적 재생(Traj Studio)** 두 가지 경로를 지원합니다.
 
+## 한눈에 보기
+
+```
+┌─ 실 로봇 (ROS2 도메인 77) ─┐                ┌─ Isaac Sim 6.0 + Newton(MuJoCo Warp) ─┐
+│  joint_positions_deg topics │  ──── 200 Hz ───▶│  ALLEX USD (49 active joints)         │
+│  joint_torque topics        │                  │  Pose-mirror or CSV Traj playback     │
+└─────────────────────────────┘                  │  PD gain · torque-limit live ramp     │
+                                                 │  Auto gravity compensation (mjc)      │
+        trajectory/<group>/*.csv  ───────────▶   │  Showcase CSV logger (rosbag-aligned) │
+                                                 └───────────────────────────────────────┘
+```
+
+세 가지 모드:
+1. **ROS2 미러** — 실 로봇 토픽 → sim 자세 실시간 추종
+2. **Traj Studio** — `trajectory/<그룹>/*.csv` 의 via point + PD 이벤트 재생
+3. **Hysteresis 시나리오** — 별도 윈도우로 게인 hysteresis 측정/검증
+
 ## 요구사항
 
 - NVIDIA Isaac Sim **6.0.0** (conda env 내 pip 설치, Python 3.12)
@@ -12,6 +29,13 @@ ALLEX 휴머노이드 로봇의 Real2Sim 디지털 트윈 확장(Extension). Isa
 
 ## 설치
 
+> **Git LFS 가 필요합니다** — `asset/ALLEX/*.usd` (45 MB ×2) 와 mesh STL 들이 LFS 로 관리됩니다.
+> ```bash
+> sudo apt install git-lfs   # Ubuntu/Debian (또는 brew install git-lfs)
+> git lfs install            # ~/.gitconfig 에 filter 등록 (1회)
+> ```
+> LFS 미설치 상태로 clone 하면 USD/STL 이 ~130 B pointer 텍스트로 받아져 로드 실패.
+
 1. conda env (Python 3.12)에 Isaac Sim **6.0.0** 설치:
 
    ```bash
@@ -20,13 +44,29 @@ ALLEX 휴머노이드 로봇의 Real2Sim 디지털 트윈 확장(Extension). Isa
    pip install isaacsim==6.0.0.0 --extra-index-url https://pypi.nvidia.com
    ```
 
-2. 본 폴더를 Isaac Sim 의 `extsUser/` 하위로 복사:
+2. 본 리포를 Isaac Sim 의 `extsUser/` 하위로 clone:
 
-   ```
-   $CONDA_PREFIX/lib/python3.12/site-packages/isaacsim/extsUser/allex_isaac_twin/
+   ```bash
+   cd "$CONDA_PREFIX/lib/python3.12/site-packages/isaacsim/extsUser/"
+   git clone <repo-url> allex_isaac_twin
+   cd allex_isaac_twin
+   git lfs pull   # USD / STL 실데이터 받기 (clone 시 자동 안 받히면)
    ```
 
 3. Isaac Sim 실행 → `Window > Extensions` → `ALLEX` 검색 후 활성화
+
+## Quickstart (5 분 시나리오)
+
+ROS2 / 실 로봇 연결 없이 **CSV 궤적 재생** 만으로 동작 확인:
+
+1. Isaac Sim 부팅 후 ALLEX extension 활성화 → 좌측에 4 개 패널 표시
+2. **World Controls 패널 → LOAD** — ALLEX USD 가 stage 에 로드됨
+3. **Traj Studio 패널** → 그룹 드롭다운에서 `demo1_dynamic_group` 선택 → **Run**
+4. 재생 시작 — 로봇이 zero pose 에서 "팔짱" 자세 ramp 후 다양한 모션 시연
+5. 재생 종료 또는 **Stop** 시 `data/showcase/showcase_sim_data_<timestamp>/` 에 자동 CSV 저장:
+   - `joint_position.csv`, `joint_torque.csv`, `kp_gain.csv`, `kd_gain.csv`, `passive_torque.csv`, `torque_limit.csv`
+
+`demo1_dynamic_group` 의 trajectory CSV 들은 실 로봇에서 측정된 PD 게인/토크 리밋 이벤트를 포함 — sim 측에서 그대로 재현되며 실측 rosbag 과 직접 비교 가능 (1 kHz 격자).
 
 ### 편의용 `cdisaac` 별칭
 
@@ -188,6 +228,18 @@ allex_isaac_twin/
 - 총 관절 수: 60 (49 active + 11 coupled)
 - Coupled joints: master 관절 비율로 자동 계산 (`src/allex/config/joint_config.json::coupled_joints`)
 - 스폰 위치: `(0, 0, 0.685)`
+
+## Troubleshooting (자주 막히는 곳)
+
+| 증상 | 원인 / 해결 |
+|---|---|
+| Isaac Sim 시작 시 코어 덤프 | shell 에서 `source /opt/ros/*/setup.bash` 한 적 있음. 새 터미널 열고 conda env 만 활성화 후 재실행. |
+| Extension Manager 에 ALLEX 가 안 보임 | extsUser 경로 확인 — `$CONDA_PREFIX/lib/python3.12/site-packages/isaacsim/extsUser/allex_isaac_twin/` 정확. |
+| 로드 시 USD 텍스트 / mesh 깨짐 | Git LFS 미설치 또는 `git lfs pull` 안 한 상태. 위 설치 단계 참조. |
+| 코드 수정 후 반영 안 됨 | Extension 비활성화 → 활성화 토글. 안 되면 `__pycache__` 지우고 Isaac Sim 재기동. |
+| RUN 후 진동 / 스냅 발생 | trajectory CSV 의 K_pos / K_vel 값이 너무 stiff / 너무 underdamped. via 행 의 게인 컬럼 확인. |
+| ROS2 토픽 안 받히면 | Domain ID 일치 (기본 77). RMW = `rmw_cyclonedds_cpp` 일치. UI ROS2 패널의 Subscribe 버튼 눌렀는지. |
+| Showcase CSV 가 안 생김 | `src/allex/config/showcase_logger_config.json::logged_groups` 에 그룹 등록 안 됨. 또는 Stop 누르기 전에 Reset 함. |
 
 ## 최근 변경사항
 
