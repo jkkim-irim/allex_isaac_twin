@@ -9,7 +9,6 @@ UI 헬퍼 (`UIComponentFactory`, `ButtonStyleManager`) 와 데이터 클래스
 도메인 모듈 (`utils/contact_force_viz.py`) 이 순환 의존 없이 import 가능합니다.
 
 UI 가 아닌 도메인 서브시스템:
-- `utils/showcase_logger.py` (CSV 로깅, 623 LOC)
 - `utils/contact_force_viz.py` (충돌력 시각화, 547 LOC)
 는 유지보수 격리 차원에서 utils/ 에 분리되어 있습니다.
 """
@@ -30,7 +29,6 @@ from .ros2 import ROS2IntegratedManager
 from .scenario import ALLEXDigitalTwin
 from .trajectory_generate import TrajectoryPlayer
 from .utils.contact_force_viz import ContactForceVisualizer
-from .utils.showcase_logger import ShowcaseDataLogger
 from .utils.sim_settings_utils import get_world_settings
 from .utils.ui_settings_utils import (
     ButtonStyleManager,
@@ -474,7 +472,10 @@ class TrajStudioControls:
             return None, None
         return scenario, articulation
 
-    def _query_physics_hz(self, default: float = 200.0) -> float:
+    def _query_physics_hz(self) -> float:
+        """Live Newton stage 의 physics_frequency 우선, 실패 시
+        ``physics_config.json::world.physics_hz`` 폴백.
+        """
         try:
             from isaacsim.physics.newton import acquire_stage
             st = acquire_stage()
@@ -483,8 +484,9 @@ class TrajStudioControls:
                 if f and f > 0:
                     return float(f)
         except Exception as exc:
-            print(f"[ALLEX][Traj] physics_frequency query failed: {exc}; using hz={default}")
-        return default
+            print(f"[ALLEX][Traj] physics_frequency query failed: {exc}; falling back to JSON")
+        from .utils.sim_settings_utils import get_physics_hz
+        return get_physics_hz()
 
     # ------------------------------------------------------------------
     # Button callbacks
@@ -525,18 +527,19 @@ class TrajStudioControls:
             f"{len(player.groups_used)} group(s))"
         )
 
-        # Showcase data logger — record per physics step only for groups
-        # listed in `config/showcase_logger_config.json::logged_groups`.
-        logger = getattr(self._ui, "_showcase_logger", None)
-        if logger is not None:
-            from .utils.showcase_logger import is_group_logged
-            if is_group_logged(group):
-                try:
-                    logger.start_recording(articulation, player, physics_dt=1.0 / hz)
-                except Exception as exc:
-                    print(f"[ALLEX][Showcase] start_recording failed: {exc}")
-            else:
-                print(f"[ALLEX][Showcase] group '{group}' not in logged_groups → CSV skipped")
+        # SimStateLogger — Run 버튼 시 항상 시작 (kp/kd/torque 검증용).
+        # demo1_dynamic_group: 처음 ~5 s 가 zero pose 에서 "팔짱" 자세로 ramp.
+        # 4780 = 5000 - 220 step 보정. rosbag 과 sim 의 motion onset 을
+        # cross-correlation (key joints, 0~10s) 한 결과 sim 이 220 ms 앞섬.
+        # → offset 을 220 줄이면 ramp-in 구간이 더 포함되어 motion onset 이
+        #   plot 의 더 오른쪽으로 이동, real 과 1:1 정렬.
+        offset_by_group = {
+            "demo1_dynamic_group": 4780,
+        }
+        scenario.start_sim_state_log(
+            log_every=1,
+            start_offset_steps=offset_by_group.get(group, 0),
+        )
 
     def _on_stop(self) -> None:
         scenario = getattr(self._ui, "_scenario", None)
@@ -545,20 +548,18 @@ class TrajStudioControls:
             self._set_status("Status: nothing to stop")
             return
         player.stop()
-        logger = getattr(self._ui, "_showcase_logger", None)
-        if logger is not None:
-            logger.stop_recording()
+        if scenario is not None:
+            out = scenario.stop_sim_state_log()
+            if out:
+                import os
+                print(f"[ALLEX][SimLog] saved → {os.path.basename(out)}")
         self._set_status("Status: Stopped (holding current target)")
 
     def _on_reset(self) -> None:
         scenario, articulation = self._resolve_articulation()
         if scenario is None:
             return
-        # Reset belongs to a different lifecycle than Run — finalize any active
-        # showcase recording before swapping the player.
-        logger = getattr(self._ui, "_showcase_logger", None)
-        if logger is not None:
-            logger.stop_recording()
+        scenario.stop_sim_state_log()
         hz = self._query_physics_hz()
         num_dof = int(getattr(articulation, "num_dof", 0) or 0)
         if num_dof <= 0:
@@ -673,7 +674,7 @@ class AllExUI:
     창의 lifecycle 도 함께 관리한다.
 
     필드명 `_world_controls`, `_ros2_controls`, `_traj_studio`, `_visualizer`,
-    `_showcase_logger`, `_scenario`, `_timeline` 은 패널들이 `self._ui._scenario`
+    `_scenario`, `_timeline` 은 패널들이 `self._ui._scenario`
     같이 cross-reference 하므로 변경 시 주의.
     """
 
@@ -684,7 +685,6 @@ class AllExUI:
         self._ros2_controls = None
         self._traj_studio = None
         self._visualizer = None
-        self._showcase_logger = None
         self._hysteresis = None
         self._on_init()
 
@@ -695,8 +695,6 @@ class AllExUI:
             self._world_controls = WorldControls(self)
         if self._visualizer is None:
             self._visualizer = VisualizerControls()
-        if self._showcase_logger is None:
-            self._showcase_logger = ShowcaseDataLogger()
 
         if self._ros2_controls is None:
             self._ros2_controls = ROS2Controls(self)
@@ -722,8 +720,6 @@ class AllExUI:
     def on_physics_step(self, step: float):
         if self._visualizer is not None:
             self._visualizer.on_physics_step(step)
-        if self._showcase_logger is not None:
-            self._showcase_logger.on_physics_step(step)
         if self._hysteresis is not None:
             self._hysteresis.on_physics_step(step)
 
@@ -756,7 +752,5 @@ class AllExUI:
         self._traj_studio.cleanup()
         if self._visualizer is not None:
             self._visualizer.cleanup()
-        if self._showcase_logger is not None:
-            self._showcase_logger.cleanup()
         if self._hysteresis is not None:
             self._hysteresis.cleanup()
