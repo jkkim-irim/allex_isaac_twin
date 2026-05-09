@@ -15,3 +15,10 @@ temp/
 data/
 docs/
 *.zip
+
+# Internal working notes — local-only collaboration log between user and LLM agent.
+# Public-facing architecture/decision docs live in README.md / future docs/.
+dvcc/
+
+# Plan files (LLM session artifacts)
+**/.claude/plans/
