@@ -12,10 +12,15 @@ the player enters "finished" state and keeps returning the last frame —
 equivalent to holding the final pose.
 
 Via events (PD stiffness / damping / actuator torque limit changes parsed
-from the CSV side columns) are *ramped* linearly from their pre-event live
-value to the CSV target over a fixed duration (default 1.0s) — never
-applied as an instant step change, which would risk PD discontinuities and
-joint snap.
+from the CSV side columns) are *ramped* with the same per-step additive
+clamp as the real controller: each call advances each DOF's gain or torque
+limit by a fixed joint-domain step value, looked up by joint name from
+``physics_config.json::newton.ramp_step_sizes.joint_step_per_ms``. Those
+values are auto-generated from the real controller's global motor-domain
+``motor_step_per_ms`` (typically 0.001 / ms) by
+``tools/gen_joint_step_sizes.py``. Total ramp duration is therefore
+``ceil(|target - start| / joint_step)`` per element. Player hz is sync'd
+to physics_hz=1000 by the UI, so 1 call = 1 ms.
 """
 from __future__ import annotations
 
@@ -44,17 +49,21 @@ class _Category:
     idx_attr: str       # pre-baked torch index tensor (DOF indices)
     vals_attr: str      # pre-baked torch values tensor (CSV target)
     start_attr: str     # snapshot tensor captured at ramp activation
+    step_attr: str      # per-element joint-domain step bound (torch tensor)
     view_attr: str      # zero-copy torch view over Newton Model array
     model_attr: str     # Newton Model attribute name to view
     toggle_attr: str    # per-instance bool toggle (True = apply category)
 
 
 _CATEGORIES: tuple[_Category, ...] = (
-    _Category("kps",         "kps_idx", "kps_vals", "kps_start",
+    _Category("kps",         "kps_idx", "kps_vals",
+              "kps_start",   "kps_step",
               "_model_kp_view",  "joint_target_ke",    "apply_kps_events"),
-    _Category("kds",         "kds_idx", "kds_vals", "kds_start",
+    _Category("kds",         "kds_idx", "kds_vals",
+              "kds_start",   "kds_step",
               "_model_kd_view",  "joint_target_kd",    "apply_kds_events"),
-    _Category("max_efforts", "eff_idx", "eff_vals", "eff_start",
+    _Category("max_efforts", "eff_idx", "eff_vals",
+              "eff_start",   "eff_step",
               "_model_eff_view", "joint_effort_limit", "apply_eff_events"),
 )
 
@@ -65,11 +74,14 @@ class _ViaEvent:
 
     값은 CSV 원본 단위 그대로 (스케일링 없음). Pre-baked torch tensors are
     materialized at start() so the hot path does no Python-side allocation.
-    Ramp activation snapshots the current model value (start_*); per-step
-    writes interpolate from start → vals over n_ramp steps.
+    Ramp activation snapshots the current model value (start_*) and computes
+    the per-event step count ``n_ramp`` from |target - start| / step_size;
+    per-step writes apply an additive clamp toward target until ``n_ramp``
+    steps elapse, at which point the final write snaps directly to target
+    (absorbs float drift from the ceil-rounded n_ramp).
     """
     t: float                      # via 절대 시간 [s] (dense_base 기준)
-    joint_names: list[str]        # 대상 DOF 이름
+    joint_names: list[str]        # 대상 DOF 이름 (CSV column 순서)
     kps: np.ndarray | None = None
     kds: np.ndarray | None = None
     max_efforts: np.ndarray | None = None
@@ -88,6 +100,11 @@ class _ViaEvent:
     kps_start: object = None
     kds_start: object = None
     eff_start: object = None
+    # Per-element joint-domain step bound tensor (torch, on device, sized like
+    # *_idx). Pre-baked at start() from physics_config.json::joint_step_per_ms.
+    kps_step: object = None
+    kds_step: object = None
+    eff_step: object = None
 
 
 def _row_to_array(row: np.ndarray | None) -> np.ndarray | None:
@@ -111,16 +128,16 @@ class TrajectoryPlayer:
     def __init__(self, csv_dir: Path, articulation, hz: float = 200.0,
                  seed_pose: "np.ndarray | list[float] | None" = None,
                  ramp_s: float = 1.5,
-                 event_ramp_s: float = 1.0):
-        self._init_state(articulation, hz, ramp_s, event_ramp_s,
+                 motor_mirror=None):
+        self._init_state(articulation, hz, ramp_s,
                          csv_dir=Path(csv_dir), seed_pose=seed_pose)
+        self._motor_mirror = motor_mirror
         self._build()
 
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
-    def _init_state(self, articulation, hz: float, ramp_s: float,
-                    event_ramp_s: float, *,
+    def _init_state(self, articulation, hz: float, ramp_s: float, *,
                     csv_dir: Path | None, seed_pose) -> None:
         """Initialize per-instance fields. Shared by __init__ and hold_pose."""
         self._csv_dir = csv_dir
@@ -128,7 +145,16 @@ class TrajectoryPlayer:
         self._hz = float(hz)
         self._seed_pose_override = seed_pose
         self._ramp_s = float(ramp_s)
-        self.event_ramp_s = float(event_ramp_s)
+        # MotorStateMirror reference for set_target / reset_to_nominal events.
+        # __init__ overrides via constructor arg; hold_pose / scenario inject later.
+        self._motor_mirror = None
+
+        # Per-joint joint-domain ramp step table from physics_config.json
+        # (auto-generated by tools/gen_joint_step_sizes.py from motor_step).
+        # Format: {joint_name: {"gain": K_j/ms, "trq": τ_j/ms}}. Loaded at
+        # bake time. Empty dict → no per-joint values; ramp falls back to
+        # 1-step jump.
+        self._joint_step_table: dict[str, dict[str, float]] = {}
 
         self._active = False
         self._finished = False
@@ -181,15 +207,14 @@ class TrajectoryPlayer:
 
     @classmethod
     def hold_pose(cls, articulation, hz: float, target_pose,
-                  ramp_s: float = 3.0,
-                  event_ramp_s: float = 1.0) -> "TrajectoryPlayer":
+                  ramp_s: float = 3.0) -> "TrajectoryPlayer":
         """Build a player that ramps to ``target_pose`` then holds, no CSV.
 
         Used by Reset to drive every joint to a fixed target (e.g. zeros) via
         the same smooth ramp-in pipeline as a normal trajectory.
         """
         inst = cls.__new__(cls)
-        inst._init_state(articulation, hz, ramp_s, event_ramp_s,
+        inst._init_state(articulation, hz, ramp_s,
                          csv_dir=None, seed_pose=None)
 
         target = np.asarray(target_pose, dtype=np.float32).reshape(-1)
@@ -331,7 +356,8 @@ class TrajectoryPlayer:
             print(
                 f"[ALLEX][Traj] parsed {len(events_spec)} via events "
                 f"(gain={n_gain}, torque_limit={n_trq}); "
-                f"will linear-ramp over {self.event_ramp_s:.2f}s on activation"
+                f"per-step additive clamp ramp (step sizes from "
+                f"physics_config.json::newton.ramp_step_sizes)"
             )
 
     # ------------------------------------------------------------------
@@ -369,6 +395,15 @@ class TrajectoryPlayer:
     # ------------------------------------------------------------------
     # Playback control
     # ------------------------------------------------------------------
+    def set_motor_mirror(self, mirror) -> None:
+        """Late-bind a MotorStateMirror so via events can fire set_target().
+
+        scenario lazy-builds the mirror on first physics step, but the
+        TrajectoryPlayer is usually constructed earlier via UI. This setter
+        bridges the gap.
+        """
+        self._motor_mirror = mirror
+
     def is_ready(self) -> bool:
         return self._dense is not None and self._dense.shape[0] > 0
 
@@ -401,8 +436,8 @@ class TrajectoryPlayer:
         self._slow_step_count = 0
         self._max_step_ms = 0.0
         self._pending = self._build_events_for_run()
-        if self._pending:
-            self._bake_events(self._pending)
+        # NOTE: _bake_events disabled — MotorStateMirror owns joint_target_ke/kd/eff
+        # writes. Future iteration will wire events to motor_mirror.set_target.
         return True
 
     def stop(self) -> None:
@@ -414,6 +449,9 @@ class TrajectoryPlayer:
                 f"slow(>{self.event_log_threshold_ms:.1f}ms)={self._slow_step_count}; "
                 f"max single step={self._max_step_ms:.2f} ms"
             )
+        if self._motor_mirror is not None:
+            self._motor_mirror.reset_to_nominal()
+            print("[ALLEX][Traj] stop: ramping K_m back to nominal")
 
     def get_current_target(self) -> "np.ndarray | None":
         """Return the current target row and advance one sample.
@@ -432,20 +470,18 @@ class TrajectoryPlayer:
         last = self._dense.shape[0] - 1
         idx = min(self._sample_idx, last)
 
-        # 1) Activate due events
-        pending = self._pending
-        ptr = self._pending_ptr
-        n_pending = len(pending)
-        while ptr < n_pending and pending[ptr].sample_idx <= idx:
-            self._activate_event(pending[ptr], idx)
-            self._active_ramps.append(pending[ptr])
-            self._events_started += 1
-            ptr += 1
-        self._pending_ptr = ptr
-
-        # 2) Advance ramps + 3) sync once if needed
-        if self._active_ramps:
-            self._step_active_ramps(idx)
+        # Drain any via events whose sample_idx has been reached. Each event
+        # pushes new motor-domain ramp targets into MotorStateMirror; the
+        # mirror's per-step host ramp absorbs the multi-step transition.
+        if self._motor_mirror is not None:
+            while (self._pending_ptr < len(self._pending)
+                   and self._pending[self._pending_ptr].sample_idx <= self._sample_idx):
+                ev = self._pending[self._pending_ptr]
+                self._pending_ptr += 1
+                self._motor_mirror.set_target(
+                    ev.joint_names, ev.kps, ev.kds, ev.max_efforts,
+                )
+                self._events_started += 1
 
         target = self._dense[idx]
         if self._sample_idx >= last:
@@ -465,14 +501,15 @@ class TrajectoryPlayer:
         ramp offset so via timestamps match the trajectory body.
         """
         ramp_offset = self._dense.shape[0] - self._dense_base.shape[0]
-        n_ramp = max(1, int(round(self.event_ramp_s * self._hz)))
         out: list[_ViaEvent] = []
         for spec in self._events_spec:
             idx = 0 if spec.t == 0.0 else ramp_offset + int(round(spec.t * self._hz))
+            # n_ramp is set per-event at activation time from |target-start|
+            # divided by the per-1ms step size; placeholder 1 here.
             out.append(_ViaEvent(
                 t=spec.t, joint_names=spec.joint_names,
                 kps=spec.kps, kds=spec.kds, max_efforts=spec.max_efforts,
-                sample_idx=idx, n_ramp=n_ramp,
+                sample_idx=idx, n_ramp=1,
             ))
         out.sort(key=lambda e: e.sample_idx)
         return out
@@ -529,6 +566,12 @@ class TrajectoryPlayer:
             return
         dev, dt = handles.device, handles.dtype
 
+        # NOTE: joint_step_per_ms 시대의 사전-bake 로직 — motor_mirror 도입 후
+        # 미사용. _bake_events 자체가 start() 에서 호출되지 않으므로 이 함수
+        # 본체는 dead-code 이지만 추후 motor_mirror.set_target ramp 통합 시
+        # 일부 view-cache 패턴 재활용 가능해서 보존.
+        self._joint_step_table = {}
+
         # 1) Bake per-event tensors (idx + vals) for each category.
         category_used = {cat.raw_attr: False for cat in _CATEGORIES}
         n_baked_slots = 0
@@ -542,6 +585,9 @@ class TrajectoryPlayer:
                 continue
             dof_idxs = np.fromiter((p[0] for p in pairs), dtype=np.int64, count=len(pairs))
             csv_cols = np.fromiter((p[1] for p in pairs), dtype=np.int64, count=len(pairs))
+            # Joint name aligned with each (dof_idx, csv_col) pair; used to
+            # look up per-joint step values from JSON.
+            joint_names_for_pairs = [ev.joint_names[p[1]] for p in pairs]
             for cat in _CATEGORIES:
                 src = getattr(ev, cat.raw_attr)
                 if src is None:
@@ -554,6 +600,27 @@ class TrajectoryPlayer:
                         torch.as_tensor(dof_idxs[mask], dtype=torch.long, device=dev))
                 setattr(ev, cat.vals_attr,
                         torch.as_tensor(v[mask], dtype=dt, device=dev))
+                # Pre-bake per-element joint-domain step tensor (size = # of
+                # masked entries). Look up by joint name → JSON value.
+                step_key = "trq" if cat.raw_attr == "max_efforts" else "gain"
+                step_np = np.zeros(int(mask.sum()), dtype=np.float32)
+                masked_names = [n for n, m in zip(joint_names_for_pairs, mask) if m]
+                missing_step: list[str] = []
+                for i, jname in enumerate(masked_names):
+                    entry = self._joint_step_table.get(jname)
+                    if entry is None:
+                        missing_step.append(jname)
+                        step_np[i] = 0.0
+                    else:
+                        step_np[i] = float(entry.get(step_key, 0.0))
+                if missing_step:
+                    print(
+                        f"[ALLEX][Traj] joint_step_per_ms missing for "
+                        f"{missing_step} ({cat.raw_attr}) — those entries will "
+                        f"1-step jump; rerun tools/gen_joint_step_sizes.py"
+                    )
+                setattr(ev, cat.step_attr,
+                        torch.as_tensor(step_np, dtype=dt, device=dev))
                 category_used[cat.raw_attr] = True
                 n_baked_slots += 1
 
@@ -587,10 +654,10 @@ class TrajectoryPlayer:
         sync_mode = ("_update_joint_dof_properties"
                      if self._sync_dof_props is not None
                      else f"notify_model_changed(flag={self._notify_flag})")
-        n_ramp = events[0].n_ramp if events else 0
         print(
             f"[ALLEX][Traj] pre-baked {n_baked_slots} slot(s) across "
-            f"{len(events)} event(s); ramp={self.event_ramp_s:.2f}s ({n_ramp} steps); "
+            f"{len(events)} event(s); "
+            f"joint_step_per_ms loaded for {len(self._joint_step_table)} joints; "
             f"Newton views: kp={self._model_kp_view is not None} "
             f"kd={self._model_kd_view is not None} eff={self._model_eff_view is not None} "
             f"(device={dev} dtype={dt}, sync={sync_mode})"
@@ -633,11 +700,17 @@ class TrajectoryPlayer:
     # Event ramp dispatch (hot path)
     # ------------------------------------------------------------------
     def _activate_event(self, ev: _ViaEvent, cur_step: int) -> None:
-        """Snapshot live model values into ev.*_start so the per-step linear
-        interpolation has a well-defined origin. Categories with no baked
-        index tensor (i.e. event didn't author that category) are skipped.
+        """Snapshot live values + compute per-event ramp duration.
+
+        Per-element joint-domain step tensors (``ev.*_step``) are pre-baked at
+        ``_bake_events`` time from ``physics_config.json::joint_step_per_ms``,
+        so activation only needs to: (1) snapshot the current view, and
+        (2) compute ``n_ramp = max ceil(|delta_i| / step_i)`` across all
+        categories for a single termination counter.
         """
         ev.ramp_start_step = cur_step
+
+        n_max = 1
         for cat in _CATEGORIES:
             idx_t = getattr(ev, cat.idx_attr)
             if idx_t is None:
@@ -645,7 +718,31 @@ class TrajectoryPlayer:
             view = getattr(self, cat.view_attr)
             if view is None:
                 continue
-            setattr(ev, cat.start_attr, view[idx_t].clone())
+            start = view[idx_t].clone()
+            setattr(ev, cat.start_attr, start)
+            target = getattr(ev, cat.vals_attr)
+            delta = target - start
+            if delta.numel() == 0:
+                continue
+
+            step_t = getattr(ev, cat.step_attr)
+            # Move once to host for n_ramp computation (one sync per category
+            # at activation, not per step).
+            delta_abs_np = delta.abs().detach().cpu().numpy().astype(np.float64)
+            step_np = (step_t.detach().cpu().numpy().astype(np.float64)
+                       if step_t is not None
+                       else np.zeros_like(delta_abs_np))
+            valid = step_np > 0
+            n_per_elem = np.zeros_like(delta_abs_np)
+            if valid.any():
+                n_per_elem[valid] = np.ceil(delta_abs_np[valid] / step_np[valid])
+            # Elements where step==0 but delta!=0 must jump in 1 step.
+            zero_jump = (~valid) & (delta_abs_np > 0)
+            if zero_jump.any():
+                n_per_elem[zero_jump] = 1
+            if n_per_elem.size:
+                n_max = max(n_max, int(n_per_elem.max()))
+        ev.n_ramp = int(n_max)
 
     def _step_active_ramps(self, cur_step: int) -> None:
         """Advance every active ramp by one step; write + sync once."""
@@ -654,13 +751,8 @@ class TrajectoryPlayer:
         still_active: list[_ViaEvent] = []
         for ev in self._active_ramps:
             elapsed = cur_step - ev.ramp_start_step
-            if elapsed >= ev.n_ramp:
-                progress = 1.0
-                done = True
-            else:
-                progress = elapsed / ev.n_ramp
-                done = False
-            if self._write_ramp_step(ev, progress):
+            done = elapsed >= ev.n_ramp
+            if self._write_ramp_step(ev, done):
                 wrote = True
             if not done:
                 still_active.append(ev)
@@ -685,11 +777,17 @@ class TrajectoryPlayer:
                     f"active_ramps={len(self._active_ramps) + (0 if not still_active else 0)})"
                 )
 
-    def _write_ramp_step(self, ev: _ViaEvent, progress: float) -> bool:
-        """Write one interpolated step of ``ev`` into the model views.
+    def _write_ramp_step(self, ev: _ViaEvent, done: bool) -> bool:
+        """Write one additive-clamp step of ``ev`` into the model views.
 
-        Returns True if any model array was actually written (i.e., the event
-        had a baked tensor and the corresponding category toggle is on).
+        Each element advances by at most its per-DOF joint-domain step
+        (``ev.*_step``, computed at activation from motor_step + Jacobian).
+        Symmetric bounds — real controller uses identical motor_step for
+        ramp-up and ramp-down, so joint-domain magnitudes match too.
+        ``done=True`` snaps to target (absorbs float drift from ceil-rounded
+        n_ramp).
+
+        Returns True if any model array was actually written.
         """
         wrote = False
         for cat in _CATEGORIES:
@@ -700,10 +798,20 @@ class TrajectoryPlayer:
             if view is None or not getattr(self, cat.toggle_attr):
                 continue
             target = getattr(ev, cat.vals_attr)
-            if progress >= 1.0:
+            if done:
                 view[idx_t] = target
             else:
-                start = getattr(ev, cat.start_attr)
-                view[idx_t] = start + progress * (target - start)
+                cur = view[idx_t]
+                delta = target - cur
+                step_t = getattr(ev, cat.step_attr)
+                if step_t is None:
+                    # No per-element step available (rare fallback) — snap.
+                    view[idx_t] = target
+                else:
+                    # Per-element symmetric clamp: cap advance at +step_i for
+                    # positive deltas, at -step_i for negative. Elements with
+                    # step=0 (and delta=0) saturate trivially; step=0 with
+                    # delta!=0 is handled by n_ramp=1 → done=True next step.
+                    view[idx_t] = cur + delta.clamp(min=-step_t, max=step_t)
             wrote = True
         return wrote

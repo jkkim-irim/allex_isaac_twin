@@ -236,10 +236,23 @@ def parse_via_csv(path: str | Path) -> ViaCSVData:
     )
 
 
+def _resolve_hz(hz: float | None) -> float:
+    """Return ``hz`` if given, otherwise fall back to ``physics_config.json``.
+
+    Single source of truth: ``world.physics_hz`` in JSON. Pass an explicit
+    ``hz`` only when you intentionally want a non-physics rate (e.g. coarse
+    preview).
+    """
+    if hz is not None and hz > 0:
+        return float(hz)
+    from ..utils.sim_settings_utils import get_physics_hz
+    return get_physics_hz()
+
+
 def generate_trajectory(
     time_via: np.ndarray,
     pos_via_rad: np.ndarray,
-    hz: float = 1000.0,
+    hz: float | None = None,
     duration: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Via points에서 시간 균일 궤적 생성.
@@ -247,12 +260,15 @@ def generate_trajectory(
     Args:
         time_via: via point 시간 [s], shape (N,).
         pos_via_rad: via point 위치 [rad], shape (N, n_joints).
-        hz: 출력 샘플링 주파수 [Hz].
+        hz: 출력 샘플링 주파수 [Hz]. ``None`` 이면
+            ``physics_config.json::world.physics_hz`` 값 사용 (단일 소스).
         duration: 출력 궤적 길이 [s]. None이면 via point 끝까지.
 
     Returns:
         (time_out, pos_out_rad): 균일 샘플링된 시간과 위치.
     """
+    hz = _resolve_hz(hz)
+
     if duration is None:
         duration = float(time_via[-1])
 
@@ -270,10 +286,16 @@ def generate_trajectory(
 
 def generate_trajectory_from_csv(
     csv_path: str | Path,
-    hz: float = 1000.0,
+    hz: float | None = None,
     duration: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """CSV 파일에서 직접 궤적 생성.
+
+    Args:
+        csv_path: via point CSV 경로.
+        hz: 출력 샘플링 주파수 [Hz]. ``None`` 이면
+            ``physics_config.json::world.physics_hz`` 값 사용.
+        duration: 출력 궤적 길이 [s]. None이면 via point 끝까지.
 
     Returns:
         (time_out, pos_out_rad): 균일 샘플링된 시간[s]과 위치[rad].
