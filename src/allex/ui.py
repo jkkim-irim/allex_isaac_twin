@@ -1,16 +1,29 @@
 """ALLEX 통합 UI — 4개 패널 + 오케스트레이터 단일 진입점.
 
-이 파일은 기존 `src/allex/ui_utils/` 의 4개 패널 클래스
-(`WorldControls`, `ROS2Controls`, `TrajStudioControls`, `VisualizerControls`)
-와 `src/ui_builder.py` 의 `UIBuilder` 오케스트레이터를 합친 결과입니다.
+패널 구성 (`AllExUI` 가 wire-up):
+    1. WorldControls       — LOAD / RUN / Reset (ALLEX scenario lifecycle)
+    2. ROS2Controls        — Domain ID, RMW, subscribe/publish 토글
+    3. TrajStudioControls  — trajectory/<group> 선택 + Run/Stop/Reset
+                             (showcase logger 연동, demo1 자동 offset)
+    4. VisualizerControls  — Force viz 토글, contact force overlay
+
+이 파일은 기존 `src/allex/ui_utils/` 의 4개 패널 클래스 + `ui_builder.py`
+의 오케스트레이터를 단일 모듈로 통합한 결과 (`dvcc/10_arch_decisions.md` §2).
+각 패널 < 250 LOC 라 분리 임계 미달, cross-reference 가 많아 한 파일이
+추적성 좋음. UI 추가 시 새 클래스를 이 파일 안에 작성하고 `AllExUI` 의
+`build_ui()` 끝부분에서 인스턴스화 + frame 부착.
 
 UI 헬퍼 (`UIComponentFactory`, `ButtonStyleManager`) 와 데이터 클래스
-(`UIColors`, `UILayout`, `UIConfig`) 는 `utils/ui_settings_utils.py` 에 있어서
-도메인 모듈 (`utils/contact_force_viz.py`) 이 순환 의존 없이 import 가능합니다.
+(`UIColors`, `UILayout`, `UIConfig`) 는 `utils/ui_settings_utils.py` 에
+분리 — 도메인 모듈 (`utils/contact_force_viz.py`) 도 import 가능하도록 한
+중립 위치. ui.py 가 두면 순환 import 발생.
 
-UI 가 아닌 도메인 서브시스템:
-- `utils/contact_force_viz.py` (충돌력 시각화, 547 LOC)
-는 유지보수 격리 차원에서 utils/ 에 분리되어 있습니다.
+UI 가 아닌 도메인 서브시스템 (utils/ 에 분리):
+- `utils/contact_force_viz.py` (충돌력 시각화, 547 LOC) — 도메인 격리.
+
+호출 흐름:
+    UI 패널 → `self._ui._scenario` (ALLEXDigitalTwin) → core/* 서브시스템
+    UI ↛ core 직접 import 금지 (단방향 호출 원칙).
 """
 from __future__ import annotations
 
