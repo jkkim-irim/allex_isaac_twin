@@ -154,18 +154,27 @@ def _joint_type_name(t) -> str:
 
 
 def _apply_gravcomp(builder) -> None:
-    """Stamp `mujoco:gravcomp` per `physics_config.json::newton.gravcomp.bodies`.
+    """Stamp `mujoco:gravcomp` (per body) + `mujoco:actuatorgravcomp` (per joint)
+    per `physics_config.json::newton.gravcomp`.
 
-    Runs from the finalize patch — after add_usd populated body labels and the
-    MuJoCo solver registered its custom attributes — so MuJoCo's `m.ngravcomp`
-    counts these bodies at `put_model` time and the qfrc_gravcomp kernel runs
-    every step. Failure here is non-fatal: equality injection still proceeds.
+    Runs from the finalize patch — after add_usd populated body/joint labels
+    and the MuJoCo solver registered its custom attributes — so MuJoCo's
+    `m.ngravcomp` counts these bodies at `put_model` time and the
+    qfrc_gravcomp kernel runs every step. The actuator-routing stamping
+    decides whether the comp torque shows up in qfrc_gravcomp (passive) or
+    qfrc_actuator (actuator). Both calls are non-fatal: failures don't block
+    equality injection.
     """
     try:
         from ..utils import sim_settings_utils as _ps
         _ps.apply_gravcomp_to_builder(builder)
     except Exception as exc:
         print(f"[ALLEX][Gravcomp] apply_gravcomp_to_builder failed: {exc}")
+    try:
+        from ..utils import sim_settings_utils as _ps
+        _ps.apply_actuator_gravcomp_to_builder(builder)
+    except Exception as exc:
+        print(f"[ALLEX][Gravcomp] apply_actuator_gravcomp_to_builder failed: {exc}")
 
 
 def _inject(builder) -> None:
