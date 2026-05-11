@@ -39,6 +39,8 @@ from ..config.viz_config import (
     FORCE_VEC_SHAFT_NAME, FORCE_VEC_HEAD_NAME,
     FORCE_VEC_SHAFT_BASE_LENGTH, FORCE_VEC_HEAD_BASE_TRANSLATE_Z,
     FORCE_VEC_LENGTH_AXIS, FORCE_VEC_HIDE_BELOW,
+    EXT_TORQUE_GAIN, EXT_TORQUE_MIN_SCALE, EXT_TORQUE_MAX_SCALE,
+    EXT_TORQUE_HIDE_BELOW, EXT_TORQUE_COLOR_REAL, EXT_TORQUE_COLOR_SIM,
 )
 
 
@@ -121,6 +123,13 @@ class ForceTorqueVisualizer:
         # dof_abbr → 그 dof 가 속한 region 이름들의 frozenset. init 시 1회 빌드.
         self._dof_abbr_regions: dict = {}
 
+        # ext_joint_torque substitution override — (source, dof_abbr) set.
+        # csv_replayer 가 매 step ext_joint_torque trigger window 안에 있는 joint 를
+        # 여기에 넣으면 _torque_ring_visible_for 가 mode/gate 무시하고 True 리턴.
+        # "general torque ring 은 off 인데 특정 joint 의 ext_torque ring 만 보이기"
+        # use case.
+        self._torque_ring_force_visible_dofs: set = set()
+
         # CSV replay 동안 custom force prim 을 force-mode 와 무관하게 보이게 하는 bypass.
         # True 이면 _apply_visibility() 가 source="sim"/"real" custom prim 도 항상 visible
         # 처리. user 가 force/torque mode 토글을 안 켜도 replay 가 등록한 화살표는 보임.
@@ -163,6 +172,13 @@ class ForceTorqueVisualizer:
         #           "last_pose": (tx, ty, tz, qw, qx, qy, qz) or None,
         #           "last_vec": (fx, fy, fz) or None}
         self._custom_force_prims: dict = {}
+
+        # 사용자 정의 custom torque ring 테이블 — free-floating ring (joint 가 아닌
+        # contact_pos 같은 임의 위치 + 임의 axis). key = "{source}::{name}".
+        # rec: {"prim", "prim_path", "parent_path", "source", "name",
+        #       "last_axis_hat": (ax,ay,az)|None, "last_scale": float|None,
+        #       "hidden": bool}.
+        self._custom_torque_ring_prims: dict = {}
 
         self._prims_initialized = False
 
@@ -455,6 +471,28 @@ class ForceTorqueVisualizer:
         if self._torque_region_gate:
             self._torque_region_gate.clear()
             self._apply_torque_ring_visibility()
+        # ext_joint_torque override 도 함께 해제.
+        if self._torque_ring_force_visible_dofs:
+            self._torque_ring_force_visible_dofs.clear()
+            self._apply_torque_ring_visibility()
+
+    def set_torque_ring_force_visible(self, source: str, dof_abbr: str,
+                                       visible: bool) -> None:
+        """ext_joint_torque substitution active 인 (source, dof_abbr) ring 을
+        강제 visible 토글. mode/gate 보다 우선. transition 시에만 visibility 재계산.
+        """
+        src = str(source).lower()
+        if src not in ("real", "sim"):
+            return
+        key = (src, dof_abbr)
+        if visible:
+            if key not in self._torque_ring_force_visible_dofs:
+                self._torque_ring_force_visible_dofs.add(key)
+                self._apply_torque_ring_visibility()
+        else:
+            if key in self._torque_ring_force_visible_dofs:
+                self._torque_ring_force_visible_dofs.discard(key)
+                self._apply_torque_ring_visibility()
 
     def _apply_torque_ring_visibility(self) -> None:
         """torque ring prim 만 visibility 재계산. force prim 의 threshold cache 안 건드림.
@@ -475,6 +513,7 @@ class ForceTorqueVisualizer:
         """매 _apply_visibility 에서 호출 — mode AND region gate (exclusive 시멘틱).
 
         시멘틱:
+          - ext_joint_torque substitution override (force visible) → 무조건 visible
           - source 에 gate 하나도 없음 → mode-only default (visible)
           - source 에 gate 있음:
               · dof 가 매칭되는 gate 중 하나라도 True → visible
@@ -485,6 +524,10 @@ class ForceTorqueVisualizer:
         예: user 가 ``real.Hand_L`` 만 trigger 박으면 → real 의 모든 arm/Hand_R ring
         은 자동 hide. real 채널 전체를 sim 처럼 "trigger 가 있는 영역만 보여줌" 으로 다룸.
         """
+        # ext_joint_torque substitution override — mode/gate 무시. csv_replayer 가
+        # 매 step trigger 가 active 인 (source, dof_abbr) 를 set 으로 넘겨준다.
+        if (src, dof_abbr) in self._torque_ring_force_visible_dofs:
+            return True
         if self._torque_mode not in (src, "both"):
             return False
         # 이 source 에 gate 하나라도 있나?
@@ -591,6 +634,15 @@ class ForceTorqueVisualizer:
         """source + name 조합으로 내부 key. ``_custom_force_prims`` 에 사용."""
         return f"{source}::{name}"
 
+    @staticmethod
+    def _scale_params_for_kind(kind: str):
+        """kind ('force'/'torque') → (gain, min_scale, max_scale, hide_below)."""
+        if kind == "torque":
+            return (EXT_TORQUE_GAIN, EXT_TORQUE_MIN_SCALE,
+                    EXT_TORQUE_MAX_SCALE, EXT_TORQUE_HIDE_BELOW)
+        return (FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE,
+                FORCE_VEC_HIDE_BELOW)
+
     def add_custom_force_vector(
         self,
         name: str,
@@ -600,21 +652,27 @@ class ForceTorqueVisualizer:
         parent_path: str | None = None,
         source: str = "user",
         thin: bool = False,
+        kind: str = "force",
     ):
-        """임의 위치에 force vector 화살표 prim 을 새로 만든다.
+        """임의 위치에 force/torque vector 화살표 prim 을 새로 만든다.
 
         name          : 고유 식별자 (source 별로 namespace 분리됨).
         position      : (x, y, z) translate. parent_path 기준 (None 이면 world).
         vector        : (fx, fy, fz). 길이 = magnitude, 방향 = orient.
                          force_vec.usda 는 local +Z 화살표라 +Z → vector 로 회전.
-        color         : (r, g, b) 0~1. None 이면 source 따라 자동 (real=빨강,
-                         sim=시안, user=노랑).
+        color         : (r, g, b) 0~1. None 이면 source/kind 따라 자동
+                         (force: real=빨강 sim=시안 user=노랑;
+                          torque: EXT_TORQUE_COLOR_{REAL,SIM} 우선, 없으면 source 색).
         parent_path   : 생성할 부모 prim 경로. None 이면 CUSTOM_FORCE_ROOT/<source>
                          아래에 /World/AllexForceViz/<source>/<name> 으로 생성
                          (world 공간 floating). 링크 추종이 필요하면 `/ALLEX/<link>`.
         source        : "real" | "sim" | "user". visibility mode (off/real/sim/both)
                          가 force mode 와 함께 자동 적용됨. 같은 name 이라도 source
                          가 다르면 서로 다른 prim.
+        kind          : "force" (default, FORCE_* 스케일) 또는 "torque"
+                         (EXT_TORQUE_* 스케일). 둘 다 동일 arrow asset 을 쓰고
+                         스케일/색상만 달라짐. set_custom_force_vector 가 rec.kind
+                         를 보고 자동으로 같은 스케일을 사용함.
 
         Returns: 성공 시 prim path (str), 실패 시 None.
         동일 (source, name) 이 이미 존재하면 기존 prim 재사용하고 pose/vector 갱신.
@@ -627,6 +685,11 @@ class ForceTorqueVisualizer:
             logger.warning(f"[viz] add_custom_force_vector: invalid source '{source}'; "
                            f"expected real/sim/user. Falling back to 'user'.")
             source = "user"
+        kind = str(kind).lower()
+        if kind not in ("force", "torque"):
+            logger.warning(f"[viz] add_custom_force_vector: invalid kind '{kind}', "
+                           f"falling back to 'force'.")
+            kind = "force"
 
         key = self._custom_key(name, source)
         if key in self._custom_force_prims:
@@ -688,9 +751,18 @@ class ForceTorqueVisualizer:
                         Gf.Vec3d(float(im[0]), float(im[1]), float(im[2])),
                     )
 
-        eff_color = color if color is not None else self._SOURCE_COLOR.get(
-            source, REAL_COLOR
-        )
+        if color is not None:
+            eff_color = color
+        elif kind == "torque":
+            # torque 전용 색상이 정의돼 있으면 그걸, 아니면 source 색.
+            if source == "real" and EXT_TORQUE_COLOR_REAL is not None:
+                eff_color = EXT_TORQUE_COLOR_REAL
+            elif source == "sim" and EXT_TORQUE_COLOR_SIM is not None:
+                eff_color = EXT_TORQUE_COLOR_SIM
+            else:
+                eff_color = self._SOURCE_COLOR.get(source, REAL_COLOR)
+        else:
+            eff_color = self._SOURCE_COLOR.get(source, REAL_COLOR)
         prim = self._create_force_ref_xform(
             stage, prim_path, usd_path,
             tuple(float(c) for c in position), orient_q, (1, 1, 1),
@@ -706,11 +778,13 @@ class ForceTorqueVisualizer:
             "parent_path": parent,
             "source": source,
             "name": name,
+            "kind": kind,
         }
 
         # 최초 크기 적용 — _apply_force_scale 가 threshold 따라 visibility 결정 (this prim).
-        self._apply_force_vector(prim, fx, fy, fz,
-                                 FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE)
+        gain, lo, hi, hide_below = self._scale_params_for_kind(kind)
+        self._apply_force_vector(prim, fx, fy, fz, gain, lo, hi,
+                                 hide_below=hide_below)
 
         # 가시성: this prim 만 mode-based override. 전체 _apply_visibility() 호출하면
         # _threshold_hide_state cache 가 wipe 되어, **다른** force prim 들이 1 frame
@@ -784,8 +858,10 @@ class ForceTorqueVisualizer:
 
         if vector is not None:
             fx, fy, fz = (float(vector[0]), float(vector[1]), float(vector[2]))
-            self._apply_force_vector(prim, fx, fy, fz,
-                                     FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE)
+            kind = rec.get("kind", "force")
+            gain, lo, hi, hide_below = self._scale_params_for_kind(kind)
+            self._apply_force_vector(prim, fx, fy, fz, gain, lo, hi,
+                                     hide_below=hide_below)
         return True
 
     def remove_custom_force_vector(self, name, source: str = "user"):
@@ -837,6 +913,272 @@ class ForceTorqueVisualizer:
         추후 animated / time-varying vector 지원 시 여기서 step 별 갱신.
         """
         return
+
+    # ========================================
+    # Custom torque ring — contact_pos 같은 free-floating 위치에 ring 생성/갱신
+    # ========================================
+    CUSTOM_TORQUE_RING_ROOT = "/World/AllexTorqueRing"
+
+    def add_custom_torque_ring(
+        self,
+        name: str,
+        position=(0.0, 0.0, 0.0),
+        axis=(0.0, 0.0, 1.0),
+        magnitude: float = 0.0,
+        color=None,
+        parent_path: str | None = None,
+        source: str = "user",
+    ):
+        """contact_pos 등 임의 world 좌표에 torque ring prim 을 새로 만든다.
+
+        name      : 고유 식별자 (source 별 namespace 분리)
+        position  : (x,y,z). parent_path 기준 (None 이면 world).
+        axis      : torque 벡터 (방향만 의미; magnitude 는 별도 인자). 길이 0 이면
+                    orient 무시하고 identity 로 둠.
+        magnitude : |τ| (Nm). 0 이면 hide_below 미만이라 invisible 로 시작.
+        color     : (r,g,b) 또는 None. None 이면 EXT_TORQUE_COLOR_<source> 우선,
+                    없으면 source 기본색 (real=빨강, sim=시안).
+        parent_path: 부모 prim. None → CUSTOM_TORQUE_RING_ROOT/<source>.
+        source    : "real" / "sim" / "user".
+
+        Returns: 성공 시 prim path (str), 실패 시 None. 이미 존재하면 set 으로 위임.
+        """
+        if not name:
+            logger.warning("[viz] add_custom_torque_ring: name required")
+            return None
+        source = str(source).lower()
+        if source not in ("real", "sim", "user"):
+            logger.warning(f"[viz] add_custom_torque_ring: invalid source {source!r}; "
+                           f"falling back to 'user'.")
+            source = "user"
+
+        key = self._custom_key(name, source)
+        if key in self._custom_torque_ring_prims:
+            self.set_custom_torque_ring(name, source=source, position=position,
+                                        axis=axis, magnitude=magnitude)
+            return self._custom_torque_ring_prims[key]["prim"].GetPath().pathString
+
+        stage = self._get_stage()
+        if stage is None:
+            logger.warning("[viz] add_custom_torque_ring: stage unavailable")
+            return None
+
+        if not os.path.exists(TORQUE_VIZ_USD_PATH):
+            logger.warning(f"[viz] torque ring asset missing: {TORQUE_VIZ_USD_PATH}")
+            return None
+
+        from pxr import Gf
+
+        parent = parent_path or f"{self.CUSTOM_TORQUE_RING_ROOT}/{source}"
+        prim_path = f"{parent}/{name}"
+
+        with self._session_edit():
+            parent_prim = stage.GetPrimAtPath(parent)
+            if not parent_prim or not parent_prim.IsValid():
+                stage.DefinePrim(parent, "Xform")
+
+        orient_q = self._axis_to_quatd(axis)
+
+        if color is not None:
+            eff_color = color
+        elif source == "real" and EXT_TORQUE_COLOR_REAL is not None:
+            eff_color = EXT_TORQUE_COLOR_REAL
+        elif source == "sim" and EXT_TORQUE_COLOR_SIM is not None:
+            eff_color = EXT_TORQUE_COLOR_SIM
+        else:
+            eff_color = self._SOURCE_COLOR.get(source, REAL_COLOR)
+
+        # 초기 scale 은 magnitude 기반 — 0 이면 _apply_torque_ring_scale 가 hide.
+        prim = self._create_ref_xform(
+            stage, prim_path, TORQUE_VIZ_USD_PATH,
+            tuple(float(c) for c in position), orient_q, (1, 1, 1),
+            eff_color,
+        )
+        if prim is None:
+            return None
+
+        self._custom_torque_ring_prims[key] = {
+            "prim": prim,
+            "prim_path": prim_path,
+            "parent_path": parent,
+            "source": source,
+            "name": name,
+            "last_axis_hat": None,
+            "hidden": False,
+        }
+
+        self._apply_torque_ring_scale(prim, magnitude)
+        # mode 검사: torque_mode 가 허용 안 하면 hide.
+        src_lc = source.lower()
+        mode_allows = (
+            src_lc == "user"
+            or (src_lc == "real" and self._torque_mode in ("real", "both"))
+            or (src_lc == "sim" and self._torque_mode in ("sim", "both"))
+        )
+        if not mode_allows:
+            self._set_visible(prim, False)
+        return prim_path
+
+    def set_custom_torque_ring(self, name: str, source: str = "user",
+                                position=None, axis=None,
+                                magnitude: float | None = None) -> bool:
+        """기존 custom torque ring 의 pose / scale 갱신.
+
+        position : None 이면 translate 유지.
+        axis     : None 이면 orient 유지.
+        magnitude: None 이면 scale 유지. 0 또는 hide_below 미만이면 invisible 토글.
+        """
+        source = str(source).lower()
+        if source not in ("real", "sim", "user"):
+            source = "user"
+        key = self._custom_key(name, source)
+        rec = self._custom_torque_ring_prims.get(key)
+        if rec is None:
+            logger.warning(
+                f"[viz] set_custom_torque_ring: unknown ({source}, {name!r})"
+            )
+            return False
+        prim = rec["prim"]
+        if prim is None or not prim.IsValid():
+            return False
+
+        from pxr import Gf, UsdGeom
+
+        if position is not None:
+            try:
+                tv = Gf.Vec3d(float(position[0]), float(position[1]),
+                              float(position[2]))
+                xformable = UsdGeom.Xformable(prim)
+                translate_op = None
+                for op in xformable.GetOrderedXformOps():
+                    if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                        translate_op = op
+                        break
+                with self._session_edit():
+                    if translate_op is None:
+                        translate_op = xformable.AddTranslateOp(
+                            UsdGeom.XformOp.PrecisionDouble
+                        )
+                    translate_op.Set(tv)
+            except Exception as e:
+                logger.debug(f"[viz] set_custom_torque_ring translate warn: {e}")
+
+        if axis is not None:
+            try:
+                ax_hat = self._normalize_axis(axis)
+                last = rec.get("last_axis_hat")
+                if (last is None
+                        or any(abs(a - b) > 1e-6 for a, b in zip(last, ax_hat))):
+                    orient_q = self._axis_to_quatd(ax_hat)
+                    xformable = UsdGeom.Xformable(prim)
+                    orient_op = None
+                    for op in xformable.GetOrderedXformOps():
+                        if op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                            orient_op = op
+                            break
+                    with self._session_edit():
+                        if orient_op is None:
+                            orient_op = xformable.AddOrientOp(
+                                UsdGeom.XformOp.PrecisionDouble
+                            )
+                        orient_op.Set(orient_q)
+                    rec["last_axis_hat"] = ax_hat
+            except Exception as e:
+                logger.debug(f"[viz] set_custom_torque_ring orient warn: {e}")
+
+        if magnitude is not None:
+            self._apply_torque_ring_scale(prim, float(magnitude))
+        return True
+
+    def remove_custom_torque_ring(self, name: str, source: str = "user") -> bool:
+        source = str(source).lower()
+        if source not in ("real", "sim", "user"):
+            source = "user"
+        key = self._custom_key(name, source)
+        rec = self._custom_torque_ring_prims.pop(key, None)
+        if rec is None:
+            return False
+        prim_path = rec.get("prim_path")
+        if prim_path:
+            self._scale_op_cache.pop(prim_path, None)
+            self._last_scale_cache.pop(prim_path, None)
+            stage = self._get_stage()
+            if stage is not None:
+                try:
+                    with self._session_edit():
+                        stage.RemovePrim(prim_path)
+                except Exception as e:
+                    logger.debug(f"[viz] remove_custom_torque_ring warn: {e}")
+        return True
+
+    def clear_custom_torque_rings(self, source: str | None = None) -> None:
+        keys_to_remove = []
+        for key, rec in self._custom_torque_ring_prims.items():
+            if source is None or rec.get("source") == source:
+                keys_to_remove.append((rec["name"], rec["source"]))
+        for n, s in keys_to_remove:
+            self.remove_custom_torque_ring(n, source=s)
+
+    @staticmethod
+    def _normalize_axis(axis) -> tuple:
+        ax, ay, az = float(axis[0]), float(axis[1]), float(axis[2])
+        mag = math.sqrt(ax * ax + ay * ay + az * az)
+        if mag < 1e-12:
+            return (0.0, 0.0, 1.0)
+        inv = 1.0 / mag
+        return (ax * inv, ay * inv, az * inv)
+
+    @classmethod
+    def _axis_to_quatd(cls, axis):
+        """torque_viz.usd 의 local +Z 축을 ``axis`` 방향으로 회전시키는 Quatd 리턴.
+
+        axis 가 zero vector 면 identity. axis 정규화는 내부에서.
+        """
+        from pxr import Gf
+        ax_hat = cls._normalize_axis(axis)
+        if (abs(ax_hat[0]) < 1e-12 and abs(ax_hat[1]) < 1e-12
+                and abs(ax_hat[2]) < 1e-12):
+            return Gf.Quatd(1.0, 0.0, 0.0, 0.0)
+        from_vec = Gf.Vec3d(0.0, 0.0, 1.0)
+        to_vec = Gf.Vec3d(*ax_hat)
+        d = Gf.Dot(from_vec, to_vec)
+        if d > 1.0 - 1e-9:
+            return Gf.Quatd(1.0, 0.0, 0.0, 0.0)
+        if d < -1.0 + 1e-9:
+            return Gf.Quatd(0.0, Gf.Vec3d(1.0, 0.0, 0.0))
+        q = Gf.Rotation(from_vec, to_vec).GetQuat()
+        if not isinstance(q, Gf.Quatd):
+            im = q.GetImaginary()
+            q = Gf.Quatd(float(q.GetReal()),
+                         Gf.Vec3d(float(im[0]), float(im[1]), float(im[2])))
+        return q
+
+    def _apply_torque_ring_scale(self, prim, magnitude: float) -> None:
+        """magnitude (Nm) 에 따라 uniform scale + threshold-hide. EXT_TORQUE_* 사용.
+
+        |τ| < EXT_TORQUE_HIDE_BELOW → invisible (전체 prim hide).
+        그 외 → scale = clip(|τ| * EXT_TORQUE_GAIN, MIN, MAX).
+        """
+        if prim is None:
+            return
+        try:
+            prim_path = prim.GetPath().pathString
+        except Exception:
+            prim_path = None
+
+        mag = abs(float(magnitude))
+        hide = mag < EXT_TORQUE_HIDE_BELOW
+        prev_hidden = self._threshold_hide_state.get(prim_path, False) if prim_path else False
+        if hide != prev_hidden:
+            self._set_visible(prim, not hide)
+            if prim_path is not None:
+                self._threshold_hide_state[prim_path] = hide
+        if hide:
+            return
+
+        s = _clip(mag * EXT_TORQUE_GAIN, EXT_TORQUE_MIN_SCALE, EXT_TORQUE_MAX_SCALE)
+        self._apply_scale(prim, mag, EXT_TORQUE_GAIN,
+                          EXT_TORQUE_MIN_SCALE, EXT_TORQUE_MAX_SCALE)
 
     def _detect_newton_backend(self) -> bool:
         """Newton physics backend 여부를 감지. get_measured_joint_efforts 호출 전 1회 실행."""
@@ -1801,17 +2143,24 @@ class ForceTorqueVisualizer:
 
     @staticmethod
     def _torque_gain_for(abbr: str) -> float:
-        """dof_abbr 로 그룹별 gain 반환. viz_config.py 에서 조절."""
-        suffix = abbr[1:]  # 'L'/'R' 제거 → 'SP', 'WP', '11', ...
+        """dof_abbr 로 그룹별 + side 별 gain 반환. viz_config.py 에서 조절.
+
+        side (L/R) 가 있는 그룹 (shoulder/elbow/wrist/finger) 은 dict 에서 lookup.
+        side 무관 (default fallback, e.g. waist/neck) 은 TORQUE_GAIN 단일 float.
+        """
+        if not abbr:
+            return TORQUE_GAIN
+        side = abbr[0]   # 'L' / 'R' (또는 다른 prefix)
+        suffix = abbr[1:]
         if suffix in ("SP", "SR", "SY"):
-            return TORQUE_GAIN_SHOULDER
+            return TORQUE_GAIN_SHOULDER.get(side, TORQUE_GAIN)
         if suffix == "EP":
-            return TORQUE_GAIN_ELBOW
+            return TORQUE_GAIN_ELBOW.get(side, TORQUE_GAIN)
         if suffix in ("WY", "WR", "WP"):
-            return TORQUE_GAIN_WRIST
-        if suffix[:1].isdigit():  # '11'~'54' 형태
-            return TORQUE_GAIN_FINGER
-        return TORQUE_GAIN  # fallback
+            return TORQUE_GAIN_WRIST.get(side, TORQUE_GAIN)
+        if suffix[:1].isdigit():  # '11'~'54' 형태 (finger)
+            return TORQUE_GAIN_FINGER.get(side, TORQUE_GAIN)
+        return TORQUE_GAIN  # fallback (waist/neck 등)
 
     def _apply_scale(self, prim, raw_value, gain, lo, hi):
         """캐시된 scale op 에 직접 Set. dead-band 통과 시에만 write (B5)."""
@@ -1865,10 +2214,14 @@ class ForceTorqueVisualizer:
         except Exception as e:
             logger.debug(f"[viz] apply_scale warn: {e}")
 
-    def _apply_force_scale(self, prim, raw_value, gain, lo, hi):
+    def _apply_force_scale(self, prim, raw_value, gain, lo, hi,
+                           hide_below: float | None = None):
         """force 화살표 전용: Shaft 길이(Z scale) + Head translate Z 를 함께 갱신.
 
         shaft/head op 캐시가 없으면 legacy `_apply_scale` 로 fallback (전체 scale).
+
+        hide_below: 임계 magnitude. None 이면 FORCE_VEC_HIDE_BELOW (force 기본).
+        ext_torque arrow 처럼 force 와 다른 hide 임계가 필요할 때 override.
         """
         if prim is None:
             return
@@ -1891,7 +2244,9 @@ class ForceTorqueVisualizer:
         # Shaft/Head cache miss (legacy ALLEX.usd force_viz prim 등) 가 있어도
         # 화살표 자체는 wrapper visibility 로 hide 가능해야 한다.
         s = _clip(abs(float(raw_value)) * gain, lo, hi)
-        threshold_hidden = s < FORCE_VEC_HIDE_BELOW
+        eff_hide_below = (FORCE_VEC_HIDE_BELOW if hide_below is None
+                          else float(hide_below))
+        threshold_hidden = s < eff_hide_below
         prev_hidden = self._threshold_hide_state.get(prim_path, False) if prim_path else False
         if threshold_hidden != prev_hidden:
             self._set_visible(prim, not threshold_hidden)
@@ -1975,7 +2330,8 @@ class ForceTorqueVisualizer:
     # 3D force vector → arrow length + orientation
     # ------------------------------------------------------------------
     def _apply_force_vector(self, prim, fx: float, fy: float, fz: float,
-                            gain: float, lo: float, hi: float):
+                            gain: float, lo: float, hi: float,
+                            hide_below: float | None = None):
         """force vector (fx, fy, fz) 를 받아 arrow 의 길이 + 방향 갱신.
 
         - 길이: _apply_force_scale(magnitude) 로 Shaft/Head scale 변경
@@ -1983,6 +2339,8 @@ class ForceTorqueVisualizer:
         force_vec.usda 의 shaft 는 local +Z 방향이므로 +Z 를 F_hat 으로
         돌리면 arrow 가 force vector 방향을 가리킨다. vector 는
         **arrow 의 parent (= link) local frame** 기준으로 해석됨.
+
+        hide_below: 임계 magnitude. None → FORCE_VEC_HIDE_BELOW.
         """
         if prim is None:
             return
@@ -1990,7 +2348,8 @@ class ForceTorqueVisualizer:
         magnitude = math.sqrt(fx * fx + fy * fy + fz * fz)
 
         # 1) 길이
-        self._apply_force_scale(prim, magnitude, gain, lo, hi)
+        self._apply_force_scale(prim, magnitude, gain, lo, hi,
+                                hide_below=hide_below)
 
         # 2) 방향 (magnitude 너무 작으면 orient 유지)
         if magnitude < 1e-9:

@@ -52,6 +52,9 @@ _spec = _ilu.spec_from_file_location("joint_name_map", _jnm_path)
 _jnm = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_jnm)
 ALLEX_CSV_JOINT_NAMES = _jnm.ALLEX_CSV_JOINT_NAMES
+EXT_TORQUE_JOINT_NAMES = _jnm.EXT_TORQUE_JOINT_NAMES
+EXT_TORQUE_JOINT_CSV_KEYS = _jnm.EXT_TORQUE_JOINT_CSV_KEYS
+joint_to_csv_short = _jnm.joint_to_csv_short
 
 
 # TrajStudio 가 스캔하는 14 개 그룹 (src/trajectory/joint_name_map.py 와 일치)
@@ -153,6 +156,17 @@ def _parse_bag(input_dir: str):
                 continue
             keep.append(name)
             topic_meta[name] = (group, "joint_torque")
+            continue
+        # /result/<group>/joint/ext_torque (per-joint external torque, Nm)
+        # element 순서는 EXT_TORQUE_JOINT_NAMES (follower 포함) 기준. showcase CSV 에
+        # 는 ``ext_torque_<joint_full_name>`` 스칼라 컬럼으로 풀어 씀.
+        if (len(parts) == 4 and parts[0] == "result"
+                and parts[2] == "joint" and parts[3] == "ext_torque"):
+            group = parts[1]
+            if group not in CSV_GROUPS:
+                continue
+            keep.append(name)
+            topic_meta[name] = (group, "joint_ext_torque")
             continue
         # /robot_outbound_data/<group>/<suffix>  (단 joint_torque 는 위에서 처리)
         if len(parts) == 3 and parts[0] == "robot_outbound_data":
@@ -322,6 +336,16 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     # /robot_outbound_data/<group>/joint_torque 는 _parse_bag 에서 skip 됨.
     pos_streams: dict[str, list] = {n: [] for n in column_joint_order}
     trq_streams: dict[str, list] = {n: [] for n in column_joint_order}
+    # ext_joint_torque streams — column key = joint_full_name. EXT_TORQUE_JOINT_NAMES
+    # 는 follower (DIP/IP) 도 포함하므로 column_joint_order 의 superset 일 수 있음.
+    ext_torque_joint_order: list[str] = []
+    _seen_ext = set()
+    for _group_names in EXT_TORQUE_JOINT_NAMES.values():
+        for _jn in _group_names:
+            if _jn not in _seen_ext:
+                _seen_ext.add(_jn)
+                ext_torque_joint_order.append(_jn)
+    ext_trq_streams: dict[str, list] = {n: [] for n in ext_torque_joint_order}
     # ext_force streams: topic_id → list[(t_ns, [fx, fy, fz])]   (chest_origin frame)
     ext_force_streams: dict[str, list] = {
         tid: [] for tid in EXT_FORCE_TOPICS.values()
@@ -335,11 +359,18 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
         group, suffix = topic_meta[topic]
         if group == "_ext_force":
             topic_id = suffix
+            # Wrench/WrenchStamped → [fx,fy,fz,tx,ty,tz] (6),
+            # Vector3 / 3-원소 Float64MultiArray → [fx,fy,fz] (3) → torque 0 padding.
             for t_ns, vals in samples:
                 if len(vals) < 3:
                     continue
+                fx, fy, fz = float(vals[0]), float(vals[1]), float(vals[2])
+                if len(vals) >= 6:
+                    tx, ty, tz = float(vals[3]), float(vals[4]), float(vals[5])
+                else:
+                    tx = ty = tz = 0.0
                 ext_force_streams[topic_id].append(
-                    (t_ns, [float(vals[0]), float(vals[1]), float(vals[2])])
+                    (t_ns, [fx, fy, fz, tx, ty, tz])
                 )
             continue
         if group == "_contact_pos":
@@ -350,6 +381,17 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
                 contact_pos_streams[topic_id].append(
                     (t_ns, [float(vals[0]), float(vals[1]), float(vals[2])])
                 )
+            continue
+        if suffix == "joint_ext_torque":
+            # ext_torque element 순서는 EXT_TORQUE_JOINT_NAMES 기준 (follower 포함).
+            jn_list = EXT_TORQUE_JOINT_NAMES.get(group)
+            if jn_list is None:
+                continue
+            for t_ns, vals in samples:
+                for j_idx, name in enumerate(jn_list):
+                    if j_idx >= len(vals):
+                        continue
+                    ext_trq_streams[name].append((t_ns, float(vals[j_idx])))
             continue
         joint_names = ALLEX_CSV_JOINT_NAMES.get(group)
         if joint_names is None:
@@ -368,7 +410,7 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
                     continue
                 target[name].append((t_ns, vals[j_idx] * scale))
 
-    for d in (pos_streams, trq_streams):
+    for d in (pos_streams, trq_streams, ext_trq_streams):
         for k in d:
             d[k].sort(key=lambda x: x[0])
     for k in ext_force_streams:
@@ -379,6 +421,7 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     # 3) Active joint set (실제 데이터 있는 것만).
     active_pos_joints = [n for n in column_joint_order if pos_streams[n]]
     active_trq_joints = [n for n in column_joint_order if trq_streams[n]]
+    active_ext_trq_joints = [n for n in ext_torque_joint_order if ext_trq_streams[n]]
     if not active_pos_joints:
         print("[ERROR] showcase 모드: joint_positions_deg 데이터가 없습니다.")
         return 0
@@ -389,6 +432,7 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     active_cpos_ids = [tid for tid, s in contact_pos_streams.items() if s]
     all_streams = ([pos_streams[n] for n in active_pos_joints]
                    + [trq_streams[n] for n in active_trq_joints]
+                   + [ext_trq_streams[n] for n in active_ext_trq_joints]
                    + [ext_force_streams[tid] for tid in active_ext_ids]
                    + [contact_pos_streams[tid] for tid in active_cpos_ids])
     t_start_ns = max(s[0][0] for s in all_streams)
@@ -426,6 +470,8 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
 
     pos_lookup = {n: _build_lookup(pos_streams[n]) for n in active_pos_joints}
     trq_lookup = {n: _build_lookup(trq_streams[n]) for n in active_trq_joints}
+    ext_trq_lookup = {n: _build_lookup(ext_trq_streams[n])
+                      for n in active_ext_trq_joints}
 
     # ─────────────────────────────────────────────────────────────────────
     # 5b) ext_force / contact_pos — chest_origin frame 으로 RAW 저장.
@@ -442,11 +488,22 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         header = (["time"]
-                  + [f"pos_{n}" for n in active_pos_joints]
-                  + [f"torque_{n}" for n in active_trq_joints])
-        # ext_force / contact_pos 컬럼 — ShowcaseReader 가 prefix 매칭으로 가져감.
+                  # pos_/torque_ 컬럼은 joint_full 의 short form 사용 (lowercase,
+                  # `_Joint` suffix 제거). 예: R_Ring_ABAD_Joint → r_ring_abad.
+                  + [f"pos_{joint_to_csv_short(n)}" for n in active_pos_joints]
+                  + [f"torque_{joint_to_csv_short(n)}" for n in active_trq_joints]
+                  # per-joint external torque (`/result/<group>/joint/ext_torque`).
+                  # column key = ext_joint_torque_<group_short>_<joint_stem_lower>
+                  # (e.g. ext_joint_torque_hand_l_index_abad). 별도 prefix 로 Wrench-torque
+                  # (ext_torque_<id>_x) 와 명확히 구분.
+                  + [f"ext_joint_torque_{EXT_TORQUE_JOINT_CSV_KEYS[n]}"
+                     for n in active_ext_trq_joints])
+        # ext_force / Wrench-torque / contact_pos 컬럼 — ShowcaseReader 가 prefix
+        # 매칭으로 가져감. Wrench 의 force / torque 둘 다 chest_origin frame
+        # (3+3 = 6 컬럼 per topic_id).
         for tid in active_ext_ids:
             header += [f"ext_force_{tid}_{ax}" for ax in ("x", "y", "z")]
+            header += [f"ext_torque_{tid}_{ax}" for ax in ("x", "y", "z")]
         for tid in active_cpos_ids:
             header += [f"contact_pos_{tid}_{ax}" for ax in ("x", "y", "z")]
         w.writerow(header)
@@ -461,9 +518,12 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
                 row.append(f"{pos_lookup[n](t_start_ns):.6f}")
             for n in active_trq_joints:
                 row.append(f"{trq_lookup[n](t_start_ns):.6f}")
+            for n in active_ext_trq_joints:
+                row.append(f"{ext_trq_lookup[n](t_start_ns):.6f}")
             for tid in active_ext_ids:
-                fx, fy, fz = ext_lookup[tid](t_start_ns)
-                row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}"]
+                fx, fy, fz, tx, ty, tz = ext_lookup[tid](t_start_ns)
+                row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}",
+                        f"{tx:.6f}", f"{ty:.6f}", f"{tz:.6f}"]
             for tid in active_cpos_ids:
                 px, py, pz = cpos_lookup[tid](t_start_ns)
                 row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}"]
@@ -481,10 +541,13 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
                 row.append(f"{pos_lookup[n](t_ns):.6f}")
             for n in active_trq_joints:
                 row.append(f"{trq_lookup[n](t_ns):.6f}")
-            # ext_force / contact_pos 는 chest_origin frame 그대로 — runtime 에서 변환.
+            for n in active_ext_trq_joints:
+                row.append(f"{ext_trq_lookup[n](t_ns):.6f}")
+            # ext_force / Wrench-torque / contact_pos 는 chest_origin frame 그대로 — runtime 에서 변환.
             for tid in active_ext_ids:
-                fx, fy, fz = ext_lookup[tid](t_ns)
-                row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}"]
+                fx, fy, fz, tx, ty, tz = ext_lookup[tid](t_ns)
+                row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}",
+                        f"{tx:.6f}", f"{ty:.6f}", f"{tz:.6f}"]
             for tid in active_cpos_ids:
                 px, py, pz = cpos_lookup[tid](t_ns)
                 row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}"]
@@ -495,6 +558,8 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     print(f"  grid:            {target_hz:.0f} Hz × {(t_end_ns - t_start_ns) / 1e9:.3f} s")
     print(f"  pos columns:     {len(active_pos_joints)} / {len(column_joint_order)} joints")
     print(f"  torque columns:  {len(active_trq_joints)} / {len(column_joint_order)} joints")
+    print(f"  ext_joint_torque cols: {len(active_ext_trq_joints)} / "
+          f"{len(ext_torque_joint_order)} joints (follower 포함, prefix=ext_joint_torque_)")
     if active_ext_ids:
         print(f"  ext_force:       {len(active_ext_ids)} ({', '.join(active_ext_ids)})")
     if active_cpos_ids:

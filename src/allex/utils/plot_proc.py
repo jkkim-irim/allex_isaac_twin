@@ -41,6 +41,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.animation import FuncAnimation  # noqa: E402
 from matplotlib.widgets import Button  # noqa: E402
 
+# 어두운 배경 — figure/axes facecolor + tick/label/legend 색을 한 번에 전환.
+plt.style.use("dark_background")
+
 import json  # noqa: E402
 import os  # noqa: E402
 import sys  # noqa: E402
@@ -196,6 +199,17 @@ def main() -> int:
         plot_mode = "rolling"
     save_on_exit = bool(init.get("save_on_exit", False))
     has_real = bool(init.get("has_real", False))
+    # Fixed y-limit (모든 subplot 공통). None → autoscale.
+    y_lim_raw = init.get("y_lim")
+    y_lim: Optional[tuple] = None
+    if isinstance(y_lim_raw, (list, tuple)) and len(y_lim_raw) == 2:
+        try:
+            _a = float(y_lim_raw[0])
+            _b = float(y_lim_raw[1])
+            if _a < _b:
+                y_lim = (_a, _b)
+        except (TypeError, ValueError):
+            y_lim = None
     groups = init.get("groups", [])
     if not isinstance(groups, list) or not groups:
         _log("init has no groups; exiting")
@@ -521,7 +535,10 @@ def main() -> int:
                     y_min = min(y_min, float(yr_vis.min()))
                     y_max = max(y_max, float(yr_vis.max()))
             ax.set_xlim(t_min, t_last + 1e-3)
-            if y_min != float("inf") and y_max != float("-inf"):
+            if y_lim is not None:
+                # 고정 y-axis — autoscale 끔.
+                ax.set_ylim(y_lim[0], y_lim[1])
+            elif y_min != float("inf") and y_max != float("-inf"):
                 if y_min == y_max:
                     y_min -= 1.0
                     y_max += 1.0

@@ -8,8 +8,10 @@ Column conventions:
 
 Sim CSV (from showcase_logger):
   time                                       — seconds
-  pos_<joint>                                — rad. follower joints excluded.
-  torque_<joint>                             — Nm. qfrc_actuator + qfrc_gravcomp.
+  pos_<joint_short>                          — rad. joint_short = joint_full 의 lowercase
+                                              minus `_Joint` (e.g. r_ring_abad). reader 가
+                                              reverse-map 해서 self.pos[joint_full] 로 저장.
+  torque_<joint_short>                       — Nm. qfrc_actuator + qfrc_gravcomp.
   contact_pos_<linkA> <-> <linkB>_{x,y,z}    — m, world frame. pair → pair_contact_pos.
   aggregate_origin_{x,y,z}                   — m, world frame.
   force_<linkA> <-> <linkB>                  — scalar, ignored (not loaded).
@@ -18,8 +20,20 @@ Sim CSV (from showcase_logger):
   normal_R_Palm_Net_Force_{x,y,z}            — unit normal.
 
 Real CSV (from rosbag_to_csv.py --format showcase):
-  time, pos_<joint>, torque_<joint>          — same as sim
+  time, pos_<joint_short>, torque_<joint_short>   — same naming as sim
+                                              (lowercase, no `_Joint` suffix).
+  ext_joint_torque_<short_key>               — Nm, per-joint external torque (스칼라).
+                                              `/result/<group>/joint/ext_torque` 토픽
+                                              에서 풀어 쓴 값. follower joint (DIP/IP)
+                                              도 포함. short_key 는
+                                              `EXT_TORQUE_JOINT_CSV_KEYS[joint_full]`
+                                              (e.g. hand_l_index_abad). 내부적으로는
+                                              joint_full → self.ext_joint_torque[joint_full]
+                                              로 reverse-map 해서 저장.
   ext_force_<topic_id>_{x,y,z}               — N, chest_origin frame. → topic_force_vec.
+  ext_torque_<topic_id>_{x,y,z}              — Nm, chest_origin frame. → topic_torque_vec.
+                                              (Wrench 의 torque.x/y/z. per-joint 스칼라는
+                                               별도 `ext_joint_torque_` prefix 라 충돌 없음.)
   contact_pos_<topic_id>_{x,y,z}             — m, chest_origin frame. → topic_contact_pos.
   (topic_id 예: arm_l, arm_r, shoulder_l, shoulder_r — ext_force_topics 매핑)
 
@@ -88,14 +102,45 @@ class ShowcaseReader:
             raise ValueError(f"csv missing 'time' column: {self.path}")
         self.t: np.ndarray = data[:, col_idx["time"]].astype(np.float64)
 
-        # --- pos_<joint> / torque_<joint> ------------------------------
+        # --- pos / torque / ext_joint_torque 컬럼 ------------------------
+        # 모든 joint scalar 컬럼은 short form (lowercase, no `_Joint`) 으로 emit 된다.
+        # reader 는 short → joint_full reverse-map 으로 dict key 를 joint_full 로 복원
+        # 한다 (csv_replayer 가 articulation.dof_names 기반 full 이름으로 lookup).
+        #
+        # 두 종류의 ext_torque 컬럼:
+        #   (a) ext_joint_torque_<short> — per-joint scalar. EXT_TORQUE_JOINT_CSV_KEYS
+        #       reverse 로 full 복원 → self.ext_joint_torque[joint_full].
+        #   (b) ext_torque_<topic_id>_{x,y,z} — Wrench 벡터 (별도 prefix). 아래 axis 그룹.
+        #
+        # Backward compat: 구버전 CSV (대문자 + `_Joint` 포함 컬럼) 도 그대로 받음 —
+        # reverse-map miss 시 column key 그대로를 dict key 로 사용.
+        try:
+            from ..trajectory_generate.joint_name_map import (
+                EXT_TORQUE_JOINT_CSV_KEYS,
+                JOINT_CSV_SHORT_TO_FULL,
+            )
+            _ejt_short_to_full = {v: k for k, v in EXT_TORQUE_JOINT_CSV_KEYS.items()}
+            _joint_short_to_full = JOINT_CSV_SHORT_TO_FULL
+        except Exception:
+            _ejt_short_to_full = {}
+            _joint_short_to_full = {}
+
         self.pos: Dict[str, np.ndarray] = {}
         self.torque: Dict[str, np.ndarray] = {}
+        self.ext_joint_torque: Dict[str, np.ndarray] = {}
         for name, idx in col_idx.items():
             if name.startswith("pos_"):
-                self.pos[name[len("pos_"):]] = data[:, idx].astype(np.float32)
+                key = name[len("pos_"):]
+                full = _joint_short_to_full.get(key, key)
+                self.pos[full] = data[:, idx].astype(np.float32)
+            elif name.startswith("ext_joint_torque_"):
+                short = name[len("ext_joint_torque_"):]
+                full = _ejt_short_to_full.get(short, short)
+                self.ext_joint_torque[full] = data[:, idx].astype(np.float32)
             elif name.startswith("torque_"):
-                self.torque[name[len("torque_"):]] = data[:, idx].astype(np.float32)
+                key = name[len("torque_"):]
+                full = _joint_short_to_full.get(key, key)
+                self.torque[full] = data[:, idx].astype(np.float32)
 
         # --- force_vec / contact_pos / ext_force ---------------------
         # Sim CSV (pair):
@@ -109,11 +154,13 @@ class ShowcaseReader:
         self.pair_force_vec: Dict[str, np.ndarray] = {}
         self.pair_contact_pos: Dict[str, np.ndarray] = {}
         self.topic_force_vec: Dict[str, np.ndarray] = {}
+        self.topic_torque_vec: Dict[str, np.ndarray] = {}
         self.topic_contact_pos: Dict[str, np.ndarray] = {}
 
         # First, group columns by raw key & axis.
         force_vec_axes: Dict[str, Dict[str, int]] = {}      # sim only
         ext_force_axes: Dict[str, Dict[str, int]] = {}      # real only
+        ext_torque_axes: Dict[str, Dict[str, int]] = {}     # real only (Wrench.torque)
         contact_pos_axes: Dict[str, Dict[str, int]] = {}    # sim + real (분기)
         for name, idx in col_idx.items():
             if not (name[-2:] in ("_x", "_y", "_z")):
@@ -125,6 +172,9 @@ class ShowcaseReader:
             elif name.startswith("ext_force_"):
                 raw = name[len("ext_force_"):-2]
                 ext_force_axes.setdefault(raw, {})[axis] = idx
+            elif name.startswith("ext_torque_"):
+                raw = name[len("ext_torque_"):-2]
+                ext_torque_axes.setdefault(raw, {})[axis] = idx
             elif name.startswith("contact_pos_"):
                 raw = name[len("contact_pos_"):-2]
                 contact_pos_axes.setdefault(raw, {})[axis] = idx
@@ -144,6 +194,11 @@ class ShowcaseReader:
             if not all(a in axes for a in ("x", "y", "z")):
                 continue
             self.topic_force_vec[raw_id] = _stack_xyz(axes)
+
+        for raw_id, axes in ext_torque_axes.items():
+            if not all(a in axes for a in ("x", "y", "z")):
+                continue
+            self.topic_torque_vec[raw_id] = _stack_xyz(axes)
 
         for raw, axes in contact_pos_axes.items():
             if not all(a in axes for a in ("x", "y", "z")):
@@ -199,7 +254,10 @@ class ShowcaseReader:
         logger.info(
             f"[replay] loaded {self.path.name}: T={len(self.t)}, "
             f"pos_joints={len(self.pos)}, torque_joints={len(self.torque)}, "
-            f"pairs={len(self.pair_force_vec)}, aggregates={len(self.aggregate)}"
+            f"ext_joint_torque_joints={len(self.ext_joint_torque)}, "
+            f"pairs={len(self.pair_force_vec)}, aggregates={len(self.aggregate)}, "
+            f"ext_force_topics={len(self.topic_force_vec)}, "
+            f"ext_torque_topics={len(self.topic_torque_vec)}"
         )
 
     # ------------------------------------------------------------------

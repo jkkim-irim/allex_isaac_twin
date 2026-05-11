@@ -39,13 +39,36 @@ SIM_COLOR = _tup3(_cfg["colors"]["sim"])
 
 # ---------------------------------------------------------------------------
 # Torque 링 스케일
+#
+# group gain 들은 단일 float (양쪽 공통) 또는 ``{"L": float, "R": float}`` 형태로
+# JSON 에 작성 가능. 내부적으론 항상 dict ``{"L": ..., "R": ...}`` 로 normalize.
+# ``_torque_gain_for(abbr)`` 가 dof_abbr 의 side prefix (L/R) 보고 골라 줌.
 # ---------------------------------------------------------------------------
 _t = _cfg["torque"]
+
+
+def _normalize_side_gain(raw, label: str) -> dict:
+    """float → {'L': f, 'R': f}; dict → {'L': L, 'R': R} (대소문자 무관). 실패 시 0.0."""
+    if isinstance(raw, dict):
+        try:
+            l = float(raw.get("L", raw.get("l", 0.0)))
+            r = float(raw.get("R", raw.get("r", 0.0)))
+            return {"L": l, "R": r}
+        except (TypeError, ValueError):
+            pass
+    try:
+        f = float(raw)
+        return {"L": f, "R": f}
+    except (TypeError, ValueError):
+        print(f"[viz_config] {label}: invalid value {raw!r}, fallback to 0.0")
+        return {"L": 0.0, "R": 0.0}
+
+
 TORQUE_GAIN          = float(_t["gain_default"])
-TORQUE_GAIN_SHOULDER = float(_t["gain_shoulder"])
-TORQUE_GAIN_ELBOW    = float(_t["gain_elbow"])
-TORQUE_GAIN_WRIST    = float(_t["gain_wrist"])
-TORQUE_GAIN_FINGER   = float(_t["gain_finger"])
+TORQUE_GAIN_SHOULDER = _normalize_side_gain(_t["gain_shoulder"], "gain_shoulder")
+TORQUE_GAIN_ELBOW    = _normalize_side_gain(_t["gain_elbow"],    "gain_elbow")
+TORQUE_GAIN_WRIST    = _normalize_side_gain(_t["gain_wrist"],    "gain_wrist")
+TORQUE_GAIN_FINGER   = _normalize_side_gain(_t["gain_finger"],   "gain_finger")
 TORQUE_MIN_SCALE     = float(_t["min_scale"])
 TORQUE_MAX_SCALE     = float(_t["max_scale"])
 
@@ -67,6 +90,39 @@ FORCE_GAIN      = float(_f["gain"])
 FORCE_MIN_SCALE = float(_f["min_scale"])
 FORCE_MAX_SCALE = float(_f["max_scale"])
 FORCE_VEC_HIDE_BELOW = float(_f["hide_below"])
+
+
+# ---------------------------------------------------------------------------
+# Ext-torque 화살표 스케일 (Wrench 의 torque 시각화 전용)
+# JSON 에 ext_torque 섹션 없으면 force 와 동일값으로 fallback.
+# ---------------------------------------------------------------------------
+def _tup3_or_none(v):
+    if v is None:
+        return None
+    try:
+        return (float(v[0]), float(v[1]), float(v[2]))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+_et = _cfg.get("ext_torque", {})
+EXT_TORQUE_GAIN       = float(_et.get("gain",       FORCE_GAIN))
+EXT_TORQUE_MIN_SCALE  = float(_et.get("min_scale",  FORCE_MIN_SCALE))
+EXT_TORQUE_MAX_SCALE  = float(_et.get("max_scale",  FORCE_MAX_SCALE))
+EXT_TORQUE_HIDE_BELOW = float(_et.get("hide_below", FORCE_VEC_HIDE_BELOW))
+# None 이면 visualizer 가 source color (real/sim) 로 fallback.
+EXT_TORQUE_COLOR_REAL = _tup3_or_none(_et.get("color_real"))
+EXT_TORQUE_COLOR_SIM  = _tup3_or_none(_et.get("color_sim"))
+
+
+# ---------------------------------------------------------------------------
+# Per-joint external torque ring scaling.
+# `/result/<group>/joint/ext_torque` 의 값을 ring 에 substitute 할 때 기존
+# per_joint_torque_gain 위에 곱해지는 보조 스케일. 별도 prim 안 만들고 기존
+# ring 재사용이라 색은 source(real) 색 그대로 — 별도 색 변수 없음.
+# ---------------------------------------------------------------------------
+_ejt = _cfg.get("ext_joint_torque", {})
+EXT_JOINT_TORQUE_GAIN_MULT = float(_ejt.get("gain_multiplier", 1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +154,33 @@ FORCE_VEC_HEAD_NAME             = _fv["head_name"]
 FORCE_VEC_SHAFT_BASE_LENGTH     = float(_fv["shaft_base_length"])
 FORCE_VEC_HEAD_BASE_TRANSLATE_Z = float(_fv["head_base_translate_z"])
 FORCE_VEC_LENGTH_AXIS           = int(_fv["length_axis"])
+
+
+# ---------------------------------------------------------------------------
+# Torque plot (TorquePlotter rolling window / y-axis)
+# ---------------------------------------------------------------------------
+_tp = _cfg.get("torque_plot", {})
+
+
+def _parse_y_lim(v, label: str):
+    """null → None (autoscale). [ymin, ymax] (ymin<ymax) → (float, float). 그 외 → None."""
+    if v is None:
+        return None
+    try:
+        a = float(v[0])
+        b = float(v[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        print(f"[viz_config] {label}: invalid value {v!r}, fallback to autoscale")
+        return None
+    if not (a < b):
+        print(f"[viz_config] {label}: ymin>=ymax in {v!r}, fallback to autoscale")
+        return None
+    return (a, b)
+
+
+TORQUE_PLOT_WINDOW_SECONDS = float(_tp.get("window_seconds", 20.0))
+TORQUE_PLOT_Y_LIM_BODY = _parse_y_lim(_tp.get("y_lim_body"), "torque_plot.y_lim_body")
+TORQUE_PLOT_Y_LIM_HAND = _parse_y_lim(_tp.get("y_lim_hand"), "torque_plot.y_lim_hand")
 
 
 # ---------------------------------------------------------------------------

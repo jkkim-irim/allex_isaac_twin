@@ -32,18 +32,20 @@ _VIZ_SCENARIO_FILE = "viz_scenario_config.json"
 def _load_viz_scenario(group_dir: Path) -> dict:
     """``<group>/viz_scenario_config.json`` 로드. 없거나 파싱 실패면 빈 dict.
 
-    스키마 (전체 optional):
+    스키마 (전체 optional). 자세한 설명은 `dvcc/20_viz_scenario_usage.md` 참조.
     ```
     {
-      "_notes": "...",                            # 무시 (underscore prefix 키)
-      "force_triggers":       {<col_prefix>: [[t_on, t_off], ...]},
-      "torque_ring_triggers": {"real": [...], "sim": [...]},
-      "graph_plots":          [ {plot_spec}, ... ]
+      "_notes": "...",                                # 무시 (underscore prefix 키)
+      "force_triggers":            {"ext_force_<id>":          [[t_on, t_off], ...] | "off"},
+      "ext_torque_triggers":       {"ext_torque_<id>":         [[t_on, t_off], ...] | "off"},
+      "torque_ring_triggers":      {"<src>[.<region>]":        [[t_on, t_off], ...] | "off"},
+      "ext_joint_torque_triggers": {"ext_joint_torque_<short>": [[t_on, t_off], ...] | "off"},
+      "graph_plots":               [ {plot_spec}, ... ]
     }
     ```
 
     파일이 없으면 빈 dict — 기존 default 동작 (force 는 sim-active gate fallback,
-    torque ring 은 user 토글, graph plot 없음) 그대로 유지.
+    torque ring 은 user 토글, ext_joint_torque substitution 없음, graph plot 없음).
     """
     p = group_dir / _VIZ_SCENARIO_FILE
     if not p.is_file():
@@ -360,8 +362,12 @@ class ShowcaseReplayControls:
         scen_parts = []
         if viz_scenario.get("force_triggers"):
             scen_parts.append(f"force={len(viz_scenario['force_triggers'])}ch")
+        if viz_scenario.get("ext_torque_triggers"):
+            scen_parts.append(f"ext_torque={len(viz_scenario['ext_torque_triggers'])}ch")
         if viz_scenario.get("torque_ring_triggers"):
-            scen_parts.append(f"torque={len(viz_scenario['torque_ring_triggers'])}ch")
+            scen_parts.append(f"torque_ring={len(viz_scenario['torque_ring_triggers'])}ch")
+        if viz_scenario.get("ext_joint_torque_triggers"):
+            scen_parts.append(f"ext_jtq={len(viz_scenario['ext_joint_torque_triggers'])}ch")
         if viz_scenario.get("graph_plots"):
             scen_parts.append(f"plots={len(viz_scenario['graph_plots'])}")
         scen_tag = (", scenario={" + ",".join(scen_parts) + "}") if scen_parts else ""

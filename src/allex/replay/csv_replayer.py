@@ -25,6 +25,9 @@ from typing import Optional
 import numpy as np
 
 from .showcase_reader import ShowcaseReader
+from ..config.viz_config import (
+    HAND_JOINT_TORQUE_RING_MAP, EXT_JOINT_TORQUE_GAIN_MULT,
+)
 
 logger = logging.getLogger("allex.replay.csv")
 
@@ -164,7 +167,8 @@ class CsvReplayer:
         self._sec_src = _other_source(ms)
 
         # viz_scenario_config.json 에서 로드된 시나리오 dict. 키 (전부 optional):
-        #   "force_triggers":       {<col_prefix>: [[t_on, t_off], ...]}
+        #   "force_triggers":       {"ext_force_<topic_id>":  [[t_on, t_off], ...]}
+        #   "ext_torque_triggers":  {"ext_torque_<topic_id>": [[t_on, t_off], ...]}
         #   "torque_ring_triggers": {"real": [...], "sim": [...]}
         #   "graph_plots":          [ {plot_spec}, ... ]
         # 각 섹션은 _parse_*_triggers 헬퍼로 검증·정규화 후 내부 dict 에 저장.
@@ -179,6 +183,14 @@ class CsvReplayer:
             viz_scenario.get("force_triggers") or {}
         )
 
+        # --- ext_torque_triggers 파싱 ---
+        # ext_force_triggers 와 동일 시멘틱 — Wrench 의 torque (Nm) arrow 게이팅.
+        # CSV 컬럼 prefix: ext_torque_<topic_id>. 내부 dict key: topic_id.
+        # 비어있고 force_triggers 도 비어있으면 default visible (force 와 같은 fallback).
+        self._ext_torque_triggers: dict = self._parse_ext_torque_triggers(
+            viz_scenario.get("ext_torque_triggers") or {}
+        )
+
         # --- torque_ring_triggers 파싱 ---
         # 키 = "real" / "sim", 값 = list of [t_on, t_off]. 매 tick 시간 보고 visualizer 의
         # 채널별 gate 를 동적 토글. 없으면 visualizer 의 user 모드 그대로.
@@ -188,14 +200,27 @@ class CsvReplayer:
         # 직전 적용된 gate 상태 — transition 만 visualizer 에 push (불필요한 호출 방지).
         self._torque_gate_prev: dict = {}
 
+        # --- ext_joint_torque_triggers 파싱 ---
+        # Key = CSV column name 그대로 (e.g. ``ext_joint_torque_hand_l_index_abad``).
+        # ext_joint_torque CSV 는 real 만 존재 (sim 없음) 라 source/region 시멘틱 불필요
+        # — 그냥 joint 별 trigger window 만 다룬다.
+        # Internal dict: joint_full_name → ranges. parser 가 short→full reverse-map.
+        self._ext_jtq_triggers: dict = self._parse_ext_joint_torque_triggers(
+            viz_scenario.get("ext_joint_torque_triggers") or {}
+        )
+
         # --- graph_plots: Phase 3 에서 처리 — 현재는 보관만, 미사용. ---
         self._graph_plot_specs = list(viz_scenario.get("graph_plots") or [])
 
-        if self._force_triggers or self._torque_ring_triggers or self._graph_plot_specs:
+        if (self._force_triggers or self._ext_torque_triggers
+                or self._torque_ring_triggers or self._ext_jtq_triggers
+                or self._graph_plot_specs):
             logger.info(
                 f"[replay] viz_scenario loaded: "
                 f"force={len(self._force_triggers)}ch, "
-                f"torque={len(self._torque_ring_triggers)}ch, "
+                f"ext_torque={len(self._ext_torque_triggers)}ch, "
+                f"torque_ring={len(self._torque_ring_triggers)}ch, "
+                f"ext_joint_torque={len(self._ext_jtq_triggers)}ch, "
                 f"plots={len(self._graph_plot_specs)}"
             )
         # TorquePlotter 인스턴스(들). plot 도 CSV 값을 보여주려면 sim tau / real dict
@@ -326,8 +351,32 @@ class CsvReplayer:
         self._q_buf_t = None
         self._zero_vel_t = None
 
+        # ext_joint_torque substitution 상태 추적 — transition 시점에 log.
+        # ``_ext_jtq_active`` 는 이번 step 에서 override 된 (joint, source) set,
+        # ``_ext_jtq_prev_active`` 는 직전 step 의 동일 set. 매 step 끝에 diff 해
+        # 새로 진입한 joint 는 warning, 빠져나간 joint 는 info 로 1회 emit.
+        self._ext_jtq_active: set[tuple[str, str]] = set()
+        self._ext_jtq_prev_active: set[tuple[str, str]] = set()
+
+        # joint_name → frozenset[region] cache. ext_joint_torque_triggers 의
+        # (source, region) key 매칭에 사용. visualizer 의 _dof_abbr_to_regions 와
+        # 동일 룰을 csv_replayer 측에 1회 빌드 — 핫패스에서 viz private 멤버 안 만짐.
+        self._joint_to_regions: dict[str, frozenset] = {}
+        try:
+            from ..core.force_torque_visualizer import ForceTorqueVisualizer
+            for e in HAND_JOINT_TORQUE_RING_MAP:
+                jn = e["usd_joint_name"]
+                abbr = e["dof_abbr"]
+                self._joint_to_regions[jn] = (
+                    ForceTorqueVisualizer._dof_abbr_to_regions(abbr)
+                )
+        except Exception as exc:
+            logger.debug(f"[replay] build joint→regions cache warn: {exc}")
+
         # custom force vector 등록 상태 — (sanitized_pair, source) 가 add 됐는지.
         self._registered_force_keys: set[tuple[str, str]] = set()
+        # custom torque ring 등록 상태 (ext_torque ring 전용).
+        self._registered_torque_ring_keys: set[tuple[str, str]] = set()
 
         # Real arrow 의 origin 을 sim 의 contact_pos 로 대체하는 모드 (UI toggle).
         # vector 자체는 real ext_force 그대로, 위치만 sim 에서 가져와 overlay.
@@ -647,6 +696,90 @@ class CsvReplayer:
 
         self._step_count += 1
 
+    def _maybe_substitute_ext_torque(
+        self,
+        reader: ShowcaseReader,
+        joint_name: str,
+        torque_arr,
+        idx: int,
+        source: str,
+        t_rel: float,
+    ) -> float:
+        """ext_joint_torque_triggers[joint_name] window 안이고
+        ``reader.ext_joint_torque[joint_name]`` 데이터가 있으면 ext_torque ×
+        EXT_JOINT_TORQUE_GAIN_MULT 리턴. 아니면 internal torque (torque_arr[idx]) 그대로.
+
+        Trigger key 가 joint_full 단위라 source/region 매칭 불필요. ext_joint_torque CSV
+        는 real 만 존재하므로 sim reader 면 reader.ext_joint_torque 가 비어있어 자동 fallback.
+        """
+        if not self._ext_jtq_triggers:
+            return float(torque_arr[idx])
+        ranges = self._ext_jtq_triggers.get(joint_name)
+        if not ranges:
+            return float(torque_arr[idx])
+        ext_arr = reader.ext_joint_torque.get(joint_name)
+        if ext_arr is None or idx >= len(ext_arr):
+            return float(torque_arr[idx])
+        if not _t_in_ranges(t_rel, ranges):
+            return float(torque_arr[idx])
+        # substitution 발생 — transition log 용으로 active set 기록.
+        self._ext_jtq_active.add((joint_name, source))
+        return float(ext_arr[idx]) * EXT_JOINT_TORQUE_GAIN_MULT
+
+    def _flush_ext_jtq_diff(self, t_rel_main: float) -> None:
+        """매 step 말 호출. 이번 step 의 substitution active set 과 직전 step set 을
+        diff 해서:
+          (a) transition 만 로그로 emit (spam 방지)
+          (b) visualizer 의 _torque_ring_force_visible_dofs 동기화 — entered joint
+              는 mode/gate override 해서 강제 visible, exited 는 override 해제 →
+              torque_ring_triggers 가 "off" 여도 substitution 활성 joint 의 ring 만
+              표시 가능.
+        """
+        viz = self._viz
+        curr = self._ext_jtq_active
+        prev = self._ext_jtq_prev_active
+        if curr != prev:
+            entered = curr - prev
+            exited = prev - curr
+            # visualizer override set 동기화 — joint_name → dof_abbr.
+            j2abbr = self._joint_name_to_abbr_cache()
+            for jn, src in entered:
+                abbr = j2abbr.get(jn)
+                if abbr and viz is not None and hasattr(viz, "set_torque_ring_force_visible"):
+                    try:
+                        viz.set_torque_ring_force_visible(src, abbr, True)
+                    except Exception as e:
+                        logger.debug(f"[replay] force_visible set warn: {e}")
+            for jn, src in exited:
+                abbr = j2abbr.get(jn)
+                if abbr and viz is not None and hasattr(viz, "set_torque_ring_force_visible"):
+                    try:
+                        viz.set_torque_ring_force_visible(src, abbr, False)
+                    except Exception as e:
+                        logger.debug(f"[replay] force_visible clear warn: {e}")
+            for jn, src in sorted(entered):
+                logger.warning(
+                    f"[replay] ext_torque substitution active @ t={t_rel_main:.3f}s: "
+                    f"joint={jn}, source={src} — ring 에 internal torque 대신 "
+                    f"external torque 가 표시됨 (torque_ring 모드/gate override)"
+                )
+            for jn, src in sorted(exited):
+                logger.info(
+                    f"[replay] ext_torque substitution ended @ t={t_rel_main:.3f}s: "
+                    f"joint={jn}, source={src} — ring 이 internal torque 로 복귀"
+                )
+            self._ext_jtq_prev_active = set(curr)
+        self._ext_jtq_active.clear()
+
+    def _joint_name_to_abbr_cache(self) -> dict:
+        """joint_full → dof_abbr 매핑 (HAND_JOINT_TORQUE_RING_MAP 기반). lazy 빌드."""
+        cache = getattr(self, "_jn2abbr", None)
+        if cache is None:
+            cache = {e["usd_joint_name"]: e["dof_abbr"]
+                     for e in HAND_JOINT_TORQUE_RING_MAP}
+            self._jn2abbr = cache
+        return cache
+
     def _update_torque_ring_gates(self, idx_main: int, idx_sec: Optional[int]) -> None:
         """현재 t 가 (source, region) 별 active range 안에 있는지 검사 → visualizer
         region gate 토글.
@@ -697,9 +830,15 @@ class CsvReplayer:
             return
 
         # 2) main torque → main_src ring channel.
+        # ext_joint_torque_triggers 가 (main_src, region) 으로 현재 t 에서 활성이면
+        # 그 region 의 joint 는 main.ext_joint_torque[joint] 로 substitute (per-joint).
+        main_t_rel = float(self._main.t[idx_main] - self._main.t[0])
         for csv_joint, arr in self._main.torque.items():
+            value = self._maybe_substitute_ext_torque(
+                self._main, csv_joint, arr, idx_main, self._main_src, main_t_rel,
+            )
             try:
-                viz.push_external_torque(csv_joint, float(arr[idx_main]),
+                viz.push_external_torque(csv_joint, float(value),
                                          source=self._main_src)
             except Exception as exc:
                 if self._step_count % 200 == 0:
@@ -718,9 +857,13 @@ class CsvReplayer:
 
         # 4) secondary torque push (force 는 위 sim path / 아래 routed real path 가 처리).
         if self._sec is not None and sec_idx is not None:
+            sec_t_rel = float(self._sec.t[sec_idx] - self._sec.t[0])
             for csv_joint, arr in self._sec.torque.items():
+                value = self._maybe_substitute_ext_torque(
+                    self._sec, csv_joint, arr, sec_idx, self._sec_src, sec_t_rel,
+                )
                 try:
-                    viz.push_external_torque(csv_joint, float(arr[sec_idx]),
+                    viz.push_external_torque(csv_joint, float(value),
                                              source=self._sec_src)
                 except Exception as exc:
                     if self._step_count % 200 == 0:
@@ -733,6 +876,8 @@ class CsvReplayer:
         real_reader, real_idx = self._reader_idx_for("real", idx_main, sec_idx)
         if real_reader is not None and real_idx is not None:
             self._push_real_force_routed(sim_reader, sim_idx, real_reader, real_idx)
+            # ext_torque arrow (Wrench.torque). force 와 독립 게이팅, 같은 chest 변환.
+            self._push_real_torque_routed(real_reader, real_idx)
 
         # 5) CSV 에 없는 follower (DIP/IP) ring 은 0 push → base_scale 거대값 → floor.
         if self._unpushed_torque_joints:
@@ -743,6 +888,10 @@ class CsvReplayer:
                         viz.push_external_torque(jn, 0.0, source=self._sec_src)
                 except Exception:
                     pass
+
+        # 6) ext_torque substitution transition log (warning/info, transition 만 emit).
+        if self._ext_jtq_triggers:
+            self._flush_ext_jtq_diff(main_t_rel)
 
     def _kinematic_write(self, idx: int) -> None:
         if self._num_dof == 0 or self._q_buf is None:
@@ -1227,23 +1376,95 @@ class CsvReplayer:
         JSON key form: ``ext_force_<topic_id>`` (CSV 컬럼 prefix 와 일치).
         Internal key: ``<topic_id>`` (showcase_reader.topic_force_vec 와 매칭용).
         """
+        return CsvReplayer._parse_prefixed_triggers(raw, "ext_force_", "force_trigger")
+
+    @staticmethod
+    def _parse_ext_torque_triggers(raw: dict) -> dict:
+        """ext_torque_triggers — force_triggers 와 동일 구조, prefix 만 다름.
+
+        JSON key form: ``ext_torque_<topic_id>``.
+        Internal key: ``<topic_id>`` (topic_torque_vec 매칭용).
+        """
+        return CsvReplayer._parse_prefixed_triggers(raw, "ext_torque_", "ext_torque_trigger")
+
+    @staticmethod
+    def _parse_ext_joint_torque_triggers(raw: dict) -> dict:
+        """ext_joint_torque_triggers — CSV column key 그대로 받는 per-joint trigger.
+
+        JSON key form:    ``ext_joint_torque_<short_key>`` (CSV 컬럼명과 동일).
+        Internal key:     ``<joint_full_name>`` (short → full reverse-map).
+        Value:            normal range list 또는 explicit OFF (``"off"`` / ``false`` / ``[]``).
+        """
+        if not isinstance(raw, dict):
+            return {}
+        # short_key → joint_full reverse-map (lazy load).
+        try:
+            from ..trajectory_generate.joint_name_map import EXT_TORQUE_JOINT_CSV_KEYS
+            short_to_full = {v: k for k, v in EXT_TORQUE_JOINT_CSV_KEYS.items()}
+        except Exception:
+            short_to_full = {}
+
+        out: dict = {}
+        prefix = "ext_joint_torque_"
+        for raw_key, ranges in raw.items():
+            if not isinstance(raw_key, str):
+                continue
+            if not raw_key.startswith(prefix):
+                logger.warning(
+                    f"[replay] ext_joint_torque_trigger key {raw_key!r} 은 "
+                    f"'{prefix}<short>' 형태여야 합니다 (CSV 컬럼명 그대로). skip."
+                )
+                continue
+            short = raw_key[len(prefix):]
+            joint_full = short_to_full.get(short)
+            if joint_full is None:
+                logger.warning(
+                    f"[replay] ext_joint_torque_trigger {raw_key!r}: 알 수 없는 short_key "
+                    f"'{short}'. EXT_TORQUE_JOINT_CSV_KEYS 에 없습니다. skip."
+                )
+                continue
+            is_off = (ranges is False
+                      or (isinstance(ranges, str) and ranges.strip().lower() == "off")
+                      or (isinstance(ranges, list) and len(ranges) == 0))
+            if is_off:
+                out[joint_full] = []
+                continue
+            clean = _validate_ranges(f"ext_joint_torque_trigger '{raw_key}'", ranges)
+            if clean:
+                out[joint_full] = clean
+        return out
+
+    @staticmethod
+    def _parse_prefixed_triggers(raw: dict, prefix: str, label: str) -> dict:
+        """force_triggers / ext_torque_triggers (Wrench) 공용 파서.
+
+        Value 규칙은 _parse_channel_triggers 와 동일:
+          - ``[[t_on, t_off], ...]`` : 정상 trigger window
+          - ``"off"`` / ``false`` / ``[]`` : explicit OFF — 그 topic_id 의 arrow 영구 hide
+        """
         if not isinstance(raw, dict):
             return {}
         out: dict = {}
         for raw_key, ranges in raw.items():
             if not isinstance(raw_key, str):
                 continue
-            if not raw_key.startswith("ext_force_"):
+            if not raw_key.startswith(prefix):
                 logger.warning(
-                    f"[replay] force_trigger key {raw_key!r} 은 'ext_force_<topic_id>' "
+                    f"[replay] {label} key {raw_key!r} 은 '{prefix}<topic_id>' "
                     f"형태여야 합니다 (CSV 컬럼 prefix 와 일치). skip."
                 )
                 continue
-            topic_id = raw_key[len("ext_force_"):]
+            topic_id = raw_key[len(prefix):]
             if not topic_id:
-                logger.warning(f"[replay] force_trigger key {raw_key!r}: topic_id 비어있음. skip.")
+                logger.warning(f"[replay] {label} key {raw_key!r}: topic_id 비어있음. skip.")
                 continue
-            clean = _validate_ranges(f"force_trigger '{raw_key}'", ranges)
+            is_off = (ranges is False
+                      or (isinstance(ranges, str) and ranges.strip().lower() == "off")
+                      or (isinstance(ranges, list) and len(ranges) == 0))
+            if is_off:
+                out[topic_id] = []
+                continue
+            clean = _validate_ranges(f"{label} '{raw_key}'", ranges)
             if clean:
                 out[topic_id] = clean
         return out
@@ -1257,7 +1478,15 @@ class CsvReplayer:
           - ``"real.<region>"`` / ``"sim.<region>"`` : 특정 region 만
             (예: "real.Arm_L", "real.Hand_L_thumb")
 
-        Returns: dict[(source, region|None) -> sorted_ranges]
+        Value form:
+          - ``[[t_on, t_off], ...]`` : 정상 trigger window
+          - ``"off"`` / ``false`` / ``[]`` : explicit OFF — 그 (source, region) 의
+            ring 을 replay 동안 항상 hide. 빈 dict ``{}`` 와 다름:
+              · ``{}`` (전체) → trigger 없음 → mode 기본값 (visible)
+              · ``{"real": "off"}`` → real source 의 모든 ring 강제 hide
+
+        Returns: dict[(source, region|None) -> ranges]. 빈 ranges list 면 "always off"
+        sentinel — _update_*_gates 가 첫 step 에 False 로 push.
         """
         if not isinstance(raw, dict):
             return {}
@@ -1273,6 +1502,13 @@ class CsvReplayer:
             if ch not in ("real", "sim"):
                 logger.warning(f"[replay] {label}_trigger: invalid channel {ch_raw!r}, skip "
                                f"(expected 'real'/'sim' or 'real.<region>'/'sim.<region>')")
+                continue
+            # explicit OFF: "off" / false / [] → 항상 hide.
+            is_off = (ranges is False
+                      or (isinstance(ranges, str) and ranges.strip().lower() == "off")
+                      or (isinstance(ranges, list) and len(ranges) == 0))
+            if is_off:
+                out[(ch, region)] = []  # 빈 ranges = always-off sentinel
                 continue
             clean = _validate_ranges(f"{label}_trigger.{ch_raw}", ranges)
             if clean:
@@ -1415,8 +1651,154 @@ class CsvReplayer:
 
             self._set_or_add(viz, topic_id, "real", p_world, f_world)
 
-    def _set_or_add(self, viz, name: str, source: str, origin, vec) -> None:
-        """``set_custom_force_vector`` 호출. 첫 호출이면 ``add_custom_force_vector``."""
+    def _push_real_torque_routed(self, real_reader: ShowcaseReader,
+                                 real_idx: int) -> None:
+        """real CSV 의 모든 ext_torque topic 을 contact_pos 중심 **torque ring**
+        (arrow 아님!) 으로 push.
+
+        Iteration: ``real_reader.topic_torque_vec.keys()``. 각 topic_id 에 대해
+        chest→world 변환 후 ``torque_<topic_id>`` 이름으로 free-floating ring 생성.
+        기존 joint torque ring 과는 prim namespace 분리 (``/World/AllexTorqueRing/real/...``).
+
+        Gate 결정 순서 (ext_torque_triggers 만 보고 결정 — ext_force gate 와 독립):
+          1) self._ext_torque_triggers[topic_id] 있음 → 시간 범위 in/out
+          2) self._ext_torque_triggers 가 비어있지 않은데 이 topic 만 미정의
+             → exclusive hide
+          3) self._ext_torque_triggers 통째로 비어있음 → default visible
+             (hide_below 임계가 알아서 작은 |τ| 자동 hide)
+
+        Ring 의 +Z 축 = torque vector 방향 (world frame). 위치 = contact_pos
+        (topic_contact_pos 가 있으면 chest→world, 없으면 chest_origin link 위치).
+        스케일 = clip(|τ|*EXT_TORQUE_GAIN, EXT_TORQUE_MIN_SCALE, EXT_TORQUE_MAX_SCALE).
+        """
+        viz = self._viz
+        if viz is None:
+            return
+        if not real_reader.topic_torque_vec:
+            return
+
+        chest_mat = self._get_chest_world_matrix()
+        if chest_mat is None:
+            return
+
+        current_t_rel = float(real_reader.t[real_idx] - real_reader.t[0])
+        triggers_section_empty = not self._ext_torque_triggers
+
+        for topic_id, torque_arr in real_reader.topic_torque_vec.items():
+            triggers = self._ext_torque_triggers.get(topic_id)
+            if triggers is not None:
+                active = any(t_on <= current_t_rel <= t_off
+                             for t_on, t_off in triggers)
+            elif not triggers_section_empty:
+                active = False
+            else:
+                active = True
+
+            prim_name = f"torque_{topic_id}"
+            if not active:
+                self._set_torque_ring_prim_visible(viz, prim_name, "real", False)
+                continue
+
+            t_chest = torque_arr[real_idx]
+            t_world = self._xform_vec_chest_to_world(t_chest, chest_mat)
+            magnitude = float((t_world[0] * t_world[0]
+                               + t_world[1] * t_world[1]
+                               + t_world[2] * t_world[2]) ** 0.5)
+
+            cpos_arr = real_reader.topic_contact_pos.get(topic_id)
+            if cpos_arr is not None:
+                p_chest = cpos_arr[real_idx]
+                p_world = self._xform_pt_chest_to_world(p_chest, chest_mat)
+            else:
+                p_world = (float(chest_mat[3][0]),
+                           float(chest_mat[3][1]),
+                           float(chest_mat[3][2]))
+
+            self._set_or_add_torque_ring(viz, prim_name, "real",
+                                         p_world, t_world, magnitude)
+
+    def _set_or_add_torque_ring(self, viz, name: str, source: str,
+                                position, axis_vec, magnitude: float) -> None:
+        """add_custom_torque_ring 첫 호출 / 이후 set_custom_torque_ring 으로 갱신."""
+        try:
+            ox, oy, oz = float(position[0]), float(position[1]), float(position[2])
+            ax, ay, az = float(axis_vec[0]), float(axis_vec[1]), float(axis_vec[2])
+            mag = float(magnitude)
+        except Exception:
+            return
+        if not (np.isfinite(ox) and np.isfinite(oy) and np.isfinite(oz)
+                and np.isfinite(ax) and np.isfinite(ay) and np.isfinite(az)
+                and np.isfinite(mag)):
+            return
+
+        key = (name, source)
+        if key not in self._registered_torque_ring_keys:
+            try:
+                ret = viz.add_custom_torque_ring(
+                    name, position=(ox, oy, oz), axis=(ax, ay, az),
+                    magnitude=mag, source=source,
+                )
+                if ret is not None:
+                    self._registered_torque_ring_keys.add(key)
+            except Exception as exc:
+                import traceback
+                logger.warning(
+                    f"[replay] add_custom_torque_ring raised: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+            return
+
+        try:
+            viz.set_custom_torque_ring(
+                name, source=source,
+                position=(ox, oy, oz), axis=(ax, ay, az), magnitude=mag,
+            )
+        except Exception as exc:
+            if self._step_count % 200 == 0:
+                logger.debug(f"[replay] set_custom_torque_ring warn: {exc}")
+
+    def _set_torque_ring_prim_visible(self, viz, name: str, source: str,
+                                       visible: bool) -> None:
+        """custom torque ring prim visibility 토글. 충돌 방지를 위해 session layer 통해."""
+        try:
+            key = f"{source}::{name}"
+            rec = getattr(viz, "_custom_torque_ring_prims", {}).get(key)
+            if rec is None:
+                return
+            prim = rec.get("prim")
+            if prim is None:
+                return
+            if visible:
+                # torque_mode 검사 — replay bypass 없으면 mode 따라 hide.
+                bypass = getattr(viz, "_replay_force_visible", False)
+                if not bypass:
+                    mode = getattr(viz, "_torque_mode", "off")
+                    src_lc = (source or "").lower()
+                    if src_lc == "real" and mode not in ("real", "both"):
+                        return
+                    if src_lc == "sim" and mode not in ("sim", "both"):
+                        return
+            set_vis = getattr(viz, "_set_visible", None)
+            if set_vis is not None:
+                set_vis(prim, visible)
+            try:
+                prim_path = prim.GetPath().pathString
+                cache = getattr(viz, "_threshold_hide_state", None)
+                if cache is not None:
+                    cache[prim_path] = (not visible)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug(f"[replay] torque ring visibility toggle warn: {exc}")
+
+    def _set_or_add(self, viz, name: str, source: str, origin, vec,
+                    kind: str = "force") -> None:
+        """``set_custom_force_vector`` 호출. 첫 호출이면 ``add_custom_force_vector``.
+
+        kind: 'force' (default) 또는 'torque'. 'torque' 면 ext_torque 스케일/색이
+        적용된 화살표를 만든다. set_custom_force_vector 는 prim 의 kind 를 보고
+        자동으로 같은 스케일을 사용.
+        """
         # NaN 방어 (CSV 빈 셀).
         try:
             ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
@@ -1432,6 +1814,7 @@ class CsvReplayer:
             try:
                 ret = viz.add_custom_force_vector(
                     name, position=(ox, oy, oz), vector=(fx, fy, fz), source=source,
+                    kind=kind,
                 )
                 logger.debug(
                     f"[replay] add_custom_force_vector(name={name!r}, src={source}) "

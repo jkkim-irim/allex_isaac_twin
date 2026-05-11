@@ -12,7 +12,7 @@
     "gain_shoulder": 0.05,
     "gain_elbow":    0.06,
     "gain_wrist":    0.08,
-    "gain_finger":   { "L": 0.35,  "R": 1.0 },
+    "gain_finger":   0.10,
     "min_scale": 0.03,
     "max_scale": 4.0,
     "ring_offset_along_axis": {
@@ -29,10 +29,10 @@
 
   "force": {
     "_doc": "force arrow scale = clip(|F|*gain, min_scale, max_scale). hide_below 미만이면 화살표 prim 을 visible=false 로.",
-    "gain": 2.0,
+    "gain": 15.0,
     "min_scale": -60.0,
     "max_scale":  60.0,
-    "hide_below": 2.0
+    "hide_below": 0.5
   },
 
   "ext_torque": {

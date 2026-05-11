@@ -38,7 +38,7 @@ logger = logging.getLogger("allex.torque_plotter")
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-_DEFAULT_WINDOW_SECONDS = 5.0
+_DEFAULT_WINDOW_SECONDS = 20.0
 
 # Regex patterns selecting the "body" joint set (arm L/R + waist + neck).
 _BODY_RE = re.compile(r"Shoulder|Elbow|Wrist|Waist|Neck", re.IGNORECASE)
@@ -203,6 +203,7 @@ class TorquePlotter:
         plot_mode: str = "rolling",
         save_on_exit: bool = False,
         real_provider: Optional[Callable[[], dict]] = None,
+        y_lim: Optional[tuple] = None,
     ):
         if physics_hz is None or float(physics_hz) <= 0.0:
             raise ValueError(
@@ -226,6 +227,16 @@ class TorquePlotter:
         # "cumulative": 시작부터 모든 데이터 누적, x 축은 0~now 로 계속 확장.
         self._plot_mode = "cumulative" if str(plot_mode).lower() == "cumulative" else "rolling"
         self._save_on_exit = bool(save_on_exit)
+        # None → autoscale (default). (ymin, ymax) → 고정 y축. plot_proc 에 그대로 전달.
+        if y_lim is None:
+            self._y_lim: Optional[tuple] = None
+        else:
+            try:
+                a = float(y_lim[0])
+                b = float(y_lim[1])
+                self._y_lim = (a, b) if a < b else None
+            except (TypeError, ValueError, IndexError):
+                self._y_lim = None
 
         # Resolve DOF names + filter to subset.
         try:
@@ -431,17 +442,33 @@ class TorquePlotter:
             if hand_R:
                 out.append({"name": "Hand R", "joints": hand_R})
             return out
-        buckets: dict[str, list[str]] = {"arm_L": [], "arm_R": [], "other": []}
-        for n in plot_names:
-            buckets[_group_for_joint(n)].append(n)
-        out = []
-        if buckets["arm_L"]:
-            out.append({"name": "Arm L", "joints": buckets["arm_L"]})
-        if buckets["arm_R"]:
-            out.append({"name": "Arm R", "joints": buckets["arm_R"]})
-        if buckets["other"]:
-            out.append({"name": "Waist + Neck", "joints": buckets["other"]})
+        # === TEMP MOCKUP (body subset) =========================================
+        # 임시: 4개의 단일 joint plot 을 세로로 나열 — Left/Right Shoulder Pitch +
+        # Left/Right Elbow. 각 subplot 에 sim/real 두 라인. 모양새 확인용.
+        # 원복: 아래 블록 지우고 그 아래 commented-out 원본 buckets 로직 복구.
+        target_joints = (
+            ("Left Shoulder Pitch",  "L_Shoulder_Pitch_Joint"),
+            ("Left Elbow",           "L_Elbow_Joint"),
+            ("Right Shoulder Pitch", "R_Shoulder_Pitch_Joint"),
+            ("Right Elbow",          "R_Elbow_Joint"),
+        )
+        out: list[dict] = []
+        for label, jn in target_joints:
+            if jn in plot_names:
+                out.append({"name": label, "joints": [jn]})
         return out
+        # === ORIGINAL (복구 시 위 TEMP 블록 제거 + 아래 주석 해제) ============
+        # buckets: dict[str, list[str]] = {"arm_L": [], "arm_R": [], "other": []}
+        # for n in plot_names:
+        #     buckets[_group_for_joint(n)].append(n)
+        # out = []
+        # if buckets["arm_L"]:
+        #     out.append({"name": "Arm L", "joints": buckets["arm_L"]})
+        # if buckets["arm_R"]:
+        #     out.append({"name": "Arm R", "joints": buckets["arm_R"]})
+        # if buckets["other"]:
+        #     out.append({"name": "Waist + Neck", "joints": buckets["other"]})
+        # return out
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -508,6 +535,8 @@ class TorquePlotter:
             # Real-torque second line (ROS2-fed). When False, subprocess
             # skips dashed real-line creation and ignores any "y_real" payload.
             "has_real": self._real_provider is not None,
+            # y_lim: None → autoscale, [ymin, ymax] → 모든 subplot 고정.
+            "y_lim": list(self._y_lim) if self._y_lim is not None else None,
         }
         if not self._send(init_msg):
             logger.error("TorquePlotter: init handshake write failed")

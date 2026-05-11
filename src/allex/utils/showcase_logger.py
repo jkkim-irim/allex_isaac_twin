@@ -416,9 +416,12 @@ class ShowcaseDataLogger:
             self._aggregate_spec = None
 
     def _build_header(self) -> list[str]:
+        from ..trajectory_generate.joint_name_map import joint_to_csv_short
         cols: list[str] = ["time"]
-        cols += [f"pos_{n}" for n in self._pos_dof_names]
-        cols += [f"torque_{n}" for n in self._torque_dof_names]
+        # pos_/torque_ 컬럼은 joint_full 의 short form 사용 (lowercase, `_Joint` 제거).
+        # showcase_reader 가 reverse-map 해서 dict key 는 joint_full 로 유지.
+        cols += [f"pos_{joint_to_csv_short(n)}" for n in self._pos_dof_names]
+        cols += [f"torque_{joint_to_csv_short(n)}" for n in self._torque_dof_names]
         for i, ps in enumerate(self._pair_specs):
             base = ps["name"] if ps is not None else f"pair_{i}_unresolved"
             cols += [f"contact_pos_{base}_{ax}" for ax in ("x", "y", "z")]

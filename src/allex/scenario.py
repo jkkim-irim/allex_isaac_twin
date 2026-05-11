@@ -13,6 +13,11 @@ from .core import (
     FeedforwardTorqueManager,
 )
 from .utils.torque_plotter import TorquePlotter, register_singleton
+from .config.viz_config import (
+    TORQUE_PLOT_WINDOW_SECONDS,
+    TORQUE_PLOT_Y_LIM_BODY,
+    TORQUE_PLOT_Y_LIM_HAND,
+)
 
 
 logger = logging.getLogger("allex.scenario")
@@ -312,8 +317,10 @@ class ALLEXDigitalTwin:
                 physics_hz=physics_hz,
                 ff_provider=ff_provider,
                 subset="body",
+                window_s=TORQUE_PLOT_WINDOW_SECONDS,
                 ff_manager=self._ff_manager,
                 real_provider=real_provider,
+                y_lim=TORQUE_PLOT_Y_LIM_BODY,
             )
             register_singleton("body", self._torque_plotter_body)
         except Exception as exc:
@@ -326,8 +333,10 @@ class ALLEXDigitalTwin:
                 physics_hz=physics_hz,
                 ff_provider=ff_provider,
                 subset="hand",
+                window_s=TORQUE_PLOT_WINDOW_SECONDS,
                 ff_manager=self._ff_manager,
                 real_provider=real_provider,
+                y_lim=TORQUE_PLOT_Y_LIM_HAND,
             )
             register_singleton("hand", self._torque_plotter_hand)
         except Exception as exc:

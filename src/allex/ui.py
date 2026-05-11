@@ -621,7 +621,7 @@ class TrajStudioControls:
 # ============================================================================
 _ROBOT_ROOT = "/ALLEX"
 _VIZ_SKIP = ("torque_ring", "force_viz", "force_vec")
-_OPACITY_VALUE = 0.3
+_OPACITY_VALUE = 0.5
 
 _MODE_OFF = "off"
 _MODE_REAL = "real"
@@ -781,7 +781,7 @@ class VisualizerControls:
                 # Plot mode selector — applied at next Start (subprocess respawn).
                 with ui.HStack(height=UILayout.BUTTON_HEIGHT):
                     ui.Label("Plot Mode:", width=UILayout.LABEL_WIDTH_LARGE)
-                    self._plot_mode_combo = ui.ComboBox(0, "Rolling 5s", "Cumulative")
+                    self._plot_mode_combo = ui.ComboBox(0, "Rolling", "Cumulative")
                     try:
                         m = self._plot_mode_combo.model.get_item_value_model()
                         m.add_value_changed_fn(self._on_plot_mode_change)
