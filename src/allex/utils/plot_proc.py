@@ -38,11 +38,30 @@ import matplotlib
 matplotlib.use("TkAgg")
 
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.colors as mcolors  # noqa: E402
 from matplotlib.animation import FuncAnimation  # noqa: E402
 from matplotlib.widgets import Button  # noqa: E402
 
 # 어두운 배경 — figure/axes facecolor + tick/label/legend 색을 한 번에 전환.
 plt.style.use("dark_background")
+
+# Force/torque vector viz 와 동일한 real(red) / sim(cyan-blue) convention.
+# viz_config.colors.real / colors.sim 와 같은 값. plot_proc 는 독립 subprocess 라
+# viz_config import 가 안 되므로 hard-code.
+_REAL_COLOR = (1.0, 0.0, 0.0)
+_SIM_COLOR = (0.0, 0.8, 1.0)
+
+
+def _shade(base_color, idx: int, total: int) -> tuple:
+    """Per-joint lightness variation around base color so 같은 hue 안에서도
+    여러 joint 가 한 subplot 에 겹쳐 있을 때 구분 가능. idx=0 → 가장 saturated,
+    idx 증가 → 흰색 쪽으로 점진 lighten."""
+    if total <= 1:
+        return mcolors.to_rgb(base_color)
+    # mix in [0, 0.55] — 너무 흰색에 가까우면 hue 정체성 사라지므로 상한 0.55.
+    mix = 0.55 * (idx / (total - 1))
+    r, g, b = mcolors.to_rgb(base_color)
+    return (r + (1.0 - r) * mix, g + (1.0 - g) * mix, b + (1.0 - b) * mix)
 
 import json  # noqa: E402
 import os  # noqa: E402
@@ -250,70 +269,73 @@ def main() -> int:
         axes = [axes]
 
     # Per-axis line objects. Visual convention:
-    #   - real channel: solid line, in the legend
-    #   - sim channel:  dashed, same color as its real twin, not in the legend
-    # When has_real=False there is only the sim channel, drawn solid + in
-    # legend (no partner line exists).
+    #   - real channel: solid red 계열, labeled "real/<jname>"
+    #   - sim channel:  dashed blue 계열, labeled "sim/<jname>"
+    # has_real=False 면 sim 만 존재, solid + "<jname>" label.
     #
-    # Legend entries are pickable — clicking one toggles the labeled line's
-    # visibility (dimmed legend marker indicates hidden). The paired partner
-    # line (sim dashed, when has_real) tracks the labeled line's visibility
-    # 1:1. Double-click anywhere on an axes resets all lines.
+    # Legend 안 모든 entry 는 pickable — 클릭하면 해당 라인 visibility 가 토글되며
+    # legend marker 가 dim 처리됨. real/sim 는 각각 독립적으로 토글 가능.
+    # axes 더블클릭 시 그 axes 의 모든 라인이 다시 visible.
     #
-    # axis_specs entry: (ax, sim_lines, real_lines_or_None)
-    # real_lines is None for the entire run when has_real=False.
-    axis_specs: list[tuple[object, list, Optional[list]]] = []
-    # Map id(labeled_line) -> partner_line so toggle handler can sync.
-    # When has_real, labeled = real, partner = sim. When not has_real, the
-    # dict is empty (sim is the sole line).
-    label_to_partner: dict = {}
+    # axis_specs entry: (ax, sim_lines, real_lines_or_None, per_joint_legend).
+    axis_specs: list[tuple[object, list, Optional[list], object]] = []
     leg_to_orig: dict = {}
     for ax, grp in zip(axes, groups):
         sim_lines = []
         real_lines: Optional[list] = [] if has_real else None
-        for jname in grp.get("joints", []):
+        joints = list(grp.get("joints", []))
+        n_joints = len(joints)
+        # 같은 axes 안에서 real/sim 각각 따로 legend entry 가 생기도록 두 라인 모두
+        # label 부여. labeled_lines 순서는 legend 표시 순서 (real_i, sim_i 페어가
+        # 연속되게 plot 순서를 유지).
+        labeled_lines_ax: list = []
+        for j_idx, jname in enumerate(joints):
+            # Force/torque vector viz 와 동일 convention: real=red 계열,
+            # sim=cyan-blue 계열. 한 subplot 안에서 여러 joint 가 겹칠 때는
+            # 같은 hue 안에서 lightness 로 구분.
+            real_col = _shade(_REAL_COLOR, j_idx, n_joints)
+            sim_col = _shade(_SIM_COLOR, j_idx, n_joints)
             if has_real:
-                # real solid + legend label, sim dashed + same color, no label.
-                (ln_real,) = ax.plot([], [], label=str(jname), linewidth=0.8)
+                (ln_real,) = ax.plot(
+                    [], [], color=real_col, label=f"Real/{jname}", linewidth=0.8,
+                )
                 real_lines.append(ln_real)
-                color = ln_real.get_color()
+                labeled_lines_ax.append(ln_real)
                 (ln_sim,) = ax.plot(
-                    [], [], color=color, linestyle="--", linewidth=0.8,
-                    alpha=0.85,
+                    [], [], color=sim_col, linestyle="--", linewidth=0.8,
+                    label=f"Sim/{jname}",
                 )
                 sim_lines.append(ln_sim)
-                label_to_partner[id(ln_real)] = ln_sim
+                labeled_lines_ax.append(ln_sim)
             else:
                 # No real channel — sim is the sole solid line with the label.
-                (ln_sim,) = ax.plot([], [], label=str(jname), linewidth=0.8)
+                (ln_sim,) = ax.plot(
+                    [], [], color=sim_col, label=str(jname), linewidth=0.8,
+                )
                 sim_lines.append(ln_sim)
+                labeled_lines_ax.append(ln_sim)
         ax.set_title(str(grp.get("name", "")))
         ax.set_ylabel(y_label)
         ax.grid(True, alpha=0.3)
+        # ncol=2 로 real/sim 가 같은 row 에 묶여 보이도록.
         leg = ax.legend(loc="upper left", fontsize="x-small", ncol=2)
-        # Legend markers are zipped with whichever array carries the label.
-        labeled_lines = real_lines if has_real else sim_lines
-        for leg_line, orig_line in zip(leg.get_lines(), labeled_lines):
+        for leg_line, orig_line in zip(leg.get_lines(), labeled_lines_ax):
             leg_line.set_picker(True)
             leg_line.set_pickradius(5)
             leg_to_orig[id(leg_line)] = orig_line
-        axis_specs.append((ax, sim_lines, real_lines))
+        axis_specs.append((ax, sim_lines, real_lines, leg))
     axes[-1].set_xlabel("time [s]")
     # Reserve a strip at the top for Hide/Show all buttons.
     fig.tight_layout(rect=[0, 0, 1, 0.92])
 
     def _set_all_visible(visible: bool):
-        for ax in axes:
-            leg = ax.get_legend()
+        for _ax, _sl, _rl, leg in axis_specs:
             if leg is None:
                 continue
             for leg_line in leg.get_lines():
                 orig = leg_to_orig.get(id(leg_line))
                 if orig is not None:
                     orig.set_visible(visible)
-                    partner = label_to_partner.get(id(orig))
-                    if partner is not None:
-                        partner.set_visible(visible)
                 leg_line.set_alpha(1.0 if visible else 0.25)
         fig.canvas.draw_idle()
 
@@ -402,10 +424,6 @@ def main() -> int:
             return
         visible = not orig.get_visible()
         orig.set_visible(visible)
-        # Sync the paired dashed sim line (if any) with the labeled real line.
-        partner = label_to_partner.get(id(orig))
-        if partner is not None:
-            partner.set_visible(visible)
         leg_line.set_alpha(1.0 if visible else 0.25)
         fig.canvas.draw_idle()
 
@@ -413,11 +431,7 @@ def main() -> int:
         if event.dblclick:
             for _leg_id, orig in leg_to_orig.items():
                 orig.set_visible(True)
-                partner = label_to_partner.get(id(orig))
-                if partner is not None:
-                    partner.set_visible(True)
-            for ax in axes:
-                leg = ax.get_legend()
+            for _ax, _sl, _rl, leg in axis_specs:
                 if leg is not None:
                     for ll in leg.get_lines():
                         ll.set_alpha(1.0)
@@ -465,7 +479,7 @@ def main() -> int:
         else:
             t_min = t_last - window_sec
         updated = []
-        for spec_idx, ((ax, sim_lines, real_lines), joint_dqs) in enumerate(
+        for spec_idx, ((ax, sim_lines, real_lines, _leg), joint_dqs) in enumerate(
             zip(axis_specs, group_joint_dqs)
         ):
             real_jdqs = (
