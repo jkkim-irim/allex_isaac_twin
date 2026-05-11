@@ -34,7 +34,7 @@ class ViaCSVData:
     trq_via: np.ndarray | None = None    # (N, n_joints) CSV units
 
 
-# ── Hermite basis functions ──
+# ── Hermite basis functions (and their derivatives wrt u) ──
 def _h00(u: np.ndarray) -> np.ndarray:
     return 2.0 * u**3 - 3.0 * u**2 + 1.0
 
@@ -51,8 +51,31 @@ def _h11(u: np.ndarray) -> np.ndarray:
     return u**3 - u**2
 
 
-def _hermite_1d(t_out: np.ndarray, t_via: np.ndarray, y_via: np.ndarray) -> np.ndarray:
-    """1D monotonic cubic Hermite spline.
+def _h00p(u: np.ndarray) -> np.ndarray:
+    return 6.0 * u**2 - 6.0 * u
+
+
+def _h10p(u: np.ndarray) -> np.ndarray:
+    return 3.0 * u**2 - 4.0 * u + 1.0
+
+
+def _h01p(u: np.ndarray) -> np.ndarray:
+    return -6.0 * u**2 + 6.0 * u
+
+
+def _h11p(u: np.ndarray) -> np.ndarray:
+    return 3.0 * u**2 - 2.0 * u
+
+
+def _hermite_1d(
+    t_out: np.ndarray, t_via: np.ndarray, y_via: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """1D monotonic cubic Hermite spline (position + analytic velocity).
+
+        pos = h00*P1 + h10*T1 + h01*P2 + h11*T2
+        vel = (h00'*P1 + h10'*T1 + h01'*P2 + h11'*T2) / seg_dur
+    where ``T1 = m1*seg_dur``, ``T2 = m2*seg_dur`` and ``m1, m2`` are the
+    monotonic Fritsch–Carlson tangents (in pos/time).
 
     Args:
         t_out: 출력 시간 배열 [s].
@@ -60,17 +83,19 @@ def _hermite_1d(t_out: np.ndarray, t_via: np.ndarray, y_via: np.ndarray) -> np.n
         y_via: via point 값 배열 [rad].
 
     Returns:
-        t_out에 대응하는 보간된 값 배열.
+        (pos, vel) — 위치 [rad] 와 속도 [rad/s]. Hold 구간 / 범위 밖에서는
+        속도 0.
     """
     n = len(t_via)
-    out = np.empty_like(t_out)
+    pos = np.empty_like(t_out)
+    vel = np.zeros_like(t_out)
 
     if n == 0:
-        out[:] = 0.0
-        return out
+        pos[:] = 0.0
+        return pos, vel
     if n == 1:
-        out[:] = y_via[0]
-        return out
+        pos[:] = y_via[0]
+        return pos, vel
 
     for i in range(n - 1):
         t0, t1 = t_via[i], t_via[i + 1]
@@ -82,9 +107,9 @@ def _hermite_1d(t_out: np.ndarray, t_via: np.ndarray, y_via: np.ndarray) -> np.n
         P1 = float(y_via[i])
         P2 = float(y_via[i + 1])
 
-        # P1 ≈ P2이면 홀드
+        # P1 ≈ P2이면 홀드 (vel = 0; 이미 초기화돼 있음)
         if abs(P2 - P1) <= _HOLD_TOL_RAD:
-            out[mask] = P1
+            pos[mask] = P1
             continue
 
         u = (t_out[mask] - t0) / seg_dur
@@ -100,21 +125,26 @@ def _hermite_1d(t_out: np.ndarray, t_via: np.ndarray, y_via: np.ndarray) -> np.n
         s12 = (P2 - P1) / seg_dur
         s23 = (P3 - P2) / d23 if d23 > _EPS else 0.0
 
-        # monotonic tangent
+        # monotonic tangent (pos/time)
         m1 = 0.5 * (s01 + s12) if s01 * s12 > 0.0 else 0.0
         m2 = 0.5 * (s12 + s23) if s12 * s23 > 0.0 else 0.0
 
         T1, T2 = m1 * seg_dur, m2 * seg_dur
-        pos = _h00(u) * P1 + _h10(u) * T1 + _h01(u) * P2 + _h11(u) * T2
+        seg_pos = _h00(u) * P1 + _h10(u) * T1 + _h01(u) * P2 + _h11(u) * T2
+        seg_vel = (
+            _h00p(u) * P1 + _h10p(u) * T1 + _h01p(u) * P2 + _h11p(u) * T2
+        ) / seg_dur
 
-        if not np.all(np.isfinite(pos)):
-            pos = np.where(np.isfinite(pos), pos, P1 + (P2 - P1) * u)
-        out[mask] = pos
+        if not np.all(np.isfinite(seg_pos)):
+            seg_pos = np.where(np.isfinite(seg_pos), seg_pos, P1 + (P2 - P1) * u)
+            seg_vel = np.where(np.isfinite(seg_vel), seg_vel, (P2 - P1) / seg_dur)
+        pos[mask] = seg_pos
+        vel[mask] = seg_vel
 
-    # 범위 밖
-    out[t_out <= t_via[0]] = y_via[0]
-    out[t_out >= t_via[-1]] = y_via[-1]
-    return out
+    # 범위 밖: 위치 hold, 속도 0 (이미 0으로 초기화)
+    pos[t_out <= t_via[0]] = y_via[0]
+    pos[t_out >= t_via[-1]] = y_via[-1]
+    return pos, vel
 
 
 def _parse_float(s: str) -> float:
@@ -254,7 +284,7 @@ def generate_trajectory(
     pos_via_rad: np.ndarray,
     hz: float | None = None,
     duration: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Via points에서 시간 균일 궤적 생성.
 
     Args:
@@ -265,7 +295,8 @@ def generate_trajectory(
         duration: 출력 궤적 길이 [s]. None이면 via point 끝까지.
 
     Returns:
-        (time_out, pos_out_rad): 균일 샘플링된 시간과 위치.
+        (time_out, pos_out_rad, vel_out_rad_s): 균일 샘플링된 시간, 위치, 속도.
+        속도는 Hermite 기저의 해석적 미분으로 계산되어 수치 차분 노이즈 없음.
     """
     hz = _resolve_hz(hz)
 
@@ -278,17 +309,20 @@ def generate_trajectory(
     n_joints = pos_via_rad.shape[1]
 
     pos_out = np.zeros((n_steps + 1, n_joints), dtype=np.float32)
+    vel_out = np.zeros((n_steps + 1, n_joints), dtype=np.float32)
     for j in range(n_joints):
-        pos_out[:, j] = _hermite_1d(t_out, time_via, pos_via_rad[:, j])
+        p, v = _hermite_1d(t_out, time_via, pos_via_rad[:, j])
+        pos_out[:, j] = p
+        vel_out[:, j] = v
 
-    return t_out.astype(np.float32), pos_out
+    return t_out.astype(np.float32), pos_out, vel_out
 
 
 def generate_trajectory_from_csv(
     csv_path: str | Path,
     hz: float | None = None,
     duration: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """CSV 파일에서 직접 궤적 생성.
 
     Args:
@@ -298,7 +332,7 @@ def generate_trajectory_from_csv(
         duration: 출력 궤적 길이 [s]. None이면 via point 끝까지.
 
     Returns:
-        (time_out, pos_out_rad): 균일 샘플링된 시간[s]과 위치[rad].
+        (time_out, pos_out_rad, vel_out_rad_s): 시간 [s], 위치 [rad], 속도 [rad/s].
     """
     data = parse_via_csv(csv_path)
     return generate_trajectory(data.t_via, data.pos_via, hz=hz, duration=duration)

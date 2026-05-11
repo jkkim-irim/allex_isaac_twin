@@ -206,8 +206,9 @@ class ALLEXJointController:
     # ========================================
     def create_joint_control_generator(self, articulation, get_target_positions_func,
                                         is_external_active_fn=None,
-                                        pre_step_fn=None):
-        """관절 제어 제너레이터 — 매 physics step마다 목표 위치 적용.
+                                        pre_step_fn=None,
+                                        get_target_velocities_func=None):
+        """관절 제어 제너레이터 — 매 physics step마다 목표 위치 + (옵션) 속도 적용.
 
         is_external_active_fn: optional callable returning True when an external
         driver (e.g. trajectory playback) wants to push targets even if the ROS2
@@ -216,6 +217,13 @@ class ALLEXJointController:
         used by MotorStateMirror to refresh joint PD gains from current q.
         Runs regardless of `active` state so PD mirror works during idle / ROS2
         teleop / trajectory playback uniformly.
+        get_target_velocities_func: optional callable returning per-DOF
+        target velocities [rad/s]. Returning ``None`` (or omitting) is fine —
+        position-only ArticulationAction is sent in that case. Newton's
+        POSITION_VELOCITY actuator mode is what makes the velocity target
+        actually drive the controller (see ``newton_bridge.
+        _force_position_velocity_mode``); without that upgrade the velocity
+        target is ignored regardless.
         """
         while True:
             if pre_step_fn is not None:
@@ -225,7 +233,19 @@ class ALLEXJointController:
                 active = bool(is_external_active_fn())
             if articulation is not None and active:
                 target_positions = get_target_positions_func()
-                articulation.apply_action(ArticulationAction(target_positions))
+                target_velocities = None
+                if get_target_velocities_func is not None:
+                    try:
+                        target_velocities = get_target_velocities_func()
+                    except Exception as exc:
+                        print(f"[ALLEX][JointCtrl] velocity provider failed: {exc}")
+                        target_velocities = None
+                articulation.apply_action(
+                    ArticulationAction(
+                        joint_positions=target_positions,
+                        joint_velocities=target_velocities,
+                    )
+                )
             yield
 
     def get_coupled_joints_info(self):

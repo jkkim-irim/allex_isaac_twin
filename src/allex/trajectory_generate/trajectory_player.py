@@ -166,11 +166,19 @@ class TrajectoryPlayer:
         self._name_to_idx: dict[str, int] = {n: i for i, n in enumerate(dof_names)}
 
         # _dense_base = trajectory as built from CSV; _dense = ramp-in prepended.
+        # _dense_vel_* are matching analytical velocity arrays [rad/s], same shape.
         self._dense_base: np.ndarray | None = None
         self._dense: np.ndarray | None = None
+        self._dense_vel_base: np.ndarray | None = None
+        self._dense_vel: np.ndarray | None = None
         self._duration_s: float = 0.0
         self._groups_used: list[str] = []
         self._missing_joints: list[str] = []
+
+        # Cache of the velocity row that pairs with the most recent
+        # ``get_current_target()``. Read by ``get_current_velocity_target``
+        # without advancing the sample index.
+        self._last_vel_target: np.ndarray | None = None
 
         # Sparse via events. Built in _build(); per-run sample_idx + tensor
         # baking happens in start(). _pending is sorted by sample_idx and
@@ -224,6 +232,8 @@ class TrajectoryPlayer:
             )
         inst._dense_base = target[None, :].copy()
         inst._dense = inst._dense_base
+        inst._dense_vel_base = np.zeros_like(inst._dense_base)
+        inst._dense_vel = inst._dense_vel_base
         inst._duration_s = 0.0
         return inst
 
@@ -312,6 +322,8 @@ class TrajectoryPlayer:
         n_steps = int(max_dur * self._hz)
         # Dense target buffer, tiled with seed pose (hold for uncovered joints).
         dense = np.tile(pose.astype(np.float32)[None, :], (n_steps + 1, 1))
+        # Velocity buffer: 0 by default (uncovered joints stay still).
+        dense_vel = np.zeros_like(dense)
 
         events_spec: list[_ViaEvent] = []
         for csv_name, data in group_data.items():
@@ -324,7 +336,7 @@ class TrajectoryPlayer:
                 )
                 continue
 
-            _, pos_interp = generate_trajectory(
+            _, pos_interp, vel_interp = generate_trajectory(
                 data.t_via, data.pos_via, hz=self._hz, duration=max_dur
             )
             for j, jname in enumerate(joint_names):
@@ -333,12 +345,15 @@ class TrajectoryPlayer:
                     self._missing_joints.append(jname)
                     continue
                 dense[:, idx] = pos_interp[:, j]
+                dense_vel[:, idx] = vel_interp[:, j]
 
             events_spec.extend(self._extract_via_events(data, joint_names))
 
         self._events_spec = events_spec
         self._dense_base = dense
         self._dense = dense
+        self._dense_vel_base = dense_vel
+        self._dense_vel = dense_vel
         self._duration_s = float(dense.shape[0] - 1) / self._hz
 
         print(
@@ -424,7 +439,9 @@ class TrajectoryPlayer:
     def start(self) -> bool:
         if self._dense_base is None or self._dense_base.shape[0] == 0:
             return False
-        self._dense = self._build_with_ramp(self._dense_base)
+        self._dense, self._dense_vel = self._build_with_ramp(
+            self._dense_base, self._dense_vel_base
+        )
         self._duration_s = float(self._dense.shape[0] - 1) / self._hz
         self._active = True
         self._finished = False
@@ -484,11 +501,27 @@ class TrajectoryPlayer:
                 self._events_started += 1
 
         target = self._dense[idx]
+        if self._dense_vel is not None and idx < self._dense_vel.shape[0]:
+            self._last_vel_target = self._dense_vel[idx]
+        else:
+            self._last_vel_target = None
         if self._sample_idx >= last:
             self._finished = True
         else:
             self._sample_idx += 1
         return target
+
+    def get_current_velocity_target(self) -> "np.ndarray | None":
+        """Return the velocity row paired with the most recent
+        ``get_current_target()`` call (does NOT advance the sample index).
+
+        Returns ``None`` if the player is not active or the dense velocity
+        buffer hasn't been built (e.g. ``hold_pose`` factory before any
+        ``get_current_target`` call). Units: rad/s.
+        """
+        if not self.is_active():
+            return None
+        return self._last_vel_target
 
     # ------------------------------------------------------------------
     # Event scheduling + baking
@@ -666,35 +699,51 @@ class TrajectoryPlayer:
     # ------------------------------------------------------------------
     # Ramp-in (initial pose → first dense row)
     # ------------------------------------------------------------------
-    def _build_with_ramp(self, dense_base: np.ndarray) -> np.ndarray:
+    def _build_with_ramp(
+        self, dense_base: np.ndarray, dense_vel_base: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Prepend a smooth ramp from the live pose to dense_base[0].
 
-        Quintic smoothstep (C2-continuous start + end), so the articulation
-        eases out of its current pose and joins the trajectory with zero
-        velocity instead of being yanked at full controller gain.
+        Quintic smoothstep ``s(u) = 6u^5 - 15u^4 + 10u^3`` (C2-continuous at
+        both ends). 위치는 ``live + s(u)*delta``, 속도는 닫힌 형태 미분
+        ``ds/dt = (30u^4 - 60u^3 + 30u^2) / ramp_s * delta``.
+        u=0 / u=1 모두 속도 0 이므로 본 궤적 진입 시 jerk 없이 이어진다.
+
+        Returns:
+            (pos_out, vel_out) — same row count, same DOF axis.
         """
+        if dense_vel_base is None:
+            dense_vel_base = np.zeros_like(dense_base)
         if self._ramp_s <= 0.0:
-            return dense_base
+            return dense_base, dense_vel_base
         live = self._read_live_pose()
         if live is None:
-            return dense_base
+            return dense_base, dense_vel_base
 
         first = dense_base[0]
         delta = first - live
         max_delta = float(np.max(np.abs(delta))) if delta.size else 0.0
         if max_delta < 1e-4:
-            return dense_base
+            return dense_base, dense_vel_base
 
         n_ramp = max(1, int(round(self._ramp_s * self._hz)))
         u = np.linspace(0.0, 1.0, n_ramp + 1, dtype=np.float32)[1:]
-        s = u * u * u * (u * (u * 6.0 - 15.0) + 10.0)  # 6u^5 - 15u^4 + 10u^3
-        ramp = live[None, :] + s[:, None] * delta[None, :]
-        out = np.concatenate([live[None, :], ramp, dense_base[1:]], axis=0)
+        s = u * u * u * (u * (u * 6.0 - 15.0) + 10.0)         # 6u^5 - 15u^4 + 10u^3
+        sd = (30.0 * u**4 - 60.0 * u**3 + 30.0 * u**2)        # ds/du
+        ramp_pos = live[None, :] + s[:, None] * delta[None, :]
+        ramp_vel = (sd / self._ramp_s)[:, None] * delta[None, :]
+
+        # Live row prepended at u=0 (vel=0) so playback starts with the
+        # current pose held; then the ramp segment carries velocity.
+        live_row = live[None, :]
+        zero_row = np.zeros_like(live_row)
+        pos_out = np.concatenate([live_row, ramp_pos, dense_base[1:]], axis=0)
+        vel_out = np.concatenate([zero_row, ramp_vel, dense_vel_base[1:]], axis=0)
         print(
             f"[ALLEX][Traj] ramp-in: {self._ramp_s:.2f}s ({n_ramp} samples), "
             f"max joint delta = {max_delta:.4f} rad"
         )
-        return out
+        return pos_out, vel_out
 
     # ------------------------------------------------------------------
     # Event ramp dispatch (hot path)

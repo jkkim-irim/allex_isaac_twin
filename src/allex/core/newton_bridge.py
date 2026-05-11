@@ -153,6 +153,49 @@ def _joint_type_name(t) -> str:
         return str(t)
 
 
+def _force_position_velocity_mode(builder) -> None:
+    """Promote DOFs with both kp>0 AND kd>0 from POSITION → POSITION_VELOCITY.
+
+    Newton 의 USD importer 가 자동 호출되며 ``force_position_velocity_actuation``
+    인자를 외부에서 주입할 진입점이 없어, finalize 직전 builder.joint_target_mode
+    배열을 직접 덮어쓰는 방식으로 동등 효과를 얻는다.
+
+    POSITION_VELOCITY 모드는 MuJoCo solver 가 position + velocity 두 개의
+    actuator 를 설치하여 ``joint_target_pos`` 와 ``joint_target_vel`` 둘 다
+    추적한다. 즉 PD 식이
+        τ = kp·(q_target − q) − kd·(q̇ − q̇_target)
+    가 되어 q̇_target 항이 살아난다.
+
+    조건: 현재 mode 가 ``POSITION`` 이고 (kp, kd) 둘 다 양수인 DOF 만 승격.
+    EFFORT/VELOCITY/NONE 모드는 그대로 둔다.
+    """
+    try:
+        from newton import JointTargetMode
+    except ImportError:
+        print("[ALLEX][JointMode] newton.JointTargetMode unavailable; skip")
+        return
+    modes = getattr(builder, "joint_target_mode", None)
+    ke = list(getattr(builder, "joint_target_ke", []) or [])
+    kd = list(getattr(builder, "joint_target_kd", []) or [])
+    if not modes or len(ke) != len(modes) or len(kd) != len(modes):
+        print(
+            f"[ALLEX][JointMode] builder shape mismatch "
+            f"(mode={len(modes) if modes else 0}, ke={len(ke)}, kd={len(kd)}); skip"
+        )
+        return
+    pos = int(JointTargetMode.POSITION)
+    posvel = int(JointTargetMode.POSITION_VELOCITY)
+    upgraded = 0
+    for i in range(len(modes)):
+        if modes[i] == pos and ke[i] > 0.0 and kd[i] > 0.0:
+            modes[i] = posvel
+            upgraded += 1
+    print(
+        f"[ALLEX][JointMode] upgraded {upgraded}/{len(modes)} DOF "
+        f"POSITION → POSITION_VELOCITY (track both q_target and q_dot_target)"
+    )
+
+
 def _apply_gravcomp(builder) -> None:
     """Stamp `mujoco:gravcomp` (per body) + `mujoco:actuatorgravcomp` (per joint)
     per `physics_config.json::newton.gravcomp`.
@@ -389,6 +432,10 @@ def install(joint_config_path: Path) -> None:
             _inject(self)
         except Exception as exc:
             print(f"[ALLEX] equality injection raised: {exc}")
+        try:
+            _force_position_velocity_mode(self)
+        except Exception as exc:
+            print(f"[ALLEX] joint_target_mode upgrade raised: {exc}")
         model = _orig_finalize(self, *args, **kwargs)
         try:
             _dump_model_equality_state(model)

@@ -164,11 +164,27 @@ class ALLEXDigitalTwin:
         def _traj_active():
             return self._trajectory_player is not None and self._trajectory_player.is_active()
 
+        def get_target_velocities():
+            """Velocity target paired with the most recent position target.
+
+            Trajectory mode → analytic dense_vel row from Hermite. Other modes
+            (ROS2 mirror / idle hold) carry no velocity reference, so return
+            None so the controller falls back to position-only.
+            """
+            player = self._trajectory_player
+            if player is None or not player.is_active():
+                return None
+            vel = player.get_current_velocity_target()
+            if vel is None:
+                return None
+            return vel.tolist()
+
         generator = self._joint_controller.create_joint_control_generator(
             articulation=self._articulation,
             get_target_positions_func=get_target_positions,
             is_external_active_fn=_traj_active,
             pre_step_fn=self._motor_mirror_step,
+            get_target_velocities_func=get_target_velocities,
         )
         self._simulation_loop.set_script_generator(generator)
 
