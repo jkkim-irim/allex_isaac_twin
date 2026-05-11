@@ -1128,6 +1128,150 @@ class VisualizerControls:
 
 
 # ============================================================================
+# Panel — Viewport Presets (save/load active viewport camera as named slots)
+# ============================================================================
+class ViewportControls:
+    """Viewport camera 슬롯 저장/복원 패널.
+
+    Active viewport (기본 ``/OmniverseKit_Persp``) 의 현재 각도/위치를 이름 붙여
+    저장해두고, ComboBox 로 골라 즉시 복원. 슬롯은 ``data/saved_viewports.json`` 에
+    영속화되어 Isaac Sim 재시작 후에도 유지.
+    """
+
+    def __init__(self):
+        self._name_model: ui.SimpleStringModel | None = None
+        self._combo_frame: ui.Frame | None = None
+        self._combo: ui.ComboBox | None = None
+        self._status_label: ui.Label | None = None
+        self._slots: list[str] = []
+
+    def build(self):
+        from .utils import viewport_store
+        self._slots = viewport_store.list_viewports()
+
+        frame = CollapsableFrame("Viewport Presets", collapsed=True)
+        with frame:
+            with ui.VStack(style=get_style(), spacing=UILayout.SPACING_SMALL, height=0):
+                ui.Label(
+                    "Save/load active viewport camera (angle + zoom) as named slot.",
+                    height=UILayout.LABEL_HEIGHT,
+                )
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Slot name:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._name_model = ui.SimpleStringModel("")
+                    ui.StringField(self._name_model)
+
+                UIComponentFactory.create_styled_button(
+                    "Save Current View",
+                    callback=self._on_save,
+                    color_scheme="green",
+                    height=UILayout.BUTTON_HEIGHT,
+                )
+
+                UIComponentFactory.create_separator(UILayout.SEPARATOR_HEIGHT)
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Saved:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._combo_frame = ui.Frame()
+                    self._rebuild_combo()
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    UIComponentFactory.create_styled_button(
+                        "Load",
+                        callback=self._on_load,
+                        color_scheme="blue",
+                        height=UILayout.BUTTON_HEIGHT,
+                    )
+                    UIComponentFactory.create_styled_button(
+                        "Delete",
+                        callback=self._on_delete,
+                        color_scheme="red",
+                        height=UILayout.BUTTON_HEIGHT,
+                    )
+
+                self._status_label = UIComponentFactory.create_status_label(
+                    "", UILayout.LABEL_WIDTH_XLARGE,
+                )
+
+    def _rebuild_combo(self) -> None:
+        if self._combo_frame is None:
+            return
+        from .utils import viewport_store
+        self._slots = viewport_store.list_viewports()
+        self._combo_frame.clear()
+        with self._combo_frame:
+            if self._slots:
+                self._combo = ui.ComboBox(
+                    0, *self._slots, height=UILayout.BUTTON_HEIGHT,
+                )
+            else:
+                self._combo = None
+                ui.Label("(no saved views)", height=UILayout.BUTTON_HEIGHT)
+
+    def _selected_slot(self) -> str:
+        if not self._slots or self._combo is None:
+            return ""
+        try:
+            idx = self._combo.model.get_item_value_model().get_value_as_int()
+        except Exception:
+            return ""
+        if 0 <= idx < len(self._slots):
+            return self._slots[idx]
+        return ""
+
+    def _set_status(self, text: str) -> None:
+        if self._status_label is not None:
+            self._status_label.text = text
+
+    def _on_save(self) -> None:
+        from .utils import viewport_store
+        name = self._name_model.as_string.strip() if self._name_model else ""
+        if not name:
+            self._set_status("Slot name required")
+            return
+        try:
+            ok = viewport_store.save_viewport(name)
+        except Exception as exc:
+            self._set_status(f"Save failed: {exc}")
+            return
+        if ok:
+            self._set_status(f"Saved '{name}'")
+            self._rebuild_combo()
+        else:
+            self._set_status(f"Save failed (camera unavailable)")
+
+    def _on_load(self) -> None:
+        from .utils import viewport_store
+        name = self._selected_slot()
+        if not name:
+            self._set_status("No slot selected")
+            return
+        try:
+            ok = viewport_store.load_viewport(name)
+        except Exception as exc:
+            self._set_status(f"Load failed: {exc}")
+            return
+        self._set_status(f"Loaded '{name}'" if ok else f"Load failed: {name}")
+
+    def _on_delete(self) -> None:
+        from .utils import viewport_store
+        name = self._selected_slot()
+        if not name:
+            self._set_status("No slot selected")
+            return
+        viewport_store.delete_viewport(name)
+        self._set_status(f"Deleted '{name}'")
+        self._rebuild_combo()
+
+    def cleanup(self) -> None:
+        self._name_model = None
+        self._combo = None
+        self._combo_frame = None
+        self._status_label = None
+
+
+# ============================================================================
 # Orchestrator — was `src/ui_builder.py::UIBuilder`
 # ============================================================================
 class AllExUI:
@@ -1150,6 +1294,7 @@ class AllExUI:
         self._traj_studio = None
         self._showcase_replay = None
         self._visualizer = None
+        self._viewport_controls = None
         self._showcase_logger = None
         self._hysteresis = None
         self._on_init()
@@ -1177,6 +1322,9 @@ class AllExUI:
 
         if self._showcase_replay is None:
             self._showcase_replay = ShowcaseReplayControls(self)
+
+        if self._viewport_controls is None:
+            self._viewport_controls = ViewportControls()
 
     # ------------------------------------------------------------------
     # Isaac Sim event callbacks
@@ -1216,6 +1364,7 @@ class AllExUI:
         self._traj_studio.build()
         self._showcase_replay.build()
         self._visualizer.build()
+        self._viewport_controls.build()
 
     def build_hysteresis_ui(self, window):
         """Hysteresis 전용 ScrollingWindow 에 UI 빌드. 최초 1회만 호출."""
@@ -1240,5 +1389,7 @@ class AllExUI:
             self._visualizer.cleanup()
         if self._showcase_logger is not None:
             self._showcase_logger.cleanup()
+        if self._viewport_controls is not None:
+            self._viewport_controls.cleanup()
         if self._hysteresis is not None:
             self._hysteresis.cleanup()
