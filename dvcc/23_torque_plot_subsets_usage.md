@@ -1,6 +1,8 @@
-# Torque Plot subset / subplot 설정 가이드
+# Data Plot subset / subplot 설정 가이드
 
-`viz_config.json::torque_plot` 안에서 **어떤 joint 를 어떤 subplot 으로 묶어 보여줄지** 직접 정의할 수 있다. UI 의 "Torque Plot (Body)" / "Torque Plot (Hand)" 버튼이 누르는 subset 이름과 매핑된다.
+`viz_config.json::torque_plot` 안에서 **어떤 joint 를 어떤 subplot 으로, 어떤 채널 (torque / position) 로 그릴지** 직접 정의할 수 있다. UI 의 "Data Plot (Body)" / "Data Plot (Hand)" 버튼이 누르는 subset 이름과 매핑된다.
+
+> 키 이름이 `torque_plot` 인 건 historical (`DataPlotter` 로 일반화 전 이름). 데이터 의미는 channel 별로 결정됨.
 
 ---
 
@@ -38,7 +40,9 @@
 | `torque_plot.subsets.<subset>` | list of group | 각 entry = 한 subplot. 순서대로 위→아래 배치. |
 | `<group>.name` | string | subplot 제목 (legend 위쪽). |
 | `<group>.joints` | list of string | 그 subplot 에 함께 표시할 dof_name (USD 기준). |
-| `<group>.y_lim` | optional `[float, float]` | 이 subplot 만의 고정 y 축. 우선순위: **group.y_lim > subset 의 y_lim_\<subset\> > autoscale**. |
+| `<group>.channel` | optional `"torque"` \| `"pos"` (default `"torque"`) | 이 subplot 이 그릴 채널. `"torque"` 는 N m, `"pos"` 는 deg 로 표시 (내부 rad → plot_proc 에서 변환). 잘못된 값은 `"torque"` 로 fallback. |
+| `<group>.y_lim` | optional `[float, float]` | 이 subplot 만의 고정 y 축 (channel 의 단위로 해석: torque=Nm, pos=deg). 우선순위: **group.y_lim > (torque channel 일 때) subset 의 y_lim_\<subset\> > autoscale**. pos channel 은 subset-level fallback 없음 — autoscale 또는 group.y_lim 지정만. |
+| `<group>.highlights` | optional list of `{t0, t1, color?, alpha?, edgecolor?, linewidth?}` | 이 subplot 에 사전 등록된 시간 구간 강조 띠 (matplotlib `axvspan`). 자세한 형식은 §F. |
 
 ### Joint 이름 형식
 
@@ -132,6 +136,58 @@
 - `hand` → `Hand L` (모든 `L_<finger>_*_Joint`) + `Hand R`
 - `body` → `Arm L` + `Arm R` + `Waist + Neck` 버킷
 
+### F. 시간 구간 강조 (axvspan)
+
+특정 시간 윈도우를 반투명 띠로 강조 (예: trigger 활성 구간 / 외력 인가 구간 marking):
+
+```jsonc
+{
+  "name": "L Elbow",
+  "joints": ["L_Elbow_Joint"],
+  "highlights": [
+    {"t0": 10.0, "t1": 20.0, "color": "#ff8c00", "alpha": 0.15},
+    {"t0": 30.0, "t1": 35.0, "color": "#dc143c", "alpha": 0.20}
+  ]
+}
+```
+
+| 필드 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `t0`, `t1` | ✅ | — | 시작 / 끝 sim_time (초, 절대 기준). `t1 ≤ t0` 면 silently drop. |
+| `color` | ❌ | `#ff8c00` | facecolor (matplotlib hex 또는 이름). |
+| `alpha` | ❌ | `0.15` | 0~1, 범위 밖이면 clamp. |
+| `edgecolor` | ❌ | (없음, edge 안 그림) | 가장자리 색. |
+| `linewidth` | ❌ | `0.0` (edgecolor 없을 때) / `0.8` (있을 때) | edge 두께. |
+
+시간 기준은 plot 의 x 축과 동일한 절대 sim_time. rolling window 모드에선 `t0 ~ t1` 이 view 밖이면 자연스럽게 안 보이고, view 안에 들어오면 스크롤되며 나타남.
+
+**색 추천 (다크 배경)**: amber `#ff8c00` (일반), crimson `#dc143c` (위험/이벤트), yellow `#ffd700` (정보), magenta `#ff00ff` (보조). 라인 color 인 red / cyan 과는 충돌하므로 피할 것.
+
+### G. Channel mix (position + torque 한 subset 에 혼합)
+
+같은 subset 안에서 pos channel subplot 과 torque channel subplot 을 섞어 배치 가능. 한 subplot 은 한 channel.
+
+```jsonc
+"subsets": {
+  "body": [
+    {"name": "L Shoulder Pitch pos",    "joints": ["L_Shoulder_Pitch_Joint"], "channel": "pos",    "y_lim": [-90, 90]},
+    {"name": "L Elbow pos",             "joints": ["L_Elbow_Joint"],          "channel": "pos",    "y_lim": [-150, 30]},
+    {"name": "L Shoulder Pitch torque", "joints": ["L_Shoulder_Pitch_Joint"], "channel": "torque", "y_lim": [-45, 28]},
+    {"name": "L Elbow torque",          "joints": ["L_Elbow_Joint"],          "channel": "torque", "y_lim": [-45, 28]}
+  ]
+}
+```
+
+→ 4 개 subplot 이 vertical 로 배치, 위 2 개는 deg 단위 position, 아래 2 개는 N m 단위 torque.
+
+**단위**: pos channel 의 데이터는 항상 **rad** 로 수집되어 (live articulation `get_joint_positions` / CSV `position_*` 컬럼) plotter 에서 **표시 직전 deg 로 변환**되어 그려진다. `y_lim` 은 표시 단위 기준으로 작성 (pos → deg, torque → Nm).
+
+**Live mode 동작**:
+- torque channel: 기존과 동일 (qfrc_actuator + joint_f → Real/Sim 라인).
+- pos channel: sim 라인만 (articulation 폴링). real 라인은 ROS2 position provider 가 없어 항상 비어 있음 (실선만 그려짐).
+
+**CSV replay mode**: 두 channel 모두 sim / real 라인이 정상 채워짐 (CSV 의 `position_*` / `torque_*` 컬럼 사용).
+
 ---
 
 ## 4. Showcase 별 swap
@@ -158,5 +214,5 @@
 
 - 데이터 정의: `src/allex/config/viz_config.json::torque_plot.subsets`
 - 로더 + 검증: `src/allex/config/viz_config.py::_parse_subsets` → 모듈 상수 `TORQUE_PLOT_SUBSETS`
-- 사용 지점: `src/allex/utils/torque_plotter.py::_select_joints` + `_build_groups`
+- 사용 지점: `src/allex/utils/torque_plotter.py::DataPlotter._select_joints` + `_build_groups`
 - 색상 / lightness 자동 분배: `src/allex/utils/plot_proc.py::_shade`

@@ -242,7 +242,7 @@ class ALLEXJointController:
         torque_plot_fn: optional no-arg callable invoked *after* the position
         target has been applied so the FF snapshot reflects the state that
         will be integrated on the next Newton step. Used by
-        ``TorquePlotter.apply_step`` (wrapped to supply dt).
+        ``DataPlotter.apply_step`` (wrapped to supply dt).
         """
         while True:
             active = self._ros2_subscriber_active

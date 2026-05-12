@@ -1,4 +1,4 @@
-"""Realtime per-joint torque plotter for the ALLEX digital twin.
+"""Realtime per-joint data plotter for the ALLEX digital twin.
 
 This module is the **client** side of a two-process design:
 
@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-logger = logging.getLogger("allex.torque_plotter")
+logger = logging.getLogger("allex.data_plotter")
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +169,12 @@ def _build_dof_name_to_abbr_lut() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
-class TorquePlotter:
-    """Subprocess-backed realtime torque plotter.
+class DataPlotter:
+    """Subprocess-backed realtime per-joint data plotter (torque / position).
+
+    Subplot 별로 ``channel`` 을 지정해 torque (N m) 또는 joint position (deg) 을
+    그릴 수 있다. Channel 선택은 ``viz_config.json::torque_plot.subsets[*][*].channel``
+    필드를 통해 group 단위로 한다. 한 subplot 은 한 channel.
 
     Parameters
     ----------
@@ -207,7 +211,7 @@ class TorquePlotter:
     ):
         if physics_hz is None or float(physics_hz) <= 0.0:
             raise ValueError(
-                "TorquePlotter: physics_hz must be > 0; pass "
+                "DataPlotter: physics_hz must be > 0; pass "
                 "1.0 / get_world_settings()['physics_dt']"
             )
         self._articulation = articulation
@@ -249,6 +253,14 @@ class TorquePlotter:
 
         self._plot_indices, self._plot_names = self._select_joints(dof_names, subset)
         self._groups = self._build_groups(self._plot_names, subset)
+        # Subset 에 pos channel 이 하나라도 있는지 — live mode 의 articulation
+        # position 폴링 스킵 여부 결정 (없으면 매 step GPU→CPU sync 회피).
+        self._has_pos_channel: bool = any(
+            g.get("channel", "torque") == "pos" for g in self._groups
+        )
+        self._has_torque_channel: bool = any(
+            g.get("channel", "torque") == "torque" for g in self._groups
+        )
         # Flat joint order matches how tau is serialised to the subprocess.
         self._joint_order: list[str] = [j for g in self._groups for j in g["joints"]]
 
@@ -268,7 +280,7 @@ class TorquePlotter:
                    if a is None]
         if missing:
             logger.warning(
-                f"TorquePlotter({subset}): {len(missing)} joint(s) have no abbr "
+                f"DataPlotter({subset}): {len(missing)} joint(s) have no abbr "
                 f"mapping; real-torque line will be 0 for them: {missing[:5]}..."
             )
 
@@ -283,10 +295,19 @@ class TorquePlotter:
         # _external_real_by_abbr: dict[abbr -> tau] — real_provider 와 동일 형식.
         self._external_sim_tau: Optional[np.ndarray] = None
         self._external_real_by_abbr: Optional[dict] = None
+        # CSV replay 의 position channel 용 — torque buffer 와 동일 패턴.
+        # 단위는 rad (변환은 plot_proc 의 표시 직전에 한 번만).
+        self._external_sim_pos: Optional[np.ndarray] = None
+        self._external_real_pos_by_abbr: Optional[dict] = None
 
         # CSV replay 모드 — set_replay_mode(True) 면 apply_step 의 자동 push 끄고
         # push_replay_frame 으로 모든 CSV 샘플을 직접 받음.
         self._replay_mode: bool = False
+
+        # Sim 데이터 소스 추적. "live" (articulation qfrc_actuator) / "csv_external"
+        # (set_external_sim_tau buffer) / "csv_push" (push_replay_frame). 값이 바뀔
+        # 때만 logger.info 로 한 번씩 알림 — step 마다 spam 안 함.
+        self._last_sim_source: Optional[str] = None
 
         # Decimate physics step → plotter sampling. FuncAnimation renders at
         # 20 Hz so much higher than ~50 Hz is wasted GPU→CPU sync.
@@ -308,6 +329,18 @@ class TorquePlotter:
     @property
     def save_on_exit(self) -> bool:
         return self._save_on_exit
+
+    def _announce_sim_source(self, source: str) -> None:
+        """Log sim data source transition (live ↔ CSV). Spam-free — only on change."""
+        if source == self._last_sim_source:
+            return
+        self._last_sim_source = source
+        label = {
+            "live": "live articulation (qfrc_actuator)",
+            "csv_external": "CSV replay (external sim_tau buffer)",
+            "csv_push": "CSV replay (push_replay_frame)",
+        }.get(source, source)
+        logger.info(f"DataPlotter[{self._subset}] sim source = {label}")
 
     def _compute_decim(self, plot_hz: float) -> int:
         hz = max(1.0, float(plot_hz))
@@ -336,6 +369,21 @@ class TorquePlotter:
         clears the override.
         """
         self._external_real_by_abbr = None if d is None else d
+
+    def set_external_sim_pos(self, arr) -> None:
+        """CSV replay 동안 articulation 폴링 대신 사용할 (num_dof,) sim position (rad).
+
+        rad → deg 변환은 plot_proc 의 표시 직전에 일괄 처리하므로 여기선 항상 rad.
+        ``None`` clears the override.
+        """
+        if arr is None:
+            self._external_sim_pos = None
+            return
+        self._external_sim_pos = np.asarray(arr, dtype=np.float32).reshape(-1)
+
+    def set_external_real_pos_by_abbr(self, d) -> None:
+        """CSV replay 동안 사용할 ``dict[abbr -> position(rad)]``. ``None`` clears."""
+        self._external_real_pos_by_abbr = None if d is None else d
 
     # ------------------------------------------------------------------
     # Replay mode (called by CsvReplayer) — bypass apply_step's auto push,
@@ -372,6 +420,8 @@ class TorquePlotter:
         sim_tau_full: Optional[np.ndarray],
         real_by_abbr: Optional[dict],
         dof_name_to_idx: dict,
+        sim_pos_full: Optional[np.ndarray] = None,
+        real_pos_by_abbr: Optional[dict] = None,
     ) -> None:
         """Replay 전용 직접 push — decim/step counter 무시.
 
@@ -380,36 +430,62 @@ class TorquePlotter:
         t
             CSV 샘플의 절대 시간 (초). plot X 축에 그대로 사용.
         sim_tau_full
-            (num_dof,) numpy 배열. None 이면 sim 채널은 0.
+            (num_dof,) numpy 배열. None 이면 sim torque 채널 omit.
         real_by_abbr
-            ``dict[abbr -> tau]``. None 이면 real 채널 omit (`y_real` 미전송).
+            ``dict[abbr -> tau]``. None 이면 real torque 채널 omit.
         dof_name_to_idx
-            sim_tau_full 의 dof_name → idx 매핑. plotter 의 `_joint_order` 정렬용.
+            sim_*_full 의 dof_name → idx 매핑. plotter 의 `_joint_order` 정렬용.
+        sim_pos_full
+            (num_dof,) numpy 배열, rad. None 이면 sim pos 채널 omit.
+        real_pos_by_abbr
+            ``dict[abbr -> pos(rad)]``. None 이면 real pos 채널 omit.
         """
         if not self.is_running():
             return
-        # Build sim list (joint_order 정렬).
-        sim_list: list[float] = []
-        if sim_tau_full is not None and sim_tau_full.size > 0:
+        self._announce_sim_source("csv_push")
+
+        n_joints = len(self._joint_order)
+        frame: dict = {"t": float(t)}
+
+        def _build_sim_list(arr: np.ndarray) -> Optional[list]:
+            out: list[float] = []
             for name in self._joint_order:
                 idx = dof_name_to_idx.get(name)
-                if idx is None or idx >= sim_tau_full.size:
-                    return
-                sim_list.append(float(sim_tau_full[idx]))
-        else:
-            sim_list = [0.0] * len(self._joint_order)
+                if idx is None or idx >= arr.size:
+                    return None
+                out.append(float(arr[idx]))
+            return out
 
-        # Build real list (joint_order_abbrs 정렬). 누락 abbr 는 0.
-        real_list: Optional[list] = None
+        # sim torque
+        if sim_tau_full is not None and sim_tau_full.size > 0:
+            sim_tau_list = _build_sim_list(sim_tau_full)
+            if sim_tau_list is not None:
+                frame["y_torque_sim"] = sim_tau_list
+
+        # real torque
         if real_by_abbr is not None:
-            real_list = [
+            frame["y_torque_real"] = [
                 float(real_by_abbr.get(abbr, 0.0)) if abbr is not None else 0.0
                 for abbr in self._joint_order_abbrs
             ]
 
-        frame: dict = {"t": float(t), "y": sim_list}
-        if real_list is not None:
-            frame["y_real"] = real_list
+        # sim pos (rad — plot_proc 가 deg 변환)
+        if sim_pos_full is not None and sim_pos_full.size > 0:
+            sim_pos_list = _build_sim_list(sim_pos_full)
+            if sim_pos_list is not None:
+                frame["y_pos_sim"] = sim_pos_list
+
+        # real pos (rad)
+        if real_pos_by_abbr is not None:
+            nan = float("nan")
+            frame["y_pos_real"] = [
+                float(real_pos_by_abbr.get(abbr, nan)) if abbr is not None else nan
+                for abbr in self._joint_order_abbrs
+            ]
+
+        # 새 키만 보내고 데이터가 아무것도 없으면 send skip — t 만 있는 빈 frame 무의미.
+        if n_joints == 0 or len(frame) == 1:
+            return
         self._send(frame)
 
     @property
@@ -466,9 +542,16 @@ class TorquePlotter:
                 if not jl:
                     continue
                 entry = {"name": g["name"], "joints": jl}
+                # group.channel ("torque" | "pos") — start() 의 init_msg 분기 및
+                # _has_pos_channel / _has_torque_channel 플래그 계산에 필수.
+                if "channel" in g:
+                    entry["channel"] = g["channel"]
                 # group.y_lim 이 있으면 그대로 보존 — start() 에서 init 으로 전달.
                 if "y_lim" in g:
                     entry["y_lim"] = list(g["y_lim"])
+                # group.highlights (axvspan 띠) 도 동일 패턴으로 통과.
+                if "highlights" in g:
+                    entry["highlights"] = list(g["highlights"])
                 out.append(entry)
             return out
         if subset == "hand":
@@ -507,11 +590,11 @@ class TorquePlotter:
 
     def start(self) -> bool:
         if self.is_running():
-            logger.info("TorquePlotter already running")
+            logger.info("DataPlotter already running")
             return True
         if not self._plot_indices or not self._groups:
             logger.warning(
-                f"TorquePlotter: no joints matched subset={self._subset}; not starting"
+                f"DataPlotter: no joints matched subset={self._subset}; not starting"
             )
             return False
 
@@ -524,11 +607,14 @@ class TorquePlotter:
         self._replay_mode = False
         self._external_sim_tau = None
         self._external_real_by_abbr = None
+        self._external_sim_pos = None
+        self._external_real_pos_by_abbr = None
+        self._last_sim_source = None
 
         py = _resolve_plotter_python()
         if py is None:
             msg = (
-                "[ALLEX][TorquePlot] no external python found with "
+                "[ALLEX][DataPlot] no external python found with "
                 "(tkinter, matplotlib, numpy). Install: "
                 "sudo apt install python3-tk python3-matplotlib python3-numpy, "
                 "or set ALLEX_PLOTTER_PYTHON to a suitable interpreter."
@@ -539,7 +625,7 @@ class TorquePlotter:
 
         script = Path(__file__).parent / "plot_proc.py"
         if not script.is_file():
-            logger.error(f"TorquePlotter: proc script missing: {script}")
+            logger.error(f"DataPlotter: proc script missing: {script}")
             return False
 
         try:
@@ -552,7 +638,7 @@ class TorquePlotter:
                 bufsize=1,  # line-buffered
             )
         except Exception as exc:
-            logger.error(f"TorquePlotter: Popen failed: {exc}")
+            logger.error(f"DataPlotter: Popen failed: {exc}")
             self._proc = None
             return False
 
@@ -561,36 +647,44 @@ class TorquePlotter:
         fallback_ylim = list(self._y_lim) if self._y_lim is not None else None
         groups_resolved: list[dict] = []
         for g in self._groups:
-            entry = {"name": g["name"], "joints": g["joints"]}
+            entry = {
+                "name": g["name"],
+                "joints": g["joints"],
+                "channel": g.get("channel", "torque"),
+            }
             if "y_lim" in g:
                 entry["y_lim"] = list(g["y_lim"])
-            elif fallback_ylim is not None:
+            elif fallback_ylim is not None and entry["channel"] == "torque":
+                # subset-level y_lim (TORQUE_PLOT_Y_LIM_<subset>) 은 torque 단위 (N m)
+                # 라서 pos channel 에 적용하면 의미가 어긋남. torque channel 에만 fallback.
                 entry["y_lim"] = list(fallback_ylim)
+            if "highlights" in g:
+                entry["highlights"] = list(g["highlights"])
             groups_resolved.append(entry)
 
         init_msg = {
             "cmd": "init",
-            "title": f"ALLEX Torque ({self._subset}) [{self._plot_mode}]",
+            "title": f"ALLEX Data ({self._subset}) [{self._plot_mode}]",
             "window_sec": self._window_s,
             "hz": self._physics_hz,
-            "y_label": "torque [N m]",
             "plot_mode": self._plot_mode,
             "save_on_exit": self._save_on_exit,
             "groups": groups_resolved,
-            # Real-torque second line (ROS2-fed). When False, subprocess
-            # skips dashed real-line creation and ignores any "y_real" payload.
+            # Real second line (ROS2-fed). When False, subprocess skips dashed
+            # real-line creation. Pos channel 의 live mode 에선 real provider 가
+            # 없어도 CSV replay 에서 push 될 수 있어, 'has_real' 은 표시 가능성
+            # 의미로만 사용 — 실제 데이터 유무는 채널별 frame key 가 결정.
             "has_real": self._real_provider is not None,
-            # Legacy field — subset 전체 fallback. group 마다 y_lim 이 이미 들어가
-            # 있어서 plot_proc 는 안 봐도 됨. 호환성 차원에서 유지.
+            # Legacy field — subset 전체 fallback (torque channel 만 적용).
             "y_lim": fallback_ylim,
         }
         if not self._send(init_msg):
-            logger.error("TorquePlotter: init handshake write failed")
+            logger.error("DataPlotter: init handshake write failed")
             self.stop(timeout=1.0)
             return False
 
         logger.info(
-            f"TorquePlotter started (subset={self._subset}, "
+            f"DataPlotter started (subset={self._subset}, "
             f"joints={len(self._plot_indices)}, python={py})"
         )
         return True
@@ -639,7 +733,9 @@ class TorquePlotter:
         self._replay_mode = False
         self._external_sim_tau = None
         self._external_real_by_abbr = None
-        logger.info("TorquePlotter stopped")
+        self._external_sim_pos = None
+        self._external_real_pos_by_abbr = None
+        logger.info("DataPlotter stopped")
 
     # ------------------------------------------------------------------
     # Per-step sampling (main / physics thread)
@@ -675,13 +771,18 @@ class TorquePlotter:
 
         num = self._num_dof
         tau_total: Optional[np.ndarray] = None
+        # Pos channel 이 있는 subset 일 때만 채워지는 sim_pos (rad). torque 채널만
+        # 인 경우 None — push_sample 에서 pos key 자동 omit.
+        sim_pos: Optional[np.ndarray] = None
 
         # --- 외부 소스 (CSV replay 등) override 우선 ---
         ext_sim = self._external_sim_tau
         if ext_sim is not None and ext_sim.size >= num:
             tau_total = ext_sim[:num].astype(np.float32, copy=True)
+            self._announce_sim_source("csv_external")
 
-        if tau_total is None:
+        if tau_total is None and self._has_torque_channel:
+            self._announce_sim_source("live")
             # --- qfrc_actuator (PD clipping 후 solver 가 쓰는 실제 torque) ----
             # Wrapper: SingleArticulation.get_applied_joint_efforts() 가 패치된
             # articulation_view.get_dof_actuation_forces() 를 통해 내부적으로
@@ -697,7 +798,7 @@ class TorquePlotter:
                         tau_pd_act = np.asarray(a, dtype=np.float32).reshape(-1)
             except Exception as exc:
                 if self._step_count % (200 * self._decim) == 0:
-                    print(f"[ALLEX][TorquePlot {self._subset}] "
+                    print(f"[ALLEX][DataPlot {self._subset}] "
                           f"get_applied_joint_efforts failed: {exc}")
 
             # --- joint_f (ground-truth FF, 모든 writer 합산 결과) -------------
@@ -713,19 +814,40 @@ class TorquePlotter:
                         tau_ff = arr[:num]
                 except Exception as exc:
                     if self._step_count % (200 * self._decim) == 0:
-                        print(f"[ALLEX][TorquePlot {self._subset}] "
+                        print(f"[ALLEX][DataPlot {self._subset}] "
                               f"ff_manager.read_current failed: {exc}")
 
             # qfrc_actuator 가 아직 채워지지 않은 초기 몇 step 은 skip.
             if tau_pd_act is None or tau_pd_act.size < num:
                 if self._step_count % (200 * self._decim) == 0:
                     size = None if tau_pd_act is None else int(tau_pd_act.size)
-                    print(f"[ALLEX][TorquePlot {self._subset}] qfrc_actuator unavailable "
+                    print(f"[ALLEX][DataPlot {self._subset}] qfrc_actuator unavailable "
                           f"(size={size}, need>={num}). "
                           f"Newton patch 가 빠졌거나 아직 build 전일 수 있음.")
                 return
 
             tau_total = (tau_pd_act[:num] + tau_ff[:num]).astype(np.float32)
+
+        # --- Live mode pos channel: articulation 으로부터 joint position 폴링 ---
+        # _has_pos_channel 이 True 인 subset 에서만 실행. External override 가
+        # 있으면 그쪽 우선.
+        if self._has_pos_channel:
+            ext_pos = self._external_sim_pos
+            if ext_pos is not None and ext_pos.size >= num:
+                sim_pos = ext_pos[:num].astype(np.float32, copy=True)
+            else:
+                try:
+                    arr = self._articulation.get_joint_positions()
+                    if arr is not None:
+                        a = _to_np(arr)
+                        if a is not None and a.ndim == 2:
+                            a = a[0]
+                        if a is not None and a.size >= num:
+                            sim_pos = np.asarray(a, dtype=np.float32).reshape(-1)[:num]
+                except Exception as exc:
+                    if self._step_count % (200 * self._decim) == 0:
+                        print(f"[ALLEX][DataPlot {self._subset}] "
+                              f"get_joint_positions failed: {exc}")
 
         # --- (legacy, 참고용) PD 재계산 경로 — 주석 보존 ----------------
         # try:
@@ -750,71 +872,105 @@ class TorquePlotter:
         # --- real torque snapshot (ROS2-fed 또는 외부 override) ----------------
         # 우선순위: external_real_by_abbr (CSV replay) → real_provider → None.
         tau_real_list: Optional[list[float]] = None
-        ext_real = self._external_real_by_abbr
-        if ext_real is not None:
-            tau_real_list = [
-                float(ext_real.get(abbr, 0.0)) if abbr is not None else 0.0
-                for abbr in self._joint_order_abbrs
-            ]
-        elif self._real_provider is not None:
-            try:
-                snap = self._real_provider()
-            except Exception as exc:
-                if self._step_count % (200 * self._decim) == 0:
-                    print(f"[ALLEX][TorquePlot {self._subset}] "
-                          f"real_provider failed: {exc}")
-                snap = None
-            if isinstance(snap, dict) and snap:
-                # 누락된 abbr 는 NaN — 0 으로 채우면 ROS2 토픽이 아직 안 와 있을 때
-                # real line 이 y=0 에 고정되어 "원점에 붙은 직선" artifact 가 됨.
-                nan = float("nan")
+        if self._has_torque_channel:
+            ext_real = self._external_real_by_abbr
+            if ext_real is not None:
                 tau_real_list = [
-                    float(snap.get(abbr, nan)) if abbr is not None else nan
+                    float(ext_real.get(abbr, 0.0)) if abbr is not None else 0.0
                     for abbr in self._joint_order_abbrs
                 ]
-            else:
-                # snap 자체가 None 또는 빈 dict — y_real 을 아예 보내지 않으면
-                # subprocess reader 가 NaN 으로 패딩 (위 plot_proc 변경 참고).
-                tau_real_list = None
+            elif self._real_provider is not None:
+                try:
+                    snap = self._real_provider()
+                except Exception as exc:
+                    if self._step_count % (200 * self._decim) == 0:
+                        print(f"[ALLEX][DataPlot {self._subset}] "
+                              f"real_provider failed: {exc}")
+                    snap = None
+                if isinstance(snap, dict) and snap:
+                    # 누락된 abbr 는 NaN — 0 으로 채우면 ROS2 토픽이 아직 안 와 있을 때
+                    # real line 이 y=0 에 고정되어 "원점에 붙은 직선" artifact 가 됨.
+                    nan = float("nan")
+                    tau_real_list = [
+                        float(snap.get(abbr, nan)) if abbr is not None else nan
+                        for abbr in self._joint_order_abbrs
+                    ]
+                else:
+                    tau_real_list = None
+
+        # --- real pos snapshot — live mode 에선 provider 없음. CSV replay 의
+        # external override 만 사용.
+        pos_real_list: Optional[list[float]] = None
+        if self._has_pos_channel:
+            ext_real_pos = self._external_real_pos_by_abbr
+            if ext_real_pos is not None:
+                nan = float("nan")
+                pos_real_list = [
+                    float(ext_real_pos.get(abbr, nan)) if abbr is not None else nan
+                    for abbr in self._joint_order_abbrs
+                ]
 
         self.push_sample(self._sim_time, tau_total, self._dof_name_to_idx,
-                         tau_real_list=tau_real_list)
+                         tau_real_list=tau_real_list,
+                         pos_full=sim_pos, pos_real_list=pos_real_list)
 
     def push_sample(
         self,
         t: float,
-        tau_full: np.ndarray,
+        tau_full: Optional[np.ndarray],
         dof_name_to_idx: dict,
         tau_real_list: Optional[list] = None,
+        pos_full: Optional[np.ndarray] = None,
+        pos_real_list: Optional[list] = None,
     ) -> None:
         """Send one sample frame to the subprocess.
 
-        ``tau_full`` is expected to be shape (num_dof,). The values are
-        picked in ``self._joint_order`` order (which matches the init
-        handshake). Missing joints are skipped; the subprocess enforces
-        length equality and drops mismatched frames.
+        ``tau_full`` / ``pos_full`` are (num_dof,) numpy arrays. None 이면 해당
+        채널 key 는 frame 에서 omit. pos 는 rad 단위 (변환은 plot_proc).
 
-        ``tau_real_list`` (optional) is a length-``len(_joint_order)`` list
-        of ROS2-fed real torque values, already pre-aligned. Sent under
-        ``y_real`` only when not None and ``has_real`` was set in init.
+        ``tau_real_list`` / ``pos_real_list`` 는 ``_joint_order`` 길이의 list 또는
+        None. None 이면 해당 real key omit.
         """
         if not self.is_running():
             return
-        tau_list: list[float] = []
-        try:
+        n_joints = len(self._joint_order)
+        frame: dict = {"t": float(t)}
+
+        def _build_sim_list(arr: np.ndarray) -> Optional[list]:
+            out: list[float] = []
             for name in self._joint_order:
                 idx = dof_name_to_idx.get(name)
-                if idx is None or idx >= tau_full.size:
-                    # Cannot safely align; skip this frame entirely rather
-                    # than send a mismatched-length payload.
-                    return
-                tau_list.append(float(tau_full[idx]))
-        except Exception as exc:
-            logger.debug(f"push_sample serialise failed: {exc}")
+                if idx is None or idx >= arr.size:
+                    return None
+                out.append(float(arr[idx]))
+            return out
+
+        if tau_full is not None and tau_full.size > 0:
+            try:
+                tau_list = _build_sim_list(tau_full)
+            except Exception as exc:
+                logger.debug(f"push_sample tau serialise failed: {exc}")
+                tau_list = None
+            if tau_list is not None:
+                frame["y_torque_sim"] = tau_list
+
+        if tau_real_list is not None and len(tau_real_list) == n_joints:
+            frame["y_torque_real"] = [float(v) for v in tau_real_list]
+
+        if pos_full is not None and pos_full.size > 0:
+            try:
+                pos_list = _build_sim_list(pos_full)
+            except Exception as exc:
+                logger.debug(f"push_sample pos serialise failed: {exc}")
+                pos_list = None
+            if pos_list is not None:
+                frame["y_pos_sim"] = pos_list
+
+        if pos_real_list is not None and len(pos_real_list) == n_joints:
+            frame["y_pos_real"] = [float(v) for v in pos_real_list]
+
+        if len(frame) == 1:
             return
-        frame: dict = {"t": float(t), "y": tau_list}
-        if tau_real_list is not None and len(tau_real_list) == len(tau_list):
-            frame["y_real"] = [float(v) for v in tau_real_list]
         self._send(frame)
 
     # ------------------------------------------------------------------
@@ -827,7 +983,7 @@ class TorquePlotter:
         try:
             payload = json.dumps(obj, separators=(",", ":")) + "\n"
         except (TypeError, ValueError) as exc:
-            logger.debug(f"TorquePlotter: json dump failed: {exc}")
+            logger.debug(f"DataPlotter: json dump failed: {exc}")
             return False
         try:
             with self._stdin_lock:
@@ -843,10 +999,10 @@ class TorquePlotter:
 # ---------------------------------------------------------------------------
 # Optional module-level singleton hooks for python console use.
 # ---------------------------------------------------------------------------
-_SINGLETONS: dict[str, TorquePlotter] = {}
+_SINGLETONS: dict[str, DataPlotter] = {}
 
 
-def register_singleton(key: str, plotter: TorquePlotter) -> None:
+def register_singleton(key: str, plotter: DataPlotter) -> None:
     """동일 key 에 이미 다른 plotter 가 등록돼 있으면 먼저 stop 시킨 뒤 교체.
 
     Reset / articulation 재바인딩 시 이전 인스턴스의 subprocess 가 누수돼 Tk
@@ -861,7 +1017,7 @@ def register_singleton(key: str, plotter: TorquePlotter) -> None:
     _SINGLETONS[key] = plotter
 
 
-def get_singleton(key: str = "body") -> Optional[TorquePlotter]:
+def get_singleton(key: str = "body") -> Optional[DataPlotter]:
     return _SINGLETONS.get(key)
 
 

@@ -6,10 +6,12 @@ Isaac Sim's bundled Python does not ship ``_tkinter.so`` and Qt backends
 can clash with Kit's own Qt event loop, so the only supported path is
 TkAgg running inside a standalone process.
 
-This module is intentionally signal-agnostic: the y-axis label and frame
-payload are supplied by the client. Currently used for joint torque, but
-force/any per-joint scalar can reuse it by sending a different
-``y_label`` in the init handshake.
+Frame schema is channel-keyed: each frame may carry ``y_torque_sim``,
+``y_torque_real``, ``y_pos_sim``, ``y_pos_real`` (all optional flat lists of
+length = total joints across groups). Per-group ``channel`` in the init
+handshake decides which key feeds that subplot. Y-axis label is derived
+from channel ("torque [N m]" / "position [deg]"). Position payload is rad;
+the reader converts to deg before appending to deques.
 
 IPC
 ---
@@ -20,10 +22,10 @@ or stdin EOF.
 Frames::
 
     {"cmd":"init", "title":"...", "window_sec":5.0, "hz":200,
-     "y_label":"torque [N m]",
-     "groups":[{"name":"Arm L","joints":["..."]}, ...]}
+     "groups":[{"name":"Arm L","joints":["..."],"channel":"torque"}, ...]}
 
-    {"t": 12.34, "y": [0.1, -0.2, ...]}   # y follows flat joint order
+    {"t": 12.34, "y_torque_sim":[...], "y_torque_real":[...],
+     "y_pos_sim":[...], "y_pos_real":[...]}   # all keys optional
 
     {"cmd":"quit"}
 
@@ -64,6 +66,7 @@ def _shade(base_color, idx: int, total: int) -> tuple:
     return (r + (1.0 - r) * mix, g + (1.0 - g) * mix, b + (1.0 - b) * mix)
 
 import json  # noqa: E402
+import math  # noqa: E402
 import os  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
@@ -73,6 +76,9 @@ from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 
 import numpy as np  # noqa: E402
+
+
+_RAD_TO_DEG = 180.0 / math.pi
 
 
 _POLL_INTERVAL_MS = 50
@@ -104,25 +110,24 @@ def _read_init(stdin) -> Optional[dict]:
 def _stdin_reader_loop(
     stdin,
     groups_joint_count: list[int],
+    groups_channel: list[str],
     shared_t: deque,
     group_joint_dqs: list[list[deque]],
     group_real_dqs: Optional[list[list[deque]]],
     stop_event: threading.Event,
 ) -> None:
-    """Read stdin lines, route samples into shared t + per-group joint deques.
+    """Read stdin lines, route channel-keyed samples into per-group deques.
 
-    ``shared_t`` holds one timestamp per sample.
-    ``group_joint_dqs[g][j]`` holds the sim y-value stream for joint ``j`` of
-    group ``g``. The incoming ``y`` list is flat across all groups in the
-    order given by the init handshake; ``groups_joint_count[g]`` slices
-    that flat list.
+    Frame keys (all optional, per channel):
+      - ``y_torque_sim`` / ``y_torque_real`` — flat list (N m), length = total joints
+      - ``y_pos_sim``    / ``y_pos_real``    — flat list (rad)
 
-    ``group_real_dqs`` (None when ``has_real`` was False) mirrors the same
-    shape and is fed from the optional ``y_real`` field. When ``has_real``
-    is True but a frame omits ``y_real``, real deques are padded with 0.0
-    to keep length parity with the sim deques and ``shared_t``.
+    Each group is fed only from the key matching ``groups_channel[g]``
+    (``"torque"`` or ``"pos"``). 누락 / 길이 불일치 시 NaN 패딩으로 sim/real/t
+    parity 유지. rad → deg 변환은 _update 표시 직전이 아니라 reader 에서 한 번만
+    수행 (deque 안에 deg 가 들어가도록) — _update 의 autoscale 로직이 단위
+    변환을 다시 신경쓰지 않아도 됨.
     """
-    total_expected = sum(groups_joint_count)
     has_real = group_real_dqs is not None
     received = 0
     for raw in stdin:
@@ -143,9 +148,6 @@ def _stdin_reader_loop(
         if cmd == "init":
             continue
         if cmd == "reset":
-            # Clear all deques so a non-monotonic t (e.g. on replay restart)
-            # doesn't draw a back-line. Line objects and axis structure from
-            # init stay intact.
             shared_t.clear()
             for jdq_list in group_joint_dqs:
                 for dq in jdq_list:
@@ -155,42 +157,78 @@ def _stdin_reader_loop(
                     for dq in rdq_list:
                         dq.clear()
             continue
-        y = obj.get("y")
         t = obj.get("t")
-        if y is None or t is None:
+        if t is None:
             continue
-        if not isinstance(y, list) or len(y) != total_expected:
-            _log(f"y length mismatch: got {len(y) if isinstance(y, list) else '?'} "
-                 f"expected {total_expected}; drop")
+
+        # Per-channel payloads. Apply rad → deg only to pos channels.
+        y_torque_sim = obj.get("y_torque_sim")
+        y_torque_real = obj.get("y_torque_real")
+        y_pos_sim_rad = obj.get("y_pos_sim")
+        y_pos_real_rad = obj.get("y_pos_real")
+
+        def _to_deg(lst):
+            if not isinstance(lst, list):
+                return None
+            out: list[float] = []
+            for v in lst:
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    out.append(float("nan"))
+                    continue
+                if fv != fv:  # NaN
+                    out.append(fv)
+                else:
+                    out.append(fv * _RAD_TO_DEG)
+            return out
+
+        y_pos_sim = _to_deg(y_pos_sim_rad) if y_pos_sim_rad is not None else None
+        y_pos_real = _to_deg(y_pos_real_rad) if y_pos_real_rad is not None else None
+
+        # Frame valid only if at least one channel payload has correct length.
+        total_expected = sum(groups_joint_count)
+
+        def _validate(payload):
+            return (isinstance(payload, list) and len(payload) == total_expected)
+
+        ok_torque_sim = _validate(y_torque_sim)
+        ok_torque_real = _validate(y_torque_real)
+        ok_pos_sim = _validate(y_pos_sim)
+        ok_pos_real = _validate(y_pos_real)
+        if not (ok_torque_sim or ok_torque_real or ok_pos_sim or ok_pos_real):
             continue
-        # Validate optional real payload before any append so that sim/real/t
-        # deques stay length-aligned. real 이 enabled 인데 y_real 이 누락/형식
-        # 불일치면 NaN 으로 패딩 — matplotlib 은 NaN 구간 line 을 그리지 않으므로
-        # ROS2 가 아직 토픽을 안 보내고 있을 때 real line 이 y=0 에 고정되어
-        # "원점에 붙은 직선" 으로 보이는 artifact 가 안 생김.
-        y_real_use: Optional[list] = None
-        if has_real:
-            y_real = obj.get("y_real")
-            if isinstance(y_real, list) and len(y_real) == total_expected:
-                y_real_use = y_real
-            else:
-                y_real_use = [float("nan")] * total_expected
 
         shared_t.append(float(t))
         cursor = 0
+        nan = float("nan")
         for g, count in enumerate(groups_joint_count):
-            joint_dqs = group_joint_dqs[g]
+            ch = groups_channel[g] if g < len(groups_channel) else "torque"
+            sim_dqs = group_joint_dqs[g]
             real_dqs = group_real_dqs[g] if has_real else None
+            # Pick the (sim_src, real_src) pair for this group's channel.
+            if ch == "pos":
+                sim_src = y_pos_sim if ok_pos_sim else None
+                real_src = y_pos_real if ok_pos_real else None
+            else:
+                sim_src = y_torque_sim if ok_torque_sim else None
+                real_src = y_torque_real if ok_torque_real else None
             for j in range(count):
-                try:
-                    joint_dqs[j].append(float(y[cursor + j]))
-                except (TypeError, ValueError):
-                    joint_dqs[j].append(0.0)
-                if real_dqs is not None and y_real_use is not None:
+                if sim_src is not None:
                     try:
-                        real_dqs[j].append(float(y_real_use[cursor + j]))
+                        sim_dqs[j].append(float(sim_src[cursor + j]))
                     except (TypeError, ValueError):
-                        real_dqs[j].append(0.0)
+                        sim_dqs[j].append(nan)
+                else:
+                    sim_dqs[j].append(nan)
+                if real_dqs is not None:
+                    if real_src is not None:
+                        try:
+                            real_dqs[j].append(float(real_src[cursor + j]))
+                        except (TypeError, ValueError):
+                            real_dqs[j].append(nan)
+                    else:
+                        real_dqs[j].append(nan)
             cursor += count
         received += 1
         if received % 200 == 0:
@@ -214,7 +252,6 @@ def main() -> int:
     title = str(init.get("title", "ALLEX Plot"))
     window_sec = float(init.get("window_sec", 5.0))
     hz = float(init.get("hz", _DEFAULT_HZ))
-    y_label = str(init.get("y_label", "value"))
     plot_mode = str(init.get("plot_mode", "rolling")).lower()
     if plot_mode not in ("rolling", "cumulative"):
         plot_mode = "rolling"
@@ -251,9 +288,14 @@ def main() -> int:
     group_joint_dqs: list[list[deque]] = []
     group_real_dqs: Optional[list[list[deque]]] = [] if has_real else None
     groups_joint_count: list[int] = []
+    groups_channel: list[str] = []
     for g in groups:
         joints = list(g.get("joints", []))
         groups_joint_count.append(len(joints))
+        ch = str(g.get("channel", "torque"))
+        if ch not in ("torque", "pos"):
+            ch = "torque"
+        groups_channel.append(ch)
         group_joint_dqs.append([deque() for _ in joints])
         if group_real_dqs is not None:
             group_real_dqs.append([deque() for _ in joints])
@@ -282,10 +324,11 @@ def main() -> int:
     # legend marker 가 dim 처리됨. real/sim 는 각각 독립적으로 토글 가능.
     # axes 더블클릭 시 그 axes 의 모든 라인이 다시 visible.
     #
-    # axis_specs entry: (ax, sim_lines, real_lines_or_None, per_joint_legend, ax_y_lim).
-    # ax_y_lim 은 그 subplot 전용 (tuple[float, float] | None). torque_plotter 가
+    # axis_specs entry: (ax, sim_lines, real_lines_or_None, per_joint_legend, ax_y_lim, channel).
+    # ax_y_lim 은 그 subplot 전용 (tuple[float, float] | None). data_plotter 가
     # init["groups"][i]["y_lim"] 으로 미리 resolve 해서 보낸다 (group > subset > None).
-    axis_specs: list[tuple[object, list, Optional[list], object, Optional[tuple]]] = []
+    # channel == "torque" → y_label "torque [N m]"; "pos" → "position [deg]".
+    axis_specs: list[tuple] = []
     leg_to_orig: dict = {}
     for ax, grp in zip(axes, groups):
         sim_lines = []
@@ -322,7 +365,10 @@ def main() -> int:
                 sim_lines.append(ln_sim)
                 labeled_lines_ax.append(ln_sim)
         ax.set_title(str(grp.get("name", "")))
-        ax.set_ylabel(y_label)
+        ax_channel = str(grp.get("channel", "torque"))
+        if ax_channel not in ("torque", "pos"):
+            ax_channel = "torque"
+        ax.set_ylabel("position [deg]" if ax_channel == "pos" else "torque [N m]")
         ax.grid(True, alpha=0.3)
         # ncol=2 로 real/sim 페어가 같은 row 에 묶여 보이게. Legend 가 너무 커서
         # plot 영역을 가리면 viz_config.json::torque_plot.subsets 에서 joint 수를
@@ -334,14 +380,38 @@ def main() -> int:
             leg_to_orig[id(leg_line)] = orig_line
         # group["y_lim"] 우선, 없으면 init 의 subset-level y_lim fallback.
         ax_y_lim = _parse_ylim_pair(grp.get("y_lim")) or y_lim
-        axis_specs.append((ax, sim_lines, real_lines, leg, ax_y_lim))
+        # 사전 등록된 시간 구간 강조 띠 (axvspan). torque_plotter 가
+        # init["groups"][i]["highlights"] 로 그대로 넘긴 list 사용. 안전하게
+        # 형식 검증 후 추가; cleanup 은 subprocess 종료 시 자연 정리.
+        highlights = grp.get("highlights")
+        if isinstance(highlights, list):
+            for h in highlights:
+                if not isinstance(h, dict):
+                    continue
+                t0 = h.get("t0")
+                t1 = h.get("t1")
+                if not isinstance(t0, (int, float)) or not isinstance(t1, (int, float)):
+                    continue
+                kw = {
+                    "facecolor": str(h.get("color", "#ff8c00")),
+                    "alpha": float(h.get("alpha", 0.15)),
+                    "zorder": 0,
+                }
+                if "edgecolor" in h:
+                    kw["edgecolor"] = str(h["edgecolor"])
+                    kw["linewidth"] = float(h.get("linewidth", 0.8))
+                else:
+                    kw["linewidth"] = 0.0
+                ax.axvspan(float(t0), float(t1), **kw)
+        axis_specs.append((ax, sim_lines, real_lines, leg, ax_y_lim, ax_channel))
     axes[-1].set_xlabel("time [s]")
-    # Reserve top strip for Hide/Show buttons + bottom strip for x-axis label.
-    # bottom 을 0 으로 두면 figure 가 짧을 때 "time [s]" 라벨이 잘림.
-    fig.tight_layout(rect=[0, 0.04, 1, 0.92])
+    # rect=[left, bottom, right, top] — 위 strip 은 Hide/Show 버튼, 아래는 x-label,
+    # 왼쪽은 y-label, 오른쪽도 숨 좀 트이게 작은 여백. 0(=가장자리 붙임) 이면 figure
+    # 가 좁을 때 라벨이나 마지막 tick 이 잘림.
+    fig.tight_layout(rect=[0.03, 0.02, 0.99, 0.92], h_pad=1.5)
 
     def _set_all_visible(visible: bool):
-        for _ax, _sl, _rl, leg, _yl in axis_specs:
+        for _ax, _sl, _rl, leg, _yl, _ch in axis_specs:
             if leg is None:
                 continue
             for leg_line in leg.get_lines():
@@ -443,7 +513,7 @@ def main() -> int:
         if event.dblclick:
             for _leg_id, orig in leg_to_orig.items():
                 orig.set_visible(True)
-            for _ax, _sl, _rl, leg, _yl in axis_specs:
+            for _ax, _sl, _rl, leg, _yl, _ch in axis_specs:
                 if leg is not None:
                     for ll in leg.get_lines():
                         ll.set_alpha(1.0)
@@ -457,7 +527,7 @@ def main() -> int:
     # Launch stdin reader thread.
     reader = threading.Thread(
         target=_stdin_reader_loop,
-        args=(sys.stdin, groups_joint_count, shared_t,
+        args=(sys.stdin, groups_joint_count, groups_channel, shared_t,
               group_joint_dqs, group_real_dqs, stop_event),
         name="ALLEXPlotStdin",
         daemon=True,
@@ -491,7 +561,7 @@ def main() -> int:
         else:
             t_min = t_last - window_sec
         updated = []
-        for spec_idx, ((ax, sim_lines, real_lines, _leg, ax_y_lim), joint_dqs) in enumerate(
+        for spec_idx, ((ax, sim_lines, real_lines, _leg, ax_y_lim, _ch), joint_dqs) in enumerate(
             zip(axis_specs, group_joint_dqs)
         ):
             real_jdqs = (

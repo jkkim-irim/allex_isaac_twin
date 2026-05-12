@@ -621,13 +621,18 @@ class TrajStudioControls:
 # ============================================================================
 _ROBOT_ROOT = "/ALLEX"
 _VIZ_SKIP = ("torque_ring", "force_viz", "force_vec")
-_OPACITY_VALUE = 0.5
+_OPACITY_VALUE = 0.15
 
 _MODE_OFF = "off"
 _MODE_REAL = "real"
 _MODE_SIM = "sim"
 _MODE_BOTH = "both"
 _MODE_CHOICES = [_MODE_REAL, _MODE_SIM, _MODE_BOTH]
+
+# Force magnitude label overlay anchor 위치 (vector 기준).
+_LABEL_ANCHOR_ORIGIN = "origin"
+_LABEL_ANCHOR_TIP = "tip"
+_LABEL_ANCHOR_CHOICES = [_LABEL_ANCHOR_ORIGIN, _LABEL_ANCHOR_TIP]
 
 
 class VisualizerControls:
@@ -677,6 +682,8 @@ class VisualizerControls:
 
         # Force magnitude label overlay toggle model (lazy build).
         self._force_mag_label_check = None
+        # anchor 위치 ComboBox. 순서는 _LABEL_ANCHOR_CHOICES 와 일치.
+        self._force_label_anchor_combo = None
 
     # ========================================
     # scenario 주입 지연 허용
@@ -733,6 +740,24 @@ class VisualizerControls:
                         self._on_force_mag_label_toggle
                     )
 
+                # 라벨 anchor 위치: vector 의 원점 (default) 또는 tip 위에.
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Label anchor:", width=UILayout.LABEL_WIDTH_LARGE)
+                    self._force_label_anchor_combo = ui.ComboBox(
+                        _LABEL_ANCHOR_CHOICES.index(_LABEL_ANCHOR_ORIGIN),
+                        *[a.capitalize() for a in _LABEL_ANCHOR_CHOICES],
+                    )
+                    try:
+                        anchor_model = (
+                            self._force_label_anchor_combo.model
+                            .get_item_value_model()
+                        )
+                        anchor_model.add_value_changed_fn(
+                            self._on_force_label_anchor_change
+                        )
+                    except Exception:
+                        pass
+
                 ui.Separator(height=4)
 
                 UIComponentFactory.create_styled_button(
@@ -781,8 +806,8 @@ class VisualizerControls:
 
                 ui.Separator(height=4)
 
-                # ---- Torque plotter (matplotlib Tk 별도 window) ----
-                ui.Label("Realtime joint torque plot (separate Tk window).",
+                # ---- Data plotter (matplotlib Tk 별도 window) ----
+                ui.Label("Realtime joint data plot (separate Tk window).",
                          height=UILayout.LABEL_HEIGHT)
 
                 with ui.HStack(height=UILayout.BUTTON_HEIGHT):
@@ -810,23 +835,23 @@ class VisualizerControls:
                     ui.CheckBox(self._save_on_exit_model)
 
                 UIComponentFactory.create_styled_button(
-                    "Torque Plot (Body)",
+                    "Data Plot (Body)",
                     callback=lambda: self._toggle_torque_plot("body"),
                     color_scheme='yellow',
                     height=UILayout.BUTTON_HEIGHT,
                 )
                 self._torque_plot_body_label = UIComponentFactory.create_status_label(
-                    "Torque Plot (Body): OFF", UILayout.LABEL_WIDTH_LARGE,
+                    "Data Plot (Body): OFF", UILayout.LABEL_WIDTH_LARGE,
                 )
 
                 UIComponentFactory.create_styled_button(
-                    "Torque Plot (Hand)",
+                    "Data Plot (Hand)",
                     callback=lambda: self._toggle_torque_plot("hand"),
                     color_scheme='blue',
                     height=UILayout.BUTTON_HEIGHT,
                 )
                 self._torque_plot_hand_label = UIComponentFactory.create_status_label(
-                    "Torque Plot (Hand): OFF", UILayout.LABEL_WIDTH_LARGE,
+                    "Data Plot (Hand): OFF", UILayout.LABEL_WIDTH_LARGE,
                 )
 
     # ========================================
@@ -874,6 +899,23 @@ class VisualizerControls:
             get_force_label_overlay().set_enabled(enabled)
         except Exception as exc:
             print(f"[Visualizer] force magnitude label toggle failed: {exc}")
+
+    # ========================================
+    # ComboBox — Force magnitude label anchor (origin/tip)
+    # ========================================
+    def _on_force_label_anchor_change(self, model):
+        try:
+            idx = int(model.as_int)
+        except Exception:
+            return
+        if idx < 0 or idx >= len(_LABEL_ANCHOR_CHOICES):
+            return
+        mode = _LABEL_ANCHOR_CHOICES[idx]
+        try:
+            from .core.force_label_overlay import get_force_label_overlay
+            get_force_label_overlay().set_anchor_mode(mode)
+        except Exception as exc:
+            print(f"[Visualizer] force label anchor change failed: {exc}")
 
     # ========================================
     # Mode change
@@ -1033,7 +1075,7 @@ class VisualizerControls:
             print(f"[Opacity] {path_str} / {attr_name}: {e}")
 
     # ========================================
-    # Torque Plotter (matplotlib Tk)
+    # Data Plotter (matplotlib Tk)
     # ========================================
     def _get_torque_plotter(self, subset: str):
         if self._scenario is None:
@@ -1083,7 +1125,7 @@ class VisualizerControls:
         label = self._torque_plot_label(subset)
         if plotter is None:
             if label:
-                label.text = f"Torque Plot ({subset.capitalize()}): NOT READY (press RUN first)"
+                label.text = f"Data Plot ({subset.capitalize()}): NOT READY (press RUN first)"
             return
 
         try:
@@ -1098,7 +1140,7 @@ class VisualizerControls:
                 print(f"[TorquePlot] stop({subset}) failed: {exc}")
             setattr(self, f"_torque_plot_{subset}_running", False)
             if label:
-                label.text = f"Torque Plot ({subset.capitalize()}): OFF"
+                label.text = f"Data Plot ({subset.capitalize()}): OFF"
             return
 
         try:
@@ -1120,19 +1162,19 @@ class VisualizerControls:
         except Exception as exc:
             print(f"[TorquePlot] start({subset}) failed: {exc}")
             if label:
-                label.text = f"Torque Plot ({subset.capitalize()}): ERROR"
+                label.text = f"Data Plot ({subset.capitalize()}): ERROR"
             return
         if ok:
             setattr(self, f"_torque_plot_{subset}_running", True)
             if label:
-                label.text = f"Torque Plot ({subset.capitalize()}): ON"
+                label.text = f"Data Plot ({subset.capitalize()}): ON"
         else:
             has_joints = bool(getattr(plotter, "_plot_indices", None))
             if label:
                 if has_joints:
-                    label.text = f"Torque Plot ({subset.capitalize()}): Install python3-tk"
+                    label.text = f"Data Plot ({subset.capitalize()}): Install python3-tk"
                 else:
-                    label.text = f"Torque Plot ({subset.capitalize()}): NO JOINTS"
+                    label.text = f"Data Plot ({subset.capitalize()}): NO JOINTS"
 
     # ========================================
     # Helpers

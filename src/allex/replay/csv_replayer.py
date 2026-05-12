@@ -150,9 +150,16 @@ class CsvReplayer:
         #                "sim.<channel>"   (sim CSV pair_force_vec 또는 aggregate key).
         # 내부 dict 키 = (source, channel) tuple. source ∈ {"real", "sim"}.
         # backward-compat: "ext_force_<topic_id>" 도 "real.<topic_id>" 로 해석 (warning 1회).
-        self._force_triggers: dict = self._parse_force_triggers(
-            viz_scenario.get("force_triggers") or {}
+        # real.* value list 에 "sim.<channel>" 문자열이 섞여 있으면 origin-alias 로
+        # 분리 — 활성 시간창 동안 real prim 의 origin 을 그 sim 의 최신 origin 으로 맞춤.
+        self._real_origin_alias: dict[str, str] = {}
+        clean_force_triggers = self._extract_real_origin_aliases(
+            viz_scenario.get("force_triggers") or {}, self._real_origin_alias
         )
+        self._force_triggers: dict = self._parse_force_triggers(clean_force_triggers)
+        # 매 _push_force_frame_sim 호출 시 sim 채널별 최신 origin 캐시 —
+        # _push_real_force_routed 가 alias resolve 할 때 lookup.
+        self._sim_origin_cache: dict = {}
 
         # --- ext_torque_triggers 파싱 ---
         # Wrench 의 torque (Nm) ring 게이팅. real CSV 만 — sim 쪽엔 Wrench torque 없음.
@@ -195,7 +202,13 @@ class CsvReplayer:
                 f"ext_joint_torque={len(self._ext_jtq_triggers)}ch, "
                 f"plots={len(self._graph_plot_specs)}"
             )
-        # TorquePlotter 인스턴스(들). plot 도 CSV 값을 보여주려면 sim tau / real dict
+        if self._real_origin_alias:
+            logger.info(
+                "[replay] real-force origin aliases: "
+                + ", ".join(f"real.{k} <- sim.{v}"
+                            for k, v in self._real_origin_alias.items())
+            )
+        # DataPlotter 인스턴스(들). plot 도 CSV 값을 보여주려면 sim tau / real dict
         # override 를 매 step 흘려야 함.
         self._plotters = list(plotters) if plotters else []
 
@@ -284,6 +297,25 @@ class CsvReplayer:
                     continue
                 self._sec_torque_dof_plan.append((idx, arr))
 
+        # pos plan: (dof_idx, csv_arr) — main + secondary. plot pos channel 용.
+        # CSV `position_*` 컬럼이 reader.pos 에 저장돼 있음 (rad). plotter 는 rad 로
+        # 받고 plot_proc 에서 deg 로 변환.
+        self._main_pos_dof_plan: list[tuple[int, np.ndarray]] = []
+        for csv_joint, arr in self._main.pos.items():
+            try:
+                idx = self._dof_names.index(csv_joint)
+            except ValueError:
+                continue
+            self._main_pos_dof_plan.append((idx, arr))
+        self._sec_pos_dof_plan: list[tuple[int, np.ndarray]] = []
+        if self._sec is not None:
+            for csv_joint, arr in self._sec.pos.items():
+                try:
+                    idx = self._dof_names.index(csv_joint)
+                except ValueError:
+                    continue
+                self._sec_pos_dof_plan.append((idx, arr))
+
         # CSV 에 torque 컬럼이 없는 ring joint (DIP/IP follower 등) — replay 동안
         # viz.update() 가 _external_torque_sources lock 으로 skip 되어 push 도 안 되면
         # ring 이 base_scale=(1,1,1) 초기값 그대로 거대하게 고정된다. 매 frame 0 push
@@ -370,6 +402,12 @@ class CsvReplayer:
             np.zeros(self._num_dof, dtype=np.float32) if self._num_dof else None
         )
         self._replay_real_dict_buf: dict = {}
+        # Position channel 용 — torque buffer 와 동일 패턴. plotter 는 reference 로 들고
+        # 매 sample 재사용. 단위 rad (plot_proc 가 deg 변환).
+        self._replay_sim_pos_buf: Optional[np.ndarray] = (
+            np.zeros(self._num_dof, dtype=np.float32) if self._num_dof else None
+        )
+        self._replay_real_pos_dict_buf: dict = {}
 
         # rendering tick subscription — kinematic replay 는 physics 와 무관하게
         # 매 rendering frame 마다 진행해야 함 (timeline pause / physics rate 변경에 영향 X).
@@ -492,7 +530,7 @@ class CsvReplayer:
             except Exception as exc:
                 logger.debug(f"[replay] set_replay_force_visible warn: {exc}")
 
-        # TorquePlotter replay 모드 — apply_step (physics tick) 의 자동 push 차단,
+        # DataPlotter replay 모드 — apply_step (physics tick) 의 자동 push 차단,
         # _apply_at 매 호출 시 prev_idx_main+1 ~ idx_main 사이의 모든 CSV 샘플을
         # push_replay_frame 으로 직접 push. CSV 의 native 시간축 (1 kHz 등) 을 그대로
         # plot. real CSV rate 가 다르더라도 매 main sample 의 t 에 맞춰 nearest sec
@@ -1168,6 +1206,8 @@ class CsvReplayer:
         main_src = self._main_src
         sim_buf = self._replay_sim_tau_buf
         real_buf = self._replay_real_dict_buf
+        sim_pos_buf = self._replay_sim_pos_buf
+        real_pos_buf = self._replay_real_pos_dict_buf
 
         # main_src 에 따라 sim/real 채널을 어디서 읽을지 한 번만 결정.
         # main_src=="sim": main reader → sim, sec reader → real (있을 때).
@@ -1176,12 +1216,15 @@ class CsvReplayer:
         real_reader_main = main if main_src == "real" else None
         sim_plan_sec = self._sec_torque_dof_plan if (sec is not None and self._sec_src == "sim") else None
         real_reader_sec = sec if (sec is not None and self._sec_src == "real") else None
+        # pos channel: 같은 sim/real 라우팅, 다만 plan 은 pos_dof_plan 을 사용.
+        sim_pos_plan_main = self._main_pos_dof_plan if main_src == "sim" else None
+        sim_pos_plan_sec = self._sec_pos_dof_plan if (sec is not None and self._sec_src == "sim") else None
 
         # main CSV 의 모든 새 sample 마다 push.
         for i in range(start, idx_main + 1):
             t = float(main.t[i])
 
-            # sim 채널 채우기.
+            # sim torque 채널 채우기.
             sim_tau: Optional[np.ndarray] = None
             if sim_plan_main is not None and sim_buf is not None:
                 sim_buf.fill(0.0)
@@ -1196,7 +1239,7 @@ class CsvReplayer:
                     sim_buf[dof_idx] = float(arr[s_idx])
                 sim_tau = sim_buf
 
-            # real 채널 채우기.
+            # real torque 채널 채우기.
             real_dict: Optional[dict] = None
             if real_reader_main is not None:
                 real_buf.clear()
@@ -1217,11 +1260,48 @@ class CsvReplayer:
                     real_buf[abbr] = float(arr[r_idx])
                 real_dict = real_buf
 
+            # sim pos 채널 채우기 (rad). reader.pos 에 columns 없으면 plan 이 비어
+            # 자동으로 None (plot pos channel 자체가 안 그려짐).
+            sim_pos: Optional[np.ndarray] = None
+            if sim_pos_plan_main and sim_pos_buf is not None:
+                sim_pos_buf.fill(0.0)
+                for dof_idx, arr in sim_pos_plan_main:
+                    sim_pos_buf[dof_idx] = float(arr[i])
+                sim_pos = sim_pos_buf
+            elif sim_pos_plan_sec and sim_pos_buf is not None:
+                s_idx = sec.index_at(t)
+                sim_pos_buf.fill(0.0)
+                for dof_idx, arr in sim_pos_plan_sec:
+                    sim_pos_buf[dof_idx] = float(arr[s_idx])
+                sim_pos = sim_pos_buf
+
+            # real pos 채널 (rad).
+            real_pos_dict: Optional[dict] = None
+            if real_reader_main is not None and real_reader_main.pos:
+                real_pos_buf.clear()
+                for csv_joint, arr in real_reader_main.pos.items():
+                    abbr = self._joint_to_abbr.get(csv_joint)
+                    if abbr is None:
+                        continue
+                    real_pos_buf[abbr] = float(arr[i])
+                real_pos_dict = real_pos_buf
+            elif real_reader_sec is not None and real_reader_sec.pos:
+                r_idx = sec.index_at(t)
+                real_pos_buf.clear()
+                for csv_joint, arr in real_reader_sec.pos.items():
+                    abbr = self._joint_to_abbr.get(csv_joint)
+                    if abbr is None:
+                        continue
+                    real_pos_buf[abbr] = float(arr[r_idx])
+                real_pos_dict = real_pos_buf
+
             for plotter in self._plotters:
                 try:
                     if hasattr(plotter, "push_replay_frame"):
                         plotter.push_replay_frame(
                             t, sim_tau, real_dict, self._dof_name_to_idx,
+                            sim_pos_full=sim_pos,
+                            real_pos_by_abbr=real_pos_dict,
                         )
                 except Exception as exc:
                     if self._step_count % 200 == 0:
@@ -1334,6 +1414,68 @@ class CsvReplayer:
     # ------------------------------------------------------------------
     # viz_scenario 파싱 헬퍼 (init 시 1회)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_real_origin_aliases(raw: dict, alias_out: dict) -> dict:
+        """force_triggers raw dict 에서 real.<id> 값에 섞인 ``"sim.<channel>"`` alias
+        문자열을 분리한다. 분리된 alias 는 ``alias_out`` 에 ``{topic_id: sim_channel}``
+        형식으로 stash, ranges 만 남긴 새 dict 를 리턴 (이후 _parse_force_triggers 가
+        통상 ranges 만 보고 파싱하도록).
+
+        Schema 예::
+
+            "real.arm_r": [[13.5, 17.6], "sim.L_Elbow__R_Palm_Back"]
+
+        → ranges ``[[13.5, 17.6]]`` 로 trigger 등록 + ``arm_r → L_Elbow__R_Palm_Back``
+        origin alias. 활성 시간창 동안 real prim 의 origin 이 그 sim 채널의 최신
+        origin 으로 덮어쓰여진다.
+
+        - real.* 외 key, 그리고 값이 list 가 아닌 경우 ("off" 등) 는 그대로 통과.
+        - alias 문자열이 여러 개면 가장 마지막 것을 사용, WARNING.
+        - "sim." prefix 가 아닌 문자열은 WARNING 후 drop.
+        """
+        if not isinstance(raw, dict):
+            return {}
+        out: dict = {}
+        for raw_key, value in raw.items():
+            if (not isinstance(raw_key, str)) or not raw_key.startswith("real."):
+                out[raw_key] = value
+                continue
+            if not isinstance(value, list):
+                out[raw_key] = value
+                continue
+            topic_id = raw_key.split(".", 1)[1].strip()
+            kept: list = []
+            sim_alias: Optional[str] = None
+            for item in value:
+                if isinstance(item, str):
+                    s = item.strip()
+                    if s.lower().startswith("sim."):
+                        target = s[4:].strip()
+                        if not target:
+                            logger.warning(
+                                f"[replay] force_trigger {raw_key!r}: empty "
+                                f"'sim.' alias, skip"
+                            )
+                            continue
+                        if sim_alias is not None and sim_alias != target:
+                            logger.warning(
+                                f"[replay] force_trigger {raw_key!r}: multiple "
+                                f"sim aliases ({sim_alias!r} → {target!r}); "
+                                f"using last."
+                            )
+                        sim_alias = target
+                    else:
+                        logger.warning(
+                            f"[replay] force_trigger {raw_key!r}: unknown string "
+                            f"entry {s!r} (expected 'sim.<channel>'), skip"
+                        )
+                    continue
+                kept.append(item)
+            if sim_alias is not None and topic_id:
+                alias_out[topic_id] = sim_alias
+            out[raw_key] = kept
+        return out
+
     @staticmethod
     def _parse_force_triggers(raw: dict) -> dict:
         """JSON 의 force_triggers section 을 internal dict 로 변환.
@@ -1578,6 +1720,7 @@ class CsvReplayer:
             origin_arr = reader.pair_contact_pos.get(sanitized_pair)
             origin = origin_arr[idx] if origin_arr is not None else (0.0, 0.0, 0.0)
             self._set_or_add(viz, sanitized_pair, "sim", origin, vec)
+            self._cache_sim_origin(sanitized_pair, origin)
 
         # aggregate — CSV 의 normal 은 reaction 기준이라 -1 곱해 손등 위로 향하게.
         for tag, agg in reader.aggregate.items():
@@ -1591,6 +1734,7 @@ class CsvReplayer:
                    -float(normal[1]) * mag,
                    -float(normal[2]) * mag)
             self._set_or_add(viz, tag, "sim", origin, vec)
+            self._cache_sim_origin(tag, origin)
 
     def _push_real_force_routed(self, real_reader: ShowcaseReader,
                                 real_idx: int) -> None:
@@ -1652,6 +1796,20 @@ class CsvReplayer:
                 p_world = (float(chest_mat[3][0]),
                            float(chest_mat[3][1]),
                            float(chest_mat[3][2]))
+
+            # Origin alias — 활성 시간창 동안 real prim 의 origin 을 매핑된 sim
+            # 채널의 최신 origin 으로 덮어쓴다. sim push 가 _apply_at 안에서 real
+            # push 보다 먼저 호출되므로 cache 는 이 시점에 같은 frame 의 sim 값을 갖고 있음.
+            alias_target = self._real_origin_alias.get(topic_id)
+            if alias_target is not None:
+                sim_origin = self._sim_origin_cache.get(alias_target)
+                if sim_origin is not None:
+                    p_world = sim_origin
+                elif self._step_count % 200 == 0:
+                    logger.debug(
+                        f"[replay] real.{topic_id} origin alias "
+                        f"'sim.{alias_target}' not cached yet"
+                    )
 
             self._set_or_add(viz, topic_id, "real", p_world, f_world)
 
@@ -1796,6 +1954,18 @@ class CsvReplayer:
                 pass
         except Exception as exc:
             logger.debug(f"[replay] torque ring visibility toggle warn: {exc}")
+
+    def _cache_sim_origin(self, channel: str, origin) -> None:
+        """현재 sim push 의 origin 을 채널별 캐시. real-side origin alias 가 lookup."""
+        if not channel:
+            return
+        try:
+            ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
+        except Exception:
+            return
+        if not (np.isfinite(ox) and np.isfinite(oy) and np.isfinite(oz)):
+            return
+        self._sim_origin_cache[channel] = (ox, oy, oz)
 
     def _set_or_add(self, viz, name: str, source: str, origin, vec,
                     kind: str = "force") -> None:

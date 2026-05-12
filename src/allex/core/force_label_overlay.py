@@ -1,8 +1,9 @@
 """ForceLabelOverlay — viewport 위에 force vector magnitude 텍스트 라벨 표시.
 
-각 force vector prim 의 head tip world 좌표에 anchor 된 2D billboard label 을
-omni.ui.scene.SceneView 로 active viewport overlay 에 렌더. arrow 가 hidden
-이거나 master toggle 이 OFF 면 라벨도 hidden.
+각 force vector prim 의 origin (local 0,0,0) world 좌표에 anchor 된 2D billboard
+label 을 omni.ui.scene.SceneView 로 active viewport overlay 에 렌더. arrow 가
+hidden 이거나 master toggle 이 OFF 면 라벨도 hidden. tip 이 아니라 origin 에
+anchor 한 이유: magnitude 변화 → tip 이동 → 라벨이 흔들려 시야 정신없음.
 
 force_torque_visualizer 가 add/update/remove/clear 훅에서 호출하는 singleton.
 """
@@ -42,6 +43,10 @@ class ForceLabelOverlay:
         self._viewport_frame = None  # ui.Frame inside viewport window
         self._viewport_window = None # 카메라 model bind 해제용 참조
         self._unavailable_warned: bool = False
+        # anchor 모드: "origin" (vector base, default) | "tip" (head 끝).
+        # 위치 계산은 visualizer 가 담당하고, overlay 는 mode 값만 보관해
+        # 사용자/visualizer 가 공유 — UI 토글 시 visualizer 가 이 값을 읽어 분기.
+        self._anchor_mode: str = "origin"
 
         # key -> {"source", "transform", "label", "color"}
         self._entries: dict = {}
@@ -53,6 +58,22 @@ class ForceLabelOverlay:
     # ------------------------------------------------------------------
     def is_enabled(self) -> bool:
         return self._enabled
+
+    def get_anchor_mode(self) -> str:
+        return self._anchor_mode
+
+    def set_anchor_mode(self, mode: str) -> None:
+        """anchor 위치 모드 변경. "origin" | "tip". visualizer 가 다음 update
+        호출 시 이 값을 보고 좌표를 다시 계산해 라벨이 자연스럽게 옮겨감."""
+        m = str(mode).lower()
+        if m not in ("origin", "tip"):
+            return
+        if m == self._anchor_mode:
+            return
+        self._anchor_mode = m
+        # last_state 좌표가 이전 모드 기준이라 dirty-check 가 새 좌표를 거를 수
+        # 있음 → 강제 무효화. enabled=False 면 entry 만 있고 scene 노드는 없음.
+        self._last_state.clear()
 
     def set_enabled(self, enabled: bool) -> None:
         """master toggle. OFF 면 모든 entry 제거 + scene_view 해제."""

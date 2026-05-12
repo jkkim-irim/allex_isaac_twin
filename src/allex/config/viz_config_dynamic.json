@@ -67,28 +67,48 @@
     "length_axis": 2
   },
   "torque_plot": {
-    "_doc": "TorquePlotter rolling window / y-axis 설정. window_seconds 는 body/hand 공통. y_lim_<subset> 은 null 이면 autoscale, [ymin, ymax] (Nm) 이면 고정. 잘못된 형식이면 autoscale fallback.",
+    "_doc": "DataPlotter rolling window / y-axis 설정. window_seconds 는 body/hand 공통. y_lim_<subset> 은 null 이면 autoscale, [ymin, ymax] (torque channel 의 Nm) 이면 고정. 잘못된 형식이면 autoscale fallback. pos channel subplot 에는 적용되지 않음 (단위 다름).",
     "window_seconds": 20.0,
-    "y_lim_body": [-120, 30],
+    "y_lim_body": null,
     "y_lim_hand": null,
     "subsets": {
-      "_doc": "TorquePlotter subset 별 subplot 정의. 키 = subset 명 ('body'|'hand' 등 TorquePlotter(subset=...) 인자와 매칭). 값 = subplot 들의 list, 각 entry = {'name': subplot 제목, 'joints': USD dof_name 의 list}. dof_names 에 없는 joint 는 자동 drop. subsets 자체가 없거나 비어있으면 regex 기반 fallback (hand → Hand L/R 전체, body → Arm L/R + Waist+Neck).",
+      "_doc": "DataPlotter subset 별 subplot 정의. 키 = subset 명 ('body'|'hand' 등 DataPlotter(subset=...) 인자와 매칭). 값 = subplot 들의 list, 각 entry = {'name': subplot 제목, 'joints': USD dof_name 의 list, 'channel': 'torque'|'pos' (default 'torque', pos 는 deg 단위)}. dof_names 에 없는 joint 는 자동 drop. subsets 자체가 없거나 비어있으면 regex 기반 fallback (hand → Hand L/R 전체, body → Arm L/R + Waist+Neck).",
       "body": [
         {
-          "name": "Left Shoulder Pitch",
-          "joints": ["L_Shoulder_Pitch_Joint"], "y_lim": [-45, 28]
+          "name": "L Shoulder Pitch Pos",
+          "joints": ["L_Shoulder_Pitch_Joint"], "channel": "pos", "y_lim": [-110, 70],
+          "highlights": [
+            {"t0": 13.5, "t1": 17.6,  "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 20.6, "t1": 24.3, "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 33.0, "t1": 36.8, "color": "#ff8c00", "alpha": 0.3}
+          ]
         },
         {
-          "name": "Left Elbow",
-          "joints": ["L_Elbow_Joint"], "y_lim": [-45, 28]
+          "name": "L Elbow Pos",
+          "joints": ["L_Elbow_Joint"], "channel": "pos", "y_lim": [-160, 0],
+          "highlights": [
+            {"t0": 13.5, "t1": 17.6,  "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 20.6, "t1": 24.3, "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 33.0, "t1": 36.8, "color": "#ff8c00", "alpha": 0.3}
+          ]
         },
         {
-          "name": "Right Shoulder Pitch",
-          "joints": ["R_Shoulder_Pitch_Joint"], "y_lim": [-35, 28]
+          "name": "L Shoulder Pitch Torque",
+          "joints": ["L_Shoulder_Pitch_Joint"], "channel": "torque", "y_lim": [-120, 80],
+          "highlights": [
+            {"t0": 13.5, "t1": 17.6,  "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 20.6, "t1": 24.3, "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 33.0, "t1": 36.8, "color": "#ff8c00", "alpha": 0.3}
+          ]
         },
         {
-          "name": "Right Elbow",
-          "joints": ["R_Elbow_Joint"], "y_lim": [-28, 28]
+          "name": "L Elbow Torque",
+          "joints": ["L_Elbow_Joint"], "channel": "torque", "y_lim": [-110, 30],
+          "highlights": [
+            {"t0": 13.5, "t1": 17.6,  "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 20.6, "t1": 24.3, "color": "#ff8c00", "alpha": 0.3},
+            {"t0": 33.0, "t1": 36.8, "color": "#ff8c00", "alpha": 0.3}
+          ]
         }
       ],
       "hand": [

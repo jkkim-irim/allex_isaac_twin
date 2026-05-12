@@ -684,6 +684,31 @@ class ForceTorqueVisualizer:
             logger.debug(f"[viz] compute_force_tip_world warn: {exc}")
             return None
 
+    def _compute_force_origin_world(self, prim):
+        """prim 의 origin (local 0,0,0) world 좌표. magnitude 변해도 안 움직임."""
+        if prim is None or not prim.IsValid():
+            return None
+        try:
+            from pxr import Gf, Usd, UsdGeom
+            xformable = UsdGeom.Xformable(prim)
+            l2w = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            world = l2w.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+            return (float(world[0]), float(world[1]), float(world[2]))
+        except Exception as exc:
+            logger.debug(f"[viz] compute_force_origin_world warn: {exc}")
+            return None
+
+    def _compute_force_label_anchor(self, prim, magnitude: float, kind: str,
+                                    overlay):
+        """overlay 의 anchor_mode 에 따라 origin/tip world 좌표를 선택해서 반환."""
+        try:
+            mode = overlay.get_anchor_mode() if overlay is not None else "origin"
+        except Exception:
+            mode = "origin"
+        if mode == "tip":
+            return self._compute_force_tip_world(prim, magnitude, kind)
+        return self._compute_force_origin_world(prim)
+
     @staticmethod
     def _scale_params_for_kind(kind: str):
         """kind ('force'/'torque') → (gain, min_scale, max_scale, hide_below)."""
@@ -843,10 +868,11 @@ class ForceTorqueVisualizer:
             if overlay is not None:
                 try:
                     overlay.add(prim_path, source)
-                    tip = self._compute_force_tip_world(prim, mag, kind)
-                    label_visible = (mag >= hide_below) and (tip is not None)
-                    if tip is not None:
-                        overlay.update(prim_path, tip, mag, label_visible)
+                    anchor = self._compute_force_label_anchor(
+                        prim, mag, kind, overlay)
+                    label_visible = (mag >= hide_below) and (anchor is not None)
+                    if anchor is not None:
+                        overlay.update(prim_path, anchor, mag, label_visible)
                 except Exception as exc:
                     logger.debug(f"[viz] overlay add warn: {exc}")
 
@@ -942,10 +968,11 @@ class ForceTorqueVisualizer:
                                 overlay.update(prim_path, (0.0, 0.0, 0.0),
                                                 0.0, False)
                         else:
-                            tip = self._compute_force_tip_world(prim, magnitude, kind)
-                            if tip is not None and prim_path:
+                            anchor = self._compute_force_label_anchor(
+                                prim, magnitude, kind, overlay)
+                            if anchor is not None and prim_path:
                                 label_visible = magnitude >= hide_below
-                                overlay.update(prim_path, tip, magnitude,
+                                overlay.update(prim_path, anchor, magnitude,
                                                 label_visible)
                     except Exception as exc:
                         logger.debug(f"[viz] overlay update warn: {exc}")

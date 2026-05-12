@@ -12,7 +12,7 @@ from .core import (
     ForceTorqueVisualizer,
     FeedforwardTorqueManager,
 )
-from .utils.torque_plotter import TorquePlotter, register_singleton
+from .utils.torque_plotter import DataPlotter, register_singleton
 from .config.viz_config import (
     TORQUE_PLOT_WINDOW_SECONDS,
     TORQUE_PLOT_Y_LIM_BODY,
@@ -44,8 +44,8 @@ class ALLEXDigitalTwin:
 
         # Torque plotters (body = arm+waist+neck, hand = fingers).
         # Dormant until .start() is called from the UI or python console.
-        self._torque_plotter_body: TorquePlotter | None = None
-        self._torque_plotter_hand: TorquePlotter | None = None
+        self._torque_plotter_body: DataPlotter | None = None
+        self._torque_plotter_hand: DataPlotter | None = None
 
     def setup(self):
         """시나리오 초기 설정 — 카메라 뷰 + coupled joint config 로드"""
@@ -287,14 +287,14 @@ class ALLEXDigitalTwin:
             setattr(self, attr, None)
 
     def _setup_torque_plotters(self, physics_hz: float):
-        """(Re)create TorquePlotter instances for body + hand subsets.
+        """(Re)create DataPlotter instances for body + hand subsets.
 
         If plotters were already running when articulation is reinitialized
         (e.g. after Stop/Play), we tear them down first so the new instance
         binds to the fresh articulation view.
 
         physics_hz: derived from physics_config.json::world.physics_dt by the
-        caller. Required by TorquePlotter to compute its decim ratio.
+        caller. Required by DataPlotter to compute its decim ratio.
         """
         if self._articulation is None:
             return
@@ -312,7 +312,7 @@ class ALLEXDigitalTwin:
         self._stop_torque_plotters()
 
         try:
-            self._torque_plotter_body = TorquePlotter(
+            self._torque_plotter_body = DataPlotter(
                 articulation=self._articulation,
                 physics_hz=physics_hz,
                 ff_provider=ff_provider,
@@ -324,11 +324,11 @@ class ALLEXDigitalTwin:
             )
             register_singleton("body", self._torque_plotter_body)
         except Exception as exc:
-            logger.warning(f"TorquePlotter(body) init failed: {exc}")
+            logger.warning(f"DataPlotter(body) init failed: {exc}")
             self._torque_plotter_body = None
 
         try:
-            self._torque_plotter_hand = TorquePlotter(
+            self._torque_plotter_hand = DataPlotter(
                 articulation=self._articulation,
                 physics_hz=physics_hz,
                 ff_provider=ff_provider,
@@ -340,7 +340,7 @@ class ALLEXDigitalTwin:
             )
             register_singleton("hand", self._torque_plotter_hand)
         except Exception as exc:
-            logger.warning(f"TorquePlotter(hand) init failed: {exc}")
+            logger.warning(f"DataPlotter(hand) init failed: {exc}")
             self._torque_plotter_hand = None
 
     # ========================================

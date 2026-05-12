@@ -163,7 +163,7 @@ FORCE_VEC_LENGTH_AXIS           = int(_fv["length_axis"])
 
 
 # ---------------------------------------------------------------------------
-# Torque plot (TorquePlotter rolling window / y-axis)
+# Torque plot (DataPlotter rolling window / y-axis)
 # ---------------------------------------------------------------------------
 _tp = _cfg.get("torque_plot", {})
 
@@ -194,10 +194,13 @@ def _parse_subsets(raw) -> dict:
 
     각 group 은 한 subplot 단위. 잘못된 entry 는 silently drop. subset 자체가
     비어있거나 형식이 깨졌으면 그 subset 은 key 자체가 안 생기고,
-    ``TorquePlotter._build_groups`` 가 regex 기반 fallback 으로 동작.
+    ``DataPlotter._build_groups`` 가 regex 기반 fallback 으로 동작.
 
     group.y_lim 은 optional — 있으면 그 subplot 만 fixed y-axis, 없으면 subset
     레벨 ``y_lim_<subset>`` (있으면) fallback, 그것도 없으면 autoscale.
+
+    group.channel 은 optional — ``"torque"`` (default, N m) 또는 ``"pos"`` (deg).
+    잘못된 값이면 ``"torque"`` 로 fallback.
     """
     if not isinstance(raw, dict):
         return {}
@@ -217,7 +220,9 @@ def _parse_subsets(raw) -> dict:
             jl = [str(j) for j in joints if isinstance(j, str) and j]
             if not jl:
                 continue
-            entry: dict = {"name": name, "joints": jl}
+            ch_raw = g.get("channel", "torque")
+            ch = ch_raw if ch_raw in ("torque", "pos") else "torque"
+            entry: dict = {"name": name, "joints": jl, "channel": ch}
             if "y_lim" in g:
                 yl = _parse_y_lim(
                     g["y_lim"],
@@ -225,6 +230,30 @@ def _parse_subsets(raw) -> dict:
                 )
                 if yl is not None:
                     entry["y_lim"] = [yl[0], yl[1]]
+            if "highlights" in g and isinstance(g["highlights"], list):
+                parsed_highlights: list[dict] = []
+                for h in g["highlights"]:
+                    if not isinstance(h, dict):
+                        continue
+                    t0 = h.get("t0")
+                    t1 = h.get("t1")
+                    if not isinstance(t0, (int, float)) or not isinstance(t1, (int, float)):
+                        continue
+                    if float(t1) <= float(t0):
+                        continue
+                    entry_h: dict = {
+                        "t0": float(t0),
+                        "t1": float(t1),
+                        "color": str(h.get("color", "#ff8c00")),
+                        "alpha": max(0.0, min(1.0, float(h.get("alpha", 0.15)))),
+                    }
+                    if "edgecolor" in h:
+                        entry_h["edgecolor"] = str(h["edgecolor"])
+                    if "linewidth" in h:
+                        entry_h["linewidth"] = float(h["linewidth"])
+                    parsed_highlights.append(entry_h)
+                if parsed_highlights:
+                    entry["highlights"] = parsed_highlights
             clean.append(entry)
         if clean:
             out[str(subset_name)] = clean
