@@ -164,15 +164,17 @@ def _stdin_reader_loop(
                  f"expected {total_expected}; drop")
             continue
         # Validate optional real payload before any append so that sim/real/t
-        # deques stay length-aligned. If real is enabled but y_real is missing
-        # or wrong length, fall back to zeros.
+        # deques stay length-aligned. real 이 enabled 인데 y_real 이 누락/형식
+        # 불일치면 NaN 으로 패딩 — matplotlib 은 NaN 구간 line 을 그리지 않으므로
+        # ROS2 가 아직 토픽을 안 보내고 있을 때 real line 이 y=0 에 고정되어
+        # "원점에 붙은 직선" 으로 보이는 artifact 가 안 생김.
         y_real_use: Optional[list] = None
         if has_real:
             y_real = obj.get("y_real")
             if isinstance(y_real, list) and len(y_real) == total_expected:
                 y_real_use = y_real
             else:
-                y_real_use = [0.0] * total_expected
+                y_real_use = [float("nan")] * total_expected
 
         shared_t.append(float(t))
         cursor = 0
@@ -218,17 +220,19 @@ def main() -> int:
         plot_mode = "rolling"
     save_on_exit = bool(init.get("save_on_exit", False))
     has_real = bool(init.get("has_real", False))
-    # Fixed y-limit (모든 subplot 공통). None → autoscale.
-    y_lim_raw = init.get("y_lim")
-    y_lim: Optional[tuple] = None
-    if isinstance(y_lim_raw, (list, tuple)) and len(y_lim_raw) == 2:
+    # Fixed y-limit (subset 전체 fallback). None → autoscale.
+    # group["y_lim"] 가 있는 subplot 은 그걸 우선 사용 (axis_specs 빌드 시 결정).
+    def _parse_ylim_pair(v) -> Optional[tuple]:
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            return None
         try:
-            _a = float(y_lim_raw[0])
-            _b = float(y_lim_raw[1])
-            if _a < _b:
-                y_lim = (_a, _b)
+            a = float(v[0])
+            b = float(v[1])
         except (TypeError, ValueError):
-            y_lim = None
+            return None
+        return (a, b) if a < b else None
+
+    y_lim: Optional[tuple] = _parse_ylim_pair(init.get("y_lim"))
     groups = init.get("groups", [])
     if not isinstance(groups, list) or not groups:
         _log("init has no groups; exiting")
@@ -259,10 +263,11 @@ def main() -> int:
     for g in groups:
         flat_joint_names.extend(str(j) for j in g.get("joints", []))
 
-    # Build figure + subplots.
+    # Build figure + subplots. subplot 당 최소 3.5 inch 확보해서 legend 와 plot
+    # 데이터 모두 충분한 면적 가지도록.
     n_rows = len(groups)
     fig, axes = plt.subplots(
-        n_rows, 1, figsize=(10, max(3.0, 2.5 * n_rows)),
+        n_rows, 1, figsize=(12, max(4.0, 3.5 * n_rows)),
         sharex=True, num=title,
     )
     if n_rows == 1:
@@ -277,8 +282,10 @@ def main() -> int:
     # legend marker 가 dim 처리됨. real/sim 는 각각 독립적으로 토글 가능.
     # axes 더블클릭 시 그 axes 의 모든 라인이 다시 visible.
     #
-    # axis_specs entry: (ax, sim_lines, real_lines_or_None, per_joint_legend).
-    axis_specs: list[tuple[object, list, Optional[list], object]] = []
+    # axis_specs entry: (ax, sim_lines, real_lines_or_None, per_joint_legend, ax_y_lim).
+    # ax_y_lim 은 그 subplot 전용 (tuple[float, float] | None). torque_plotter 가
+    # init["groups"][i]["y_lim"] 으로 미리 resolve 해서 보낸다 (group > subset > None).
+    axis_specs: list[tuple[object, list, Optional[list], object, Optional[tuple]]] = []
     leg_to_orig: dict = {}
     for ax, grp in zip(axes, groups):
         sim_lines = []
@@ -317,19 +324,24 @@ def main() -> int:
         ax.set_title(str(grp.get("name", "")))
         ax.set_ylabel(y_label)
         ax.grid(True, alpha=0.3)
-        # ncol=2 로 real/sim 가 같은 row 에 묶여 보이도록.
+        # ncol=2 로 real/sim 페어가 같은 row 에 묶여 보이게. Legend 가 너무 커서
+        # plot 영역을 가리면 viz_config.json::torque_plot.subsets 에서 joint 수를
+        # 줄이는 식으로 해결.
         leg = ax.legend(loc="upper left", fontsize="x-small", ncol=2)
         for leg_line, orig_line in zip(leg.get_lines(), labeled_lines_ax):
             leg_line.set_picker(True)
             leg_line.set_pickradius(5)
             leg_to_orig[id(leg_line)] = orig_line
-        axis_specs.append((ax, sim_lines, real_lines, leg))
+        # group["y_lim"] 우선, 없으면 init 의 subset-level y_lim fallback.
+        ax_y_lim = _parse_ylim_pair(grp.get("y_lim")) or y_lim
+        axis_specs.append((ax, sim_lines, real_lines, leg, ax_y_lim))
     axes[-1].set_xlabel("time [s]")
-    # Reserve a strip at the top for Hide/Show all buttons.
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    # Reserve top strip for Hide/Show buttons + bottom strip for x-axis label.
+    # bottom 을 0 으로 두면 figure 가 짧을 때 "time [s]" 라벨이 잘림.
+    fig.tight_layout(rect=[0, 0.04, 1, 0.92])
 
     def _set_all_visible(visible: bool):
-        for _ax, _sl, _rl, leg in axis_specs:
+        for _ax, _sl, _rl, leg, _yl in axis_specs:
             if leg is None:
                 continue
             for leg_line in leg.get_lines():
@@ -431,7 +443,7 @@ def main() -> int:
         if event.dblclick:
             for _leg_id, orig in leg_to_orig.items():
                 orig.set_visible(True)
-            for _ax, _sl, _rl, leg in axis_specs:
+            for _ax, _sl, _rl, leg, _yl in axis_specs:
                 if leg is not None:
                     for ll in leg.get_lines():
                         ll.set_alpha(1.0)
@@ -479,7 +491,7 @@ def main() -> int:
         else:
             t_min = t_last - window_sec
         updated = []
-        for spec_idx, ((ax, sim_lines, real_lines, _leg), joint_dqs) in enumerate(
+        for spec_idx, ((ax, sim_lines, real_lines, _leg, ax_y_lim), joint_dqs) in enumerate(
             zip(axis_specs, group_joint_dqs)
         ):
             real_jdqs = (
@@ -541,17 +553,20 @@ def main() -> int:
                 # Exclude hidden lines from y-autoscale.
                 if not ln.get_visible():
                     continue
-                y_min = min(y_min, float(y_vis.min()))
-                y_max = max(y_max, float(y_vis.max()))
-                # Real also contributes to autoscale only when its sim
-                # twin is visible (they share visibility) and real has data.
+                # nanmin/nanmax — NaN 패딩된 real 샘플을 자동스케일에서 무시.
+                if y_vis.size > 0:
+                    y_min = min(y_min, float(np.nanmin(y_vis)))
+                    y_max = max(y_max, float(np.nanmax(y_vis)))
                 if yr_vis is not None and yr_vis.size > 0:
-                    y_min = min(y_min, float(yr_vis.min()))
-                    y_max = max(y_max, float(yr_vis.max()))
+                    yr_min = float(np.nanmin(yr_vis))
+                    yr_max = float(np.nanmax(yr_vis))
+                    if yr_min == yr_min:  # not NaN
+                        y_min = min(y_min, yr_min)
+                        y_max = max(y_max, yr_max)
             ax.set_xlim(t_min, t_last + 1e-3)
-            if y_lim is not None:
-                # 고정 y-axis — autoscale 끔.
-                ax.set_ylim(y_lim[0], y_lim[1])
+            if ax_y_lim is not None:
+                # 고정 y-axis — autoscale 끔. group["y_lim"] 또는 subset fallback.
+                ax.set_ylim(ax_y_lim[0], ax_y_lim[1])
             elif y_min != float("inf") and y_max != float("-inf"):
                 if y_min == y_max:
                     y_min -= 1.0

@@ -1,0 +1,42 @@
+{
+  "_notes": "Joint topology + ROS abbr mapping for torque ring visualization. viz_config.py 가 이 파일을 읽어서 HAND_JOINT_TORQUE_RING_MAP / HAND_JOINT_TORQUE_RING_TUPLES (L/R 양쪽으로 펼친 40+14 ring entry) 를 구성. viz-only 데이터가 아니라 robot kinematic topology + ROS bridge naming convention 의 단일 진리. showcase 별 viz_config_*.json 들과는 분리 — kinematic 토폴로지는 showcase 와 무관하기 때문.",
+
+  "hand_joint_specs": {
+    "_doc": "(joint_stem, link_name, abbr_suffix). prefix='L_'/'R_' + joint_stem + '_Joint' = usd_joint_name. abbr = side + suffix (L11, R54 등). 1=Yaw/ABAD 2=CMC/MCP 3=MCP/PIP 4=IP/DIP. 4번째는 mimic slave (equality follower).",
+    "specs": [
+      ["Thumb_Yaw",   "Thumb_Yaw_Link",       "11"],
+      ["Thumb_CMC",   "Thumb_Proximal_Link",  "12"],
+      ["Thumb_MCP",   "Thumb_Middle_Link",    "13"],
+      ["Thumb_IP",    "Thumb_Distal_Link",    "14"],
+      ["Index_ABAD",  "Index_Roll_Link",      "21"],
+      ["Index_MCP",   "Index_Proximal_Link",  "22"],
+      ["Index_PIP",   "Index_Middle_Link",    "23"],
+      ["Index_DIP",   "Index_Distal_Link",    "24"],
+      ["Middle_ABAD", "Middle_Roll_Link",     "31"],
+      ["Middle_MCP",  "Middle_Proximal_Link", "32"],
+      ["Middle_PIP",  "Middle_Middle_Link",   "33"],
+      ["Middle_DIP",  "Middle_Distal_Link",   "34"],
+      ["Ring_ABAD",   "Ring_Roll_Link",       "41"],
+      ["Ring_MCP",    "Ring_Proximal_Link",   "42"],
+      ["Ring_PIP",    "Ring_Middle_Link",     "43"],
+      ["Ring_DIP",    "Ring_Distal_Link",     "44"],
+      ["Little_ABAD", "Little_Roll_Link",     "51"],
+      ["Little_MCP",  "Little_Proximal_Link", "52"],
+      ["Little_PIP",  "Little_Middle_Link",   "53"],
+      ["Little_DIP",  "Little_Distal_Link",   "54"]
+    ]
+  },
+
+  "arm_joint_specs": {
+    "_doc": "(joint_stem, link_name, abbr_suffix). full joint = side+'_'+joint_stem (e.g. L_Shoulder_Pitch_Joint). abbr_suffix 는 ros2_config 의 *SP/*SR/*SY/*EP/*WY/*WR/*WP 와 일치.",
+    "specs": [
+      ["Shoulder_Pitch_Joint", "Shoulder_Pitch_Link", "SP"],
+      ["Shoulder_Roll_Joint",  "Shoulder_Roll_Link",  "SR"],
+      ["Shoulder_Yaw_Joint",   "Shoulder_Yaw_Link",   "SY"],
+      ["Elbow_Joint",          "Elbow_Link",          "EP"],
+      ["Wrist_Yaw_Joint",      "Wrist_Yaw_Link",      "WY"],
+      ["Wrist_Roll_Joint",     "Wrist_Roll_Link",     "WR"],
+      ["Wrist_Pitch_Joint",    "Wrist_Pitch_Link",    "WP"]
+    ]
+  }
+}

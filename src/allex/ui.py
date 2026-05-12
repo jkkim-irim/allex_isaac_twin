@@ -675,6 +675,9 @@ class VisualizerControls:
         # Save-on-stop is read at Start time.
         self._save_on_exit_model = None
 
+        # Force magnitude label overlay toggle model (lazy build).
+        self._force_mag_label_check = None
+
     # ========================================
     # scenario 주입 지연 허용
     # ========================================
@@ -717,6 +720,18 @@ class VisualizerControls:
                 self._force_viz_status_label = UIComponentFactory.create_status_label(
                     "Force Viz: OFF", UILayout.LABEL_WIDTH_LARGE,
                 )
+
+                # Force magnitude label overlay toggle (기본 OFF).
+                # CheckBox 가 자체 model 을 갖게 하고 그 model 에 콜백을 단다 — 외부에서
+                # 만든 SimpleBoolModel 을 positional 로 넘기면 omni.ui 버전에 따라
+                # width 처럼 해석돼 콜백이 안 붙는 케이스가 있다 (실측 증상).
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Show force magnitude [N]:",
+                             width=UILayout.LABEL_WIDTH_LARGE)
+                    self._force_mag_label_check = ui.CheckBox()
+                    self._force_mag_label_check.model.add_value_changed_fn(
+                        self._on_force_mag_label_toggle
+                    )
 
                 ui.Separator(height=4)
 
@@ -845,6 +860,20 @@ class VisualizerControls:
         if self._force_viz_status_label:
             self._force_viz_status_label.text = status_text
         print(f"[Visualizer] {status_text}")
+
+    # ========================================
+    # Toggle — Force magnitude label overlay
+    # ========================================
+    def _on_force_mag_label_toggle(self, model):
+        try:
+            enabled = bool(model.get_value_as_bool())
+        except Exception:
+            return
+        try:
+            from .core.force_label_overlay import get_force_label_overlay
+            get_force_label_overlay().set_enabled(enabled)
+        except Exception as exc:
+            print(f"[Visualizer] force magnitude label toggle failed: {exc}")
 
     # ========================================
     # Mode change
@@ -1125,6 +1154,13 @@ class VisualizerControls:
 
     def cleanup(self) -> None:
         self._contact_force_viz.cleanup()
+        try:
+            from .core.force_label_overlay import get_force_label_overlay
+            overlay = get_force_label_overlay()
+            overlay.set_enabled(False)
+            overlay.clear()
+        except Exception:
+            pass
 
 
 # ============================================================================

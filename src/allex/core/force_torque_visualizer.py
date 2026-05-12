@@ -43,6 +43,17 @@ from ..config.viz_config import (
     EXT_TORQUE_HIDE_BELOW, EXT_TORQUE_COLOR_REAL, EXT_TORQUE_COLOR_SIM,
 )
 
+# overlay 모듈 import 실패해도 force viz 자체는 동작해야 하므로 try/except.
+# 주의: top-level import 로 함수 reference 를 캐시하면, extension reload 시 force_label_overlay
+# 모듈만 reimport 되고 visualizer 모듈은 stale 인 경우 visualizer 가 OLD singleton 을 참조하면서
+# ui 의 새 singleton 과 desync (enabled state 가 두 곳에 따로 박힘). 따라서 _overlay() 에서
+# 매번 dynamic import 로 현재 모듈의 getter 를 resolve.
+_FORCE_LABEL_OVERLAY_AVAILABLE = True
+try:
+    from . import force_label_overlay as _force_label_overlay_mod  # noqa: F401
+except Exception:  # pragma: no cover — Isaac 외 환경
+    _FORCE_LABEL_OVERLAY_AVAILABLE = False
+
 
 logger = logging.getLogger("allex.viz")
 
@@ -634,6 +645,45 @@ class ForceTorqueVisualizer:
         """source + name 조합으로 내부 key. ``_custom_force_prims`` 에 사용."""
         return f"{source}::{name}"
 
+    def _overlay(self):
+        """force_label_overlay singleton getter. 매 호출마다 dynamic import 로 현재 모듈
+        상태에서 getter 를 resolve — extension reload 후 singleton desync 방지."""
+        if not _FORCE_LABEL_OVERLAY_AVAILABLE:
+            return None
+        try:
+            from .force_label_overlay import get_force_label_overlay
+            return get_force_label_overlay()
+        except Exception:
+            return None
+
+    def _compute_force_tip_world(self, prim, magnitude: float, kind: str):
+        """prim 의 head tip world 좌표 계산.
+
+        magnitude 가 0 이면 visual_length 가 (lo) base scale 인 점에 주의 — 호출측은
+        보통 magnitude<eps 일 때 라벨을 hide 처리.
+        """
+        if prim is None or not prim.IsValid():
+            return None
+        try:
+            from pxr import Gf, Usd, UsdGeom
+            gain, lo, hi, _hb = self._scale_params_for_kind(kind)
+            s = _clip(abs(float(magnitude)) * gain, lo, hi)
+            L_base = float(FORCE_VEC_SHAFT_BASE_LENGTH)
+            head_z_base = float(FORCE_VEC_HEAD_BASE_TRANSLATE_Z)
+            # shaft 끝 + head 모델 자체의 length (~0.009 in asset). 본 코드에서는
+            # head 자체 길이를 별도 const 로 두지 않고 head_base_translate_z 만 사용
+            # — 시각적 tip 위치는 shaft 끝(=L_base*s) 으로 근사.
+            visual_length = L_base * s + max(0.0, head_z_base) * s
+            tip_local = [0.0, 0.0, 0.0]
+            tip_local[FORCE_VEC_LENGTH_AXIS] = visual_length
+            xformable = UsdGeom.Xformable(prim)
+            l2w = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            world = l2w.Transform(Gf.Vec3d(*tip_local))
+            return (float(world[0]), float(world[1]), float(world[2]))
+        except Exception as exc:
+            logger.debug(f"[viz] compute_force_tip_world warn: {exc}")
+            return None
+
     @staticmethod
     def _scale_params_for_kind(kind: str):
         """kind ('force'/'torque') → (gain, min_scale, max_scale, hide_below)."""
@@ -779,12 +829,26 @@ class ForceTorqueVisualizer:
             "source": source,
             "name": name,
             "kind": kind,
+            "last_position": tuple(float(c) for c in position),
         }
 
         # 최초 크기 적용 — _apply_force_scale 가 threshold 따라 visibility 결정 (this prim).
         gain, lo, hi, hide_below = self._scale_params_for_kind(kind)
         self._apply_force_vector(prim, fx, fy, fz, gain, lo, hi,
                                  hide_below=hide_below)
+
+        # ── magnitude 라벨 overlay 등록/갱신 (force kind 만) ───────────────
+        if kind == "force":
+            overlay = self._overlay()
+            if overlay is not None:
+                try:
+                    overlay.add(prim_path, source)
+                    tip = self._compute_force_tip_world(prim, mag, kind)
+                    label_visible = (mag >= hide_below) and (tip is not None)
+                    if tip is not None:
+                        overlay.update(prim_path, tip, mag, label_visible)
+                except Exception as exc:
+                    logger.debug(f"[viz] overlay add warn: {exc}")
 
         # 가시성: this prim 만 mode-based override. 전체 _apply_visibility() 호출하면
         # _threshold_hide_state cache 가 wipe 되어, **다른** force prim 들이 1 frame
@@ -853,6 +917,9 @@ class ForceTorqueVisualizer:
                         translate_op.Set(Gf.Vec3f(float(tv[0]),
                                                   float(tv[1]),
                                                   float(tv[2])))
+                rec["last_position"] = (float(position[0]),
+                                         float(position[1]),
+                                         float(position[2]))
             except Exception as e:
                 logger.debug(f"[viz] set_custom_force_vector translate warn: {e}")
 
@@ -862,6 +929,26 @@ class ForceTorqueVisualizer:
             gain, lo, hi, hide_below = self._scale_params_for_kind(kind)
             self._apply_force_vector(prim, fx, fy, fz, gain, lo, hi,
                                      hide_below=hide_below)
+
+            # ── magnitude 라벨 갱신 (force kind 만) ─────────────────────
+            if kind == "force":
+                overlay = self._overlay()
+                if overlay is not None and overlay.is_enabled():
+                    try:
+                        magnitude = math.sqrt(fx * fx + fy * fy + fz * fz)
+                        prim_path = rec.get("prim_path")
+                        if magnitude < 1e-9:
+                            if prim_path:
+                                overlay.update(prim_path, (0.0, 0.0, 0.0),
+                                                0.0, False)
+                        else:
+                            tip = self._compute_force_tip_world(prim, magnitude, kind)
+                            if tip is not None and prim_path:
+                                label_visible = magnitude >= hide_below
+                                overlay.update(prim_path, tip, magnitude,
+                                                label_visible)
+                    except Exception as exc:
+                        logger.debug(f"[viz] overlay update warn: {exc}")
         return True
 
     def remove_custom_force_vector(self, name, source: str = "user"):
@@ -878,6 +965,12 @@ class ForceTorqueVisualizer:
             self._force_length_cache.pop(prim_path, None)
             self._scale_op_cache.pop(prim_path, None)
             self._last_scale_cache.pop(prim_path, None)
+            overlay = self._overlay()
+            if overlay is not None:
+                try:
+                    overlay.remove(prim_path)
+                except Exception as exc:
+                    logger.debug(f"[viz] overlay remove warn: {exc}")
             stage = self._get_stage()
             if stage is not None:
                 try:
@@ -897,6 +990,12 @@ class ForceTorqueVisualizer:
                 keys_to_remove.append((rec["name"], rec["source"]))
         for name, src in keys_to_remove:
             self.remove_custom_force_vector(name, source=src)
+        overlay = self._overlay()
+        if overlay is not None:
+            try:
+                overlay.clear(source)
+            except Exception as exc:
+                logger.debug(f"[viz] overlay clear warn: {exc}")
 
     def list_custom_force_vectors(self, source: str | None = None):
         """등록된 custom vector 이름 리스트. source=None 이면 (source, name) 튜플."""
@@ -1219,6 +1318,14 @@ class ForceTorqueVisualizer:
                         logger.debug(f"[viz] RemovePrim warn ({path}): {e}")
         except Exception as e:
             logger.debug(f"[viz] cleanup warn: {e}")
+
+        overlay = self._overlay()
+        if overlay is not None:
+            try:
+                overlay.set_enabled(False)
+                overlay.clear()
+            except Exception as exc:
+                logger.debug(f"[viz] overlay cleanup warn: {exc}")
 
         self._torque_ring_prims.clear()
         self._force_viz_prims.clear()
@@ -2466,6 +2573,32 @@ class ForceTorqueVisualizer:
                     imageable.MakeInvisible()
         except Exception as e:
             logger.debug(f"[viz] set_visible warn: {e}")
+
+        # custom force prim 이면 magnitude label 도 같이 토글.
+        try:
+            prim_path = prim.GetPath().pathString
+        except Exception:
+            return
+        for rec in self._custom_force_prims.values():
+            if rec.get("prim_path") != prim_path:
+                continue
+            if rec.get("kind", "force") != "force":
+                return
+            overlay = self._overlay()
+            if overlay is None or not overlay.is_enabled():
+                return
+            try:
+                last_pos = rec.get("last_position")
+                if last_pos is None:
+                    return
+                # tip world 재계산 — orient/scale 은 prim 측이 이미 반영.
+                # magnitude 는 알 수 없으니 hide 시 0, show 시 마지막 캐시 사용 없음
+                # → show 시 update 는 set_custom_force_vector 가 다음 frame 에 갱신.
+                if not visible:
+                    overlay.update(prim_path, last_pos, 0.0, False)
+            except Exception as exc:
+                logger.debug(f"[viz] overlay set_visible warn: {exc}")
+            return
 
     # ========================================
     # Contact sensor skeleton

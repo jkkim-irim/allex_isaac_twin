@@ -421,9 +421,26 @@ class TorquePlotter:
     # ------------------------------------------------------------------
     @staticmethod
     def _select_joints(dof_names: list[str], subset: str) -> tuple[list[int], list[str]]:
+        """Subset 으로 표시할 dof index / name 추출.
+
+        ``viz_config.json::torque_plot.subsets[subset]`` 가 정의돼 있으면 그 group
+        들에 나열된 joint 만 (articulation 의 dof_names 안에 있는 것에 한해) 반환.
+        없으면 regex (_HAND_RE / _BODY_RE) 기반 fallback.
+        """
+        from ..config.viz_config import TORQUE_PLOT_SUBSETS
+        groups = TORQUE_PLOT_SUBSETS.get(subset)
+        if groups:
+            wanted = {j for g in groups for j in g["joints"]}
+            indices: list[int] = []
+            names: list[str] = []
+            for i, n in enumerate(dof_names):
+                if n in wanted:
+                    indices.append(i)
+                    names.append(n)
+            return indices, names
         pat = _HAND_RE if subset == "hand" else _BODY_RE
-        indices: list[int] = []
-        names: list[str] = []
+        indices = []
+        names = []
         for i, n in enumerate(dof_names):
             if pat.search(n):
                 indices.append(i)
@@ -432,43 +449,49 @@ class TorquePlotter:
 
     @staticmethod
     def _build_groups(plot_names: list[str], subset: str) -> list[dict]:
-        """Partition selected joints into display groups."""
+        """Subset 의 joint 들을 subplot 단위 group 으로 분할.
+
+        ``viz_config.json::torque_plot.subsets[subset]`` 가 있으면 거기 정의된
+        ``[{"name": str, "joints": [...]}]`` 그대로 사용 (dof_names 에 없는
+        joint 는 group 안에서 자동 drop, group 이 비면 그 group 자체도 drop).
+        없으면 기존 hand → L/R 분할, body → arm L/R + Waist+Neck 분할로 fallback.
+        """
+        from ..config.viz_config import TORQUE_PLOT_SUBSETS
+        cfg_groups = TORQUE_PLOT_SUBSETS.get(subset)
+        if cfg_groups:
+            present = set(plot_names)
+            out: list[dict] = []
+            for g in cfg_groups:
+                jl = [j for j in g["joints"] if j in present]
+                if not jl:
+                    continue
+                entry = {"name": g["name"], "joints": jl}
+                # group.y_lim 이 있으면 그대로 보존 — start() 에서 init 으로 전달.
+                if "y_lim" in g:
+                    entry["y_lim"] = list(g["y_lim"])
+                out.append(entry)
+            return out
         if subset == "hand":
             hand_L = [n for n in plot_names if n.startswith("L_")]
             hand_R = [n for n in plot_names if n.startswith("R_")]
-            out: list[dict] = []
+            out = []
             if hand_L:
                 out.append({"name": "Hand L", "joints": hand_L})
             if hand_R:
                 out.append({"name": "Hand R", "joints": hand_R})
             return out
-        # === TEMP MOCKUP (body subset) =========================================
-        # 임시: 4개의 단일 joint plot 을 세로로 나열 — Left/Right Shoulder Pitch +
-        # Left/Right Elbow. 각 subplot 에 sim/real 두 라인. 모양새 확인용.
-        # 원복: 아래 블록 지우고 그 아래 commented-out 원본 buckets 로직 복구.
-        target_joints = (
-            ("Left Shoulder Pitch",  "L_Shoulder_Pitch_Joint"),
-            ("Left Elbow",           "L_Elbow_Joint"),
-            ("Right Shoulder Pitch", "R_Shoulder_Pitch_Joint"),
-            ("Right Elbow",          "R_Elbow_Joint"),
-        )
-        out: list[dict] = []
-        for label, jn in target_joints:
-            if jn in plot_names:
-                out.append({"name": label, "joints": [jn]})
+        # body fallback: arm L/R + Waist+Neck buckets.
+        buckets: dict[str, list[str]] = {"arm_L": [], "arm_R": [], "other": []}
+        for n in plot_names:
+            buckets[_group_for_joint(n)].append(n)
+        out = []
+        if buckets["arm_L"]:
+            out.append({"name": "Arm L", "joints": buckets["arm_L"]})
+        if buckets["arm_R"]:
+            out.append({"name": "Arm R", "joints": buckets["arm_R"]})
+        if buckets["other"]:
+            out.append({"name": "Waist + Neck", "joints": buckets["other"]})
         return out
-        # === ORIGINAL (복구 시 위 TEMP 블록 제거 + 아래 주석 해제) ============
-        # buckets: dict[str, list[str]] = {"arm_L": [], "arm_R": [], "other": []}
-        # for n in plot_names:
-        #     buckets[_group_for_joint(n)].append(n)
-        # out = []
-        # if buckets["arm_L"]:
-        #     out.append({"name": "Arm L", "joints": buckets["arm_L"]})
-        # if buckets["arm_R"]:
-        #     out.append({"name": "Arm R", "joints": buckets["arm_R"]})
-        # if buckets["other"]:
-        #     out.append({"name": "Waist + Neck", "joints": buckets["other"]})
-        # return out
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -491,6 +514,16 @@ class TorquePlotter:
                 f"TorquePlotter: no joints matched subset={self._subset}; not starting"
             )
             return False
+
+        # 사용자가 plot 창을 X 버튼으로 닫은 경우 stop() 이 호출되지 않아 stale
+        # state 가 남는다. 새 spawn 직전에 한 번 더 청소 — proc 가 이미 죽었을
+        # 가능성을 is_running() 이 감지해 _proc=None 으로 정리하지만, 시간축
+        # counter 들은 거기서 안 건드리므로 명시적으로 0 으로.
+        self._step_count = 0
+        self._sim_time = 0.0
+        self._replay_mode = False
+        self._external_sim_tau = None
+        self._external_real_by_abbr = None
 
         py = _resolve_plotter_python()
         if py is None:
@@ -523,6 +556,18 @@ class TorquePlotter:
             self._proc = None
             return False
 
+        # 각 group 의 y_lim 을 resolve: group 자체 y_lim > subset 레벨 self._y_lim
+        # > None (autoscale). plot_proc 는 group["y_lim"] 만 보면 되도록 미리 채움.
+        fallback_ylim = list(self._y_lim) if self._y_lim is not None else None
+        groups_resolved: list[dict] = []
+        for g in self._groups:
+            entry = {"name": g["name"], "joints": g["joints"]}
+            if "y_lim" in g:
+                entry["y_lim"] = list(g["y_lim"])
+            elif fallback_ylim is not None:
+                entry["y_lim"] = list(fallback_ylim)
+            groups_resolved.append(entry)
+
         init_msg = {
             "cmd": "init",
             "title": f"ALLEX Torque ({self._subset}) [{self._plot_mode}]",
@@ -531,12 +576,13 @@ class TorquePlotter:
             "y_label": "torque [N m]",
             "plot_mode": self._plot_mode,
             "save_on_exit": self._save_on_exit,
-            "groups": self._groups,
+            "groups": groups_resolved,
             # Real-torque second line (ROS2-fed). When False, subprocess
             # skips dashed real-line creation and ignores any "y_real" payload.
             "has_real": self._real_provider is not None,
-            # y_lim: None → autoscale, [ymin, ymax] → 모든 subplot 고정.
-            "y_lim": list(self._y_lim) if self._y_lim is not None else None,
+            # Legacy field — subset 전체 fallback. group 마다 y_lim 이 이미 들어가
+            # 있어서 plot_proc 는 안 봐도 됨. 호환성 차원에서 유지.
+            "y_lim": fallback_ylim,
         }
         if not self._send(init_msg):
             logger.error("TorquePlotter: init handshake write failed")
@@ -576,6 +622,13 @@ class TorquePlotter:
             except subprocess.TimeoutExpired:
                 try:
                     proc.kill()
+                except Exception:
+                    pass
+                # SIGKILL 직후 OS 가 reap 할 시간 확보 — 곧바로 새 subprocess 가
+                # spawn 되면 두 process 공존이 잠시 발생해서 plot UI 가 꼬일 수
+                # 있음. 무한정 기다리지 않도록 5s 상한.
+                try:
+                    proc.wait(timeout=5.0)
                 except Exception:
                     pass
         self._proc = None
@@ -711,13 +764,18 @@ class TorquePlotter:
                     print(f"[ALLEX][TorquePlot {self._subset}] "
                           f"real_provider failed: {exc}")
                 snap = None
-            if isinstance(snap, dict):
+            if isinstance(snap, dict) and snap:
+                # 누락된 abbr 는 NaN — 0 으로 채우면 ROS2 토픽이 아직 안 와 있을 때
+                # real line 이 y=0 에 고정되어 "원점에 붙은 직선" artifact 가 됨.
+                nan = float("nan")
                 tau_real_list = [
-                    float(snap.get(abbr, 0.0)) if abbr is not None else 0.0
+                    float(snap.get(abbr, nan)) if abbr is not None else nan
                     for abbr in self._joint_order_abbrs
                 ]
             else:
-                tau_real_list = [0.0] * len(self._joint_order)
+                # snap 자체가 None 또는 빈 dict — y_real 을 아예 보내지 않으면
+                # subprocess reader 가 NaN 으로 패딩 (위 plot_proc 변경 참고).
+                tau_real_list = None
 
         self.push_sample(self._sim_time, tau_total, self._dof_name_to_idx,
                          tau_real_list=tau_real_list)

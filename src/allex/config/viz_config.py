@@ -20,10 +20,16 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 _JSON_PATH = os.path.join(_CONFIG_DIR, "viz_config.json")
+# hand_joint_specs / arm_joint_specs 는 robot kinematic topology + ROS abbr
+# 매핑이라 showcase 무관. viz_config_*.json 변형들 사이에서 중복되지 않도록
+# 별도 joint_specs.json 으로 분리.
+_JOINT_SPECS_PATH = os.path.join(_CONFIG_DIR, "joint_specs.json")
 EXT_ROOT = os.path.abspath(os.path.join(_CONFIG_DIR, "..", "..", ".."))
 
 with open(_JSON_PATH, "r", encoding="utf-8") as _f:
     _cfg = json.load(_f)
+with open(_JOINT_SPECS_PATH, "r", encoding="utf-8") as _f:
+    _joint_specs = json.load(_f)
 
 
 def _tup3(v) -> tuple:
@@ -183,13 +189,58 @@ TORQUE_PLOT_Y_LIM_BODY = _parse_y_lim(_tp.get("y_lim_body"), "torque_plot.y_lim_
 TORQUE_PLOT_Y_LIM_HAND = _parse_y_lim(_tp.get("y_lim_hand"), "torque_plot.y_lim_hand")
 
 
+def _parse_subsets(raw) -> dict:
+    """``{subset_name: [{"name": str, "joints": [str, ...], "y_lim"?: [ymin, ymax]}, ...]}`` 검증.
+
+    각 group 은 한 subplot 단위. 잘못된 entry 는 silently drop. subset 자체가
+    비어있거나 형식이 깨졌으면 그 subset 은 key 자체가 안 생기고,
+    ``TorquePlotter._build_groups`` 가 regex 기반 fallback 으로 동작.
+
+    group.y_lim 은 optional — 있으면 그 subplot 만 fixed y-axis, 없으면 subset
+    레벨 ``y_lim_<subset>`` (있으면) fallback, 그것도 없으면 autoscale.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[dict]] = {}
+    for subset_name, groups in raw.items():
+        if not isinstance(groups, list):
+            print(f"[viz_config] torque_plot.subsets.{subset_name}: not a list, skip")
+            continue
+        clean: list[dict] = []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            name = g.get("name")
+            joints = g.get("joints")
+            if not isinstance(name, str) or not isinstance(joints, list):
+                continue
+            jl = [str(j) for j in joints if isinstance(j, str) and j]
+            if not jl:
+                continue
+            entry: dict = {"name": name, "joints": jl}
+            if "y_lim" in g:
+                yl = _parse_y_lim(
+                    g["y_lim"],
+                    f"torque_plot.subsets.{subset_name}.{name}.y_lim",
+                )
+                if yl is not None:
+                    entry["y_lim"] = [yl[0], yl[1]]
+            clean.append(entry)
+        if clean:
+            out[str(subset_name)] = clean
+    return out
+
+
+TORQUE_PLOT_SUBSETS = _parse_subsets(_tp.get("subsets"))
+
+
 # ---------------------------------------------------------------------------
-# 손가락 / 팔 ring 테이블 — JSON 의 spec 을 양 사이드(L/R) 로 펼침
+# 손가락 / 팔 ring 테이블 — joint_specs.json 의 spec 을 양 사이드(L/R) 로 펼침
 # ---------------------------------------------------------------------------
 def _hand_side_entries(side: str) -> list[dict]:
     prefix = f"{side}_"
     out: list[dict] = []
-    for joint_stem, link_name, abbr_suffix in _cfg["hand_joint_specs"]["specs"]:
+    for joint_stem, link_name, abbr_suffix in _joint_specs["hand_joint_specs"]["specs"]:
         joint_name = f"{prefix}{joint_stem}_Joint"
         out.append({
             "usd_joint_name":          joint_name,
@@ -204,7 +255,7 @@ def _hand_side_entries(side: str) -> list[dict]:
 def _arm_side_entries(side: str) -> list[dict]:
     prefix = f"{side}_"
     out: list[dict] = []
-    for joint_stem, link_name, abbr_suffix in _cfg["arm_joint_specs"]["specs"]:
+    for joint_stem, link_name, abbr_suffix in _joint_specs["arm_joint_specs"]["specs"]:
         full_joint_name = f"{prefix}{joint_stem}"
         out.append({
             "usd_joint_name":          full_joint_name,

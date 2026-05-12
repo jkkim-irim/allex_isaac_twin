@@ -1,40 +1,36 @@
 {
   "_notes": "Force/Torque visualization 설정. viz_config.py 가 이 JSON 을 로드해서 module-level 상수와 HAND_JOINT_TORQUE_RING_MAP/TUPLES, FORCE_VIZ_PARENT_LINKS 를 구성한다. 다른 *_config.json 들과 일관성 맞추기 위해 Python 분리.",
-
   "colors": {
     "real": [1.0, 0.0, 0.0],
-    "sim":  [0.0, 0.8, 1.0]
+    "sim": [0.0, 0.8, 1.0]
   },
-
   "torque": {
     "_doc": "torque ring scale = clip(|τ|*gain, min_scale, max_scale). gain_<group> 은 단일 float (양쪽 공통) 또는 {\"L\": float, \"R\": float} (좌우 별도) 형식 모두 지원. gain_default 는 waist/neck 등 side 없는 joint 용 단일 float. ring_offset_along_axis 는 USD ring prim 을 joint 회전축 방향으로 mm 단위 미세 이동. 없는 joint 는 0.0.",
-    "gain_default":  0.1,
+    "gain_default": 0.1,
     "gain_shoulder": 0.05,
-    "gain_elbow":    0.06,
-    "gain_wrist":    0.08,
-    "gain_finger":   { "L": 0.35,  "R": 1.0 },
+    "gain_elbow": 0.05,
+    "gain_wrist": 0.08,
+    "gain_finger": 0.35,
     "min_scale": 0.03,
     "max_scale": 4.0,
     "ring_offset_along_axis": {
-      "L_Shoulder_Pitch_Joint":  0.03,
-      "L_Shoulder_Roll_Joint":  -0.035,
-      "L_Shoulder_Yaw_Joint":    0.07,
+      "L_Shoulder_Pitch_Joint": 0.03,
+      "L_Shoulder_Roll_Joint": -0.035,
+      "L_Shoulder_Yaw_Joint": 0.07,
       "R_Shoulder_Pitch_Joint": -0.03,
-      "R_Shoulder_Roll_Joint":  -0.035,
-      "R_Shoulder_Yaw_Joint":    0.07,
-      "L_Elbow_Joint":           0.07,
-      "R_Elbow_Joint":          -0.07
+      "R_Shoulder_Roll_Joint": -0.035,
+      "R_Shoulder_Yaw_Joint": 0.07,
+      "L_Elbow_Joint": 0.07,
+      "R_Elbow_Joint": -0.07
     }
   },
-
   "force": {
     "_doc": "force arrow scale = clip(|F|*gain, min_scale, max_scale). hide_below 미만이면 화살표 prim 을 visible=false 로.",
     "gain": 2.0,
     "min_scale": -60.0,
-    "max_scale":  60.0,
+    "max_scale": 60.0,
     "hide_below": 2.0
   },
-
   "ext_torque": {
     "_doc": "외력 wrench 의 torque (Nm) 시각화 — contact_pos 중심 free-floating torque ring (arrow 아님). ring 의 +Z 축 = torque 벡터 방향, scale = clip(|τ|*gain, min_scale, max_scale). |τ|<hide_below 이면 ring 전체 invisible (Nm 단위). 기존 joint torque ring 과 prim 분리: /World/AllexTorqueRing/<source>/<name>. color_real/sim 가 null 이면 colors.real/sim 사용.",
     "gain": 1.0,
@@ -42,100 +38,96 @@
     "max_scale": 3.0,
     "hide_below": 0.05,
     "color_real": [1.0, 0.4, 0.0],
-    "color_sim":  [0.4, 1.0, 0.6]
+    "color_sim": [0.4, 1.0, 0.6]
   },
-
   "ext_joint_torque": {
     "_doc": "per-joint external torque (Nm) 를 기존 torque ring 에 substitute 해서 표시. /result/<group>/joint/ext_torque 토픽이 풀어진 ext_joint_torque_<short> 컬럼이 source. ext_joint_torque_triggers (viz_scenario_config) 활성 window 동안 ring 값을 internal torque 대신 ext_torque 로 교체. 별도 prim 안 만들고 기존 ring 재사용이라 색은 source(real) 색 그대로 — 색 override 없음. ext_joint_torque CSV 는 real 만 존재 (sim 미발생).",
     "_gain_multiplier_doc": "ring scale = clip(|ext_torque × gain_multiplier × per_joint_torque_gain|, MIN, MAX). per_joint_torque_gain 은 torque.gain_* (internal torque 기준 튜닝) 이라, ext_torque 가 internal 과 magnitude 단위가 다를 때 ext 만 보정용 보조 스케일. 1.0 = internal 과 동일 게인.",
     "gain_multiplier": 1.0
   },
-
   "prim_names": {
-    "force_viz_real":      "force_viz_real",
-    "force_viz_sim":       "force_viz",
-    "torque_ring_real":    "torque_ring_real",
-    "torque_ring_sim":     "torque_ring_sim",
+    "force_viz_real": "force_viz_real",
+    "force_viz_sim": "force_viz",
+    "torque_ring_real": "torque_ring_real",
+    "torque_ring_sim": "torque_ring_sim",
     "force_viz_visual_subpath": "visuals"
   },
-
   "assets": {
     "_doc": "EXT_ROOT 기준 상대 경로. viz_config.py 가 EXT_ROOT 와 join 해서 절대경로 반환.",
-    "torque_viz_usd":      "asset/utils/torque_viz.usd",
-    "force_viz_usd":       "asset/utils/force_vec.usda",
+    "torque_viz_usd": "asset/utils/torque_viz.usd",
+    "force_viz_usd": "asset/utils/force_vec.usda",
     "force_viz_custom_usd": "asset/utils/force_vec_thick.usda"
   },
-
   "force_vec": {
     "_doc": "force_vec.usda 의 Shaft / Head 메쉬 정보. Shaft 길이 (Z=0..base_length), Head 는 Shaft 끝(Z=base_length+head_translate_z) 에 위치. length_axis 0=X 1=Y 2=Z.",
-    "shaft_name":          "Shaft",
-    "head_name":           "Head",
-    "shaft_base_length":   0.005,
+    "shaft_name": "Shaft",
+    "head_name": "Head",
+    "shaft_base_length": 0.005,
     "head_base_translate_z": 0.0,
-    "length_axis":         2
+    "length_axis": 2
   },
-
-  "hand_joint_specs": {
-    "_doc": "(joint_stem, link_name, abbr_suffix). prefix='L_'/'R_' + joint_stem + '_Joint' = usd_joint_name. abbr = side + suffix (L11, R54 등). 1=Yaw/ABAD 2=CMC/MCP 3=MCP/PIP 4=IP/DIP. 4번째는 mimic slave (equality follower).",
-    "specs": [
-      ["Thumb_Yaw",   "Thumb_Yaw_Link",       "11"],
-      ["Thumb_CMC",   "Thumb_Proximal_Link",  "12"],
-      ["Thumb_MCP",   "Thumb_Middle_Link",    "13"],
-      ["Thumb_IP",    "Thumb_Distal_Link",    "14"],
-      ["Index_ABAD",  "Index_Roll_Link",      "21"],
-      ["Index_MCP",   "Index_Proximal_Link",  "22"],
-      ["Index_PIP",   "Index_Middle_Link",    "23"],
-      ["Index_DIP",   "Index_Distal_Link",    "24"],
-      ["Middle_ABAD", "Middle_Roll_Link",     "31"],
-      ["Middle_MCP",  "Middle_Proximal_Link", "32"],
-      ["Middle_PIP",  "Middle_Middle_Link",   "33"],
-      ["Middle_DIP",  "Middle_Distal_Link",   "34"],
-      ["Ring_ABAD",   "Ring_Roll_Link",       "41"],
-      ["Ring_MCP",    "Ring_Proximal_Link",   "42"],
-      ["Ring_PIP",    "Ring_Middle_Link",     "43"],
-      ["Ring_DIP",    "Ring_Distal_Link",     "44"],
-      ["Little_ABAD", "Little_Roll_Link",     "51"],
-      ["Little_MCP",  "Little_Proximal_Link", "52"],
-      ["Little_PIP",  "Little_Middle_Link",   "53"],
-      ["Little_DIP",  "Little_Distal_Link",   "54"]
-    ]
-  },
-
-  "arm_joint_specs": {
-    "_doc": "(joint_stem, link_name, abbr_suffix). full joint = side+'_'+joint_stem (e.g. L_Shoulder_Pitch_Joint). abbr_suffix 는 ros2_config 의 *SP/*SR/*SY/*EP/*WY/*WR/*WP 와 일치.",
-    "specs": [
-      ["Shoulder_Pitch_Joint", "Shoulder_Pitch_Link", "SP"],
-      ["Shoulder_Roll_Joint",  "Shoulder_Roll_Link",  "SR"],
-      ["Shoulder_Yaw_Joint",   "Shoulder_Yaw_Link",   "SY"],
-      ["Elbow_Joint",          "Elbow_Link",          "EP"],
-      ["Wrist_Yaw_Joint",      "Wrist_Yaw_Link",      "WY"],
-      ["Wrist_Roll_Joint",     "Wrist_Roll_Link",     "WR"],
-      ["Wrist_Pitch_Joint",    "Wrist_Pitch_Link",    "WP"]
-    ]
-  },
-
   "torque_plot": {
     "_doc": "TorquePlotter rolling window / y-axis 설정. window_seconds 는 body/hand 공통. y_lim_<subset> 은 null 이면 autoscale, [ymin, ymax] (Nm) 이면 고정. 잘못된 형식이면 autoscale fallback.",
     "window_seconds": 20.0,
     "y_lim_body": null,
-    "y_lim_hand": [-1.0, 2.0]
+    "y_lim_hand": [-5.0, 5.0],
+    "subsets": {
+      "_doc": "TorquePlotter subset 별 subplot 정의. 키 = subset 명 ('body'|'hand' 등 TorquePlotter(subset=...) 인자와 매칭). 값 = subplot 들의 list, 각 entry = {'name': subplot 제목, 'joints': USD dof_name 의 list}. dof_names 에 없는 joint 는 자동 drop. subsets 자체가 없거나 비어있으면 regex 기반 fallback (hand → Hand L/R 전체, body → Arm L/R + Waist+Neck).",
+      "body": [
+        {
+          "name": "Left Shoulder Pitch",
+          "joints": ["L_Shoulder_Pitch_Joint"], "y_lim": [-45, 28]
+        },
+        {
+          "name": "Left Elbow",
+          "joints": ["L_Elbow_Joint"], "y_lim": [-45, 28]
+        },
+        {
+          "name": "Right Shoulder Pitch",
+          "joints": ["R_Shoulder_Pitch_Joint"], "y_lim": [-35, 28]
+        },
+        {
+          "name": "Right Elbow",
+          "joints": ["R_Elbow_Joint"], "y_lim": [-28, 28]
+        }
+      ],
+      "hand": [
+        {
+          "name": "Hand L",
+          "joints": [
+            "L_Thumb_CMC_Joint",
+            "L_Thumb_MCP_Joint",
+            "L_Index_MCP_Joint",
+            "L_Index_PIP_Joint"
+          ]
+        },
+        {
+          "name": "Hand R",
+          "joints": [
+            "R_Thumb_CMC_Joint",
+            "R_Thumb_MCP_Joint",
+            "R_Index_MCP_Joint",
+            "R_Index_PIP_Joint"
+          ]
+        }
+      ]
+    }
   },
-
   "force_viz_parent": {
     "_doc": "12 force arrow parent links (좌우 Palm + 5 finger distal). orient_euler_deg = force_vec.usda(+Z) 를 link local frame 의 force 방향으로 회전. Thumb distal: -Z 방향 → (180,0,0). 그 외: +X 방향 → (0,90,0).",
     "finger_to_joint_stem": {
-      "Thumb":  "Thumb_IP",
-      "Index":  "Index_DIP",
+      "Thumb": "Thumb_IP",
+      "Index": "Index_DIP",
       "Middle": "Middle_DIP",
-      "Ring":   "Ring_DIP",
+      "Ring": "Ring_DIP",
       "Little": "Little_DIP"
     },
     "orient_euler_deg": {
-      "Palm":   [0.0, 90.0, 0.0],
-      "Thumb":  [180.0, 0.0, 0.0],
-      "Index":  [0.0, 90.0, 0.0],
+      "Palm": [0.0, 90.0, 0.0],
+      "Thumb": [180.0, 0.0, 0.0],
+      "Index": [0.0, 90.0, 0.0],
       "Middle": [0.0, 90.0, 0.0],
-      "Ring":   [0.0, 90.0, 0.0],
+      "Ring": [0.0, 90.0, 0.0],
       "Little": [0.0, 90.0, 0.0]
     }
   }
