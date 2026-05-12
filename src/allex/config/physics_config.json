@@ -99,7 +99,7 @@
             "nconmax": 200
         },
         "ramp_step_sizes": {
-            "motor_step_per_ms": 0.001,
+            "motor_step_per_ms": 0.01,
             "_doc": "실 제어기의 motor-domain ramp step (per 1ms). 모든 카테고리(kp/kv/tlp/tln) 동일 글로벌 값. MotorStateMirror 가 매 physics step 이 값으로 K_m_current 를 ramp 하고 jk_kernel.compute_*_K_j 로 joint-domain 으로 변환해 view 에 직접 write."
         }
     },
