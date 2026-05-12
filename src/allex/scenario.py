@@ -169,7 +169,7 @@ class ALLEXDigitalTwin:
 
             Trajectory mode → analytic dense_vel row from Hermite. Other modes
             (ROS2 mirror / idle hold) carry no velocity reference, so return
-            None so the controller falls back to position-only.
+            None and downstream consumers fall back to zero (= hold pose).
             """
             player = self._trajectory_player
             if player is None or not player.is_active():
@@ -179,12 +179,16 @@ class ALLEXDigitalTwin:
                 return None
             return vel.tolist()
 
+        # 저장 — MotorStateMirror 빌드 시점에 callback 으로 전달.
+        # ArticulationAction 으로는 보내지 않음 (Isaac Sim 6 의 articulation_controller
+        # 가 joint_velocities CUDA tensor 에 np.isnan 직접 호출 → TypeError).
+        self._get_target_velocities_fn = get_target_velocities
+
         generator = self._joint_controller.create_joint_control_generator(
             articulation=self._articulation,
             get_target_positions_func=get_target_positions,
             is_external_active_fn=_traj_active,
             pre_step_fn=self._motor_mirror_step,
-            get_target_velocities_func=get_target_velocities,
         )
         self._simulation_loop.set_script_generator(generator)
 
@@ -214,9 +218,14 @@ class ALLEXDigitalTwin:
                 from .trajectory_generate.sim_state_logger import SimStateLogger
                 from .utils.sim_settings_utils import get_physics_hz
                 physics_hz = get_physics_hz()
+                control = getattr(stage, "control", None)
                 self._sim_state_logger = SimStateLogger(
-                    self._articulation, model, solver, log_every=log_every
+                    self._articulation, model, solver, log_every=log_every,
+                    control=control,
                 )
+                # Bind scenario so logger can read live _motor_mirror each step
+                # (mirror is lazy-built on first physics step — may be None now).
+                self._sim_state_logger._scenario_ref = self
             except Exception as exc:
                 print(f"[ALLEX][SimLog] build failed: {exc}")
                 return
@@ -253,7 +262,13 @@ class ALLEXDigitalTwin:
                 if model is None or solver is None:
                     return
                 from .trajectory_generate.motor_state_mirror import MotorStateMirror
-                self._motor_mirror = MotorStateMirror(self._articulation, model, solver, stage)
+                control = getattr(stage, "control", None)
+                if control is None:
+                    return  # not ready yet; retry next step
+                self._motor_mirror = MotorStateMirror(
+                    self._articulation, model, solver, stage, control=control,
+                    get_target_vel_fn=getattr(self, "_get_target_velocities_fn", None),
+                )
             except Exception as exc:
                 print(f"[ALLEX][Mirror] init failed: {exc}; disabling motor_mirror")
                 self._motor_mirror_failed = True

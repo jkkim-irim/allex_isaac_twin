@@ -537,12 +537,12 @@
     "Waist_Yaw_Joint": {
       "kp": 3.0,
       "kv": 0.01,
-      "trq_lim": 0.5
+      "trq_lim": 2.5
     },
     "Waist_Lower_Pitch_Joint": {
       "kp": 1.0,
       "kv": 0.1,
-      "trq_lim": 1.0
+      "trq_lim": 5.0
     },
     "Neck_Pitch_Joint": {
       "kp": 4.0,
@@ -590,18 +590,18 @@
       "trq_lim": 0.12
     },
     "L_Thumb_Yaw_Joint": {
-      "kp": 0.00193,
-      "kv": 1e-05,
+      "kp": 0.0018,
+      "kv": 8e-05,
       "trq_lim": 0.00193
     },
     "L_Thumb_CMC_Joint": {
-      "kp": 0.01,
-      "kv": 1e-05,
+      "kp": 0.005,
+      "kv": 5e-05,
       "trq_lim": 0.003
     },
     "L_Thumb_MCP_Joint": {
-      "kp": 0.01,
-      "kv": 1e-05,
+      "kp": 0.005,
+      "kv": 5e-05,
       "trq_lim": 0.003
     },
     "L_Index_ABAD_Joint": {
@@ -616,7 +616,7 @@
     },
     "L_Index_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     },
     "L_Middle_ABAD_Joint": {
@@ -631,7 +631,7 @@
     },
     "L_Middle_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     },
     "L_Ring_ABAD_Joint": {
@@ -646,7 +646,7 @@
     },
     "L_Ring_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     },
     "L_Little_ABAD_Joint": {
@@ -661,7 +661,7 @@
     },
     "L_Little_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     },
     "R_Shoulder_Pitch_Joint": {
@@ -700,18 +700,18 @@
       "trq_lim": 0.12
     },
     "R_Thumb_Yaw_Joint": {
-      "kp": 0.00193,
-      "kv": 1e-05,
+      "kp": 0.0018,
+      "kv": 8e-05,
       "trq_lim": 0.00193
     },
     "R_Thumb_CMC_Joint": {
-      "kp": 0.01,
-      "kv": 1e-05,
+      "kp": 0.005,
+      "kv": 5e-05,
       "trq_lim": 0.003
     },
     "R_Thumb_MCP_Joint": {
-      "kp": 0.01,
-      "kv": 1e-05,
+      "kp": 0.005,
+      "kv": 5e-05,
       "trq_lim": 0.003
     },
     "R_Index_ABAD_Joint": {
@@ -726,7 +726,7 @@
     },
     "R_Index_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     },
     "R_Middle_ABAD_Joint": {
@@ -741,7 +741,7 @@
     },
     "R_Middle_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     },
     "R_Ring_ABAD_Joint": {
@@ -756,7 +756,7 @@
     },
     "R_Ring_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     },
     "R_Little_ABAD_Joint": {
@@ -771,7 +771,7 @@
     },
     "R_Little_PIP_Joint": {
       "kp": 0.005,
-      "kv": 2e-05,
+      "kv": 5e-05,
       "trq_lim": 0.01
     }
   },

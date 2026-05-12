@@ -526,7 +526,12 @@ class TrajStudioControls:
         # physics step).
         hz = self._query_physics_hz()
 
-        csv_dir = _TRAJECTORY_DIR / group
+        # TEMP: demo1_dynamic_group 은 rosbag 과 함께 녹화된 최종본을 사용하여
+        # sim ↔ real 의 CSV 차이를 제거. 검증 후 trajectory/ 쪽으로 덮어쓸 예정.
+        if group == "demo1_dynamic_group":
+            csv_dir = _EXT_ROOT / "data" / "demo1_rosbag_dynamic_motion" / group
+        else:
+            csv_dir = _TRAJECTORY_DIR / group
         player = TrajectoryPlayer(csv_dir, articulation, hz=hz, seed_pose=seed_pose)
         self._set_status(f"Status: loading '{group}' @ {hz:.1f} Hz ...")
         if not player.is_ready():

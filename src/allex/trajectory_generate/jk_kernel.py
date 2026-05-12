@@ -39,6 +39,49 @@ ELBOW_B: float = 1.0 / (ELBOW_N1 * ELBOW_N2 * ELBOW_N3)
 
 
 # ============================================================
+# Polynomial FK evaluators (joint angle → motor angle).
+# Used by pd_clip_wrist / finger / thumb 의 Y(motor_space) 모드.
+# Coefficient tables: fk_coeffs.py (parsed from allex_control C++).
+# Layout: per part 'offsets[n_out+1]' slices a flat (exp..., coef) table.
+# ============================================================
+@wp.func
+def eval_poly_2d(qr: float, qp: float,
+                 exp_qr: wp.array(dtype=int),
+                 exp_qp: wp.array(dtype=int),
+                 coef: wp.array(dtype=float),
+                 start: int, end: int) -> float:
+    val = wp.float32(0.0)
+    for i in range(start, end):
+        t = coef[i]
+        for _ in range(exp_qr[i]):
+            t *= qr
+        for _ in range(exp_qp[i]):
+            t *= qp
+        val += t
+    return val
+
+
+@wp.func
+def eval_poly_3d(q1: float, q2: float, q3: float,
+                 exp_q1: wp.array(dtype=int),
+                 exp_q2: wp.array(dtype=int),
+                 exp_q3: wp.array(dtype=int),
+                 coef: wp.array(dtype=float),
+                 start: int, end: int) -> float:
+    val = wp.float32(0.0)
+    for i in range(start, end):
+        t = coef[i]
+        for _ in range(exp_q1[i]):
+            t *= q1
+        for _ in range(exp_q2[i]):
+            t *= q2
+        for _ in range(exp_q3[i]):
+            t *= q3
+        val += t
+    return val
+
+
+# ============================================================
 # [1] apply_scalar_groups — shoulder / waist / neck
 #
 # Decoupled scalar mapping: m_i = ratio_i · q_i
@@ -608,3 +651,725 @@ def compute_thumb_K_j(
     out_eff[yaw_idx] = T_j_yaw
     out_eff[cmc_idx] = T_j_cmc
     out_eff[mcp_idx] = T_j_mcp
+
+
+# ============================================================================
+# Motor-space torque clip kernels (feature/motor_torque_limit)
+# ============================================================================
+# 위쪽 compute_*_K_j 커널은 K_j_diag 를 model.joint_target_ke 등에 써서 MuJoCo
+# 의 actuator PD 가 사용하게 했다. 아래 pd_clip_* 커널은 우리가 직접 PD 식을
+# 풀어 motor 공간에서 saturation 시킨 뒤 model.qfrc_applied 에 쓰는 path
+# 이며, 동시에 model.joint_target_ke / kd 를 0 으로 강제해 MuJoCo 측 PD 를
+# 비활성화한다. effort_limit 에는 |J|^T·τ_m_max safety net 값을 그대로 둬
+# Newton 의 내부 clip 도 이중 안전망으로 활용.
+#
+# 모드:
+#   pd_mode = 0 (motor_space, Y) — q_m = J·q 변환 후 motor-domain PD.
+#   pd_mode = 1 (joint_space_diag, X) — joint-domain diag K_j=Σ J[k,i]²·K_m[k]
+#                                       로 PD 계산 후 J⁻ᵀ 로 motor 변환.
+# scalar 그룹은 X≡Y 라 모드 분기 없음. coupled (elbow/wrist/finger/thumb)
+# 에서만 분기 발생.
+#
+# 비-mech-comp motor 의 처리 흐름:
+#   q_m, qt_m = J·q, J·qt   (Y 모드)
+#   τ_m_pd    = K_m·(qt_m−q_m) + Kv_m·(qdt_m−qd_m)
+#   g_m       = J⁻ᵀ · g_j
+#   τ_m_des   = τ_m_pd + g_m
+#   τ_m_clip  = clamp(τ_m_des, ±τ_m_max)
+#   τ_j_clip  = Jᵀ · τ_m_clip
+#   joint_f   = τ_j_clip − g_j         (MuJoCo passive 가 g_j 다시 더함)
+#   safety    = |J|ᵀ · τ_m_max
+#   joint_f   = clamp(joint_f, ±safety)
+# mech-comp motor: gravcomp 합산 단계 skip (scalar 그룹 내부에서만).
+
+
+# ----------------------------------------------------------------------------
+# [6] pd_clip_scalar — shoulder/waist/neck (10 motors, 1×1 J)
+#
+# scalar 라 X≡Y. 모드 인자 불필요.
+# is_mech_comp[k] = 1 → gravcomp 합산 skip.
+# ----------------------------------------------------------------------------
+@wp.kernel
+def pd_clip_scalar(
+    dof_idx: wp.array(dtype=int),
+    ratio: wp.array(dtype=float),
+    is_mech_comp: wp.array(dtype=int),
+    K_m: wp.array(dtype=float),
+    Kv_m: wp.array(dtype=float),
+    trq_m: wp.array(dtype=float),
+    q: wp.array(dtype=float),
+    qd: wp.array(dtype=float),
+    qt: wp.array(dtype=float),
+    qdt: wp.array(dtype=float),
+    gravcomp_j: wp.array(dtype=float),
+    out_joint_f: wp.array(dtype=float),
+    out_ke: wp.array(dtype=float),
+    out_kd: wp.array(dtype=float),
+    out_eff: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    i = dof_idx[tid]
+    r = ratio[tid]
+    km = K_m[tid]
+    kvm = Kv_m[tid]
+    tm = trq_m[tid]
+
+    # Motor-space PD (1×1 J = diag(r)): τ_m = r·K_m·(qt−q) + r·Kv_m·(qdt−qd)
+    err = r * (qt[i] - q[i])
+    derr = r * (qdt[i] - qd[i])
+    tau_m_pd = km * err + kvm * derr
+
+    # Gravcomp (skip for mech-comp scalar motors)
+    g_j = wp.where(is_mech_comp[tid] == 1, wp.float32(0.0), gravcomp_j[i])
+    g_m = g_j / r
+
+    # Motor saturation
+    tau_m_total = tau_m_pd + g_m
+    tau_m_clip = wp.clamp(tau_m_total, -tm, tm)
+
+    # Safety net 은 motor 출력 (tau_j) 자체에 적용 — 정상 시 |tau_j| ≤ r·tm 이미
+    # 보장되므로 no-op. NaN/pinv blowup backstop 용. gravcomp 차감 후 clamp 하면
+    # 모터 saturate + 중력 반대 push 구간에서 gravcomp 분만큼 잘려 토크 부족 발생.
+    tau_j = r * tau_m_clip
+    safety = r * tm
+    tau_j = wp.clamp(tau_j, -safety, safety)
+    joint_f_val = tau_j - g_j
+
+    out_joint_f[i] = joint_f_val
+    out_ke[i] = wp.float32(0.0)
+    out_kd[i] = wp.float32(0.0)
+    out_eff[i] = safety
+
+
+# ----------------------------------------------------------------------------
+# [7] pd_clip_elbow — Elbow + Wrist_Yaw (2×2 constant J, X/Y 모드)
+#
+# J = [[a,  b], [-a, b]]  (a = ELBOW_A, b = ELBOW_B)
+# det(J) = 2ab > 0 (절대 singular 아님; det 모니터링 생략 가능하지만 instance 별
+# 값은 일관성 위해 기록).
+#
+# 모든 elbow 모터는 non-mech-comp → gravcomp 항상 포함.
+# Launch: dim = 2 (L/R), per instance 2 motors / 2 joints.
+# ----------------------------------------------------------------------------
+@wp.kernel
+def pd_clip_elbow(
+    dof_idx: wp.array(dtype=int),
+    K_m: wp.array(dtype=float),
+    Kv_m: wp.array(dtype=float),
+    trq_m: wp.array(dtype=float),
+    q: wp.array(dtype=float),
+    qd: wp.array(dtype=float),
+    qt: wp.array(dtype=float),
+    qdt: wp.array(dtype=float),
+    gravcomp_j: wp.array(dtype=float),
+    pd_mode: int,                       # 0 = Y (motor-space), 1 = X (joint-diag)
+    out_joint_f: wp.array(dtype=float),
+    out_ke: wp.array(dtype=float),
+    out_kd: wp.array(dtype=float),
+    out_eff: wp.array(dtype=float),
+    out_det: wp.array(dtype=float),     # |det(J)| per instance
+):
+    tid = wp.tid()
+    base = tid * 2
+    elb_idx  = dof_idx[base + 0]      # joint 0 (col 0 in J)
+    wyaw_idx = dof_idx[base + 1]      # joint 1 (col 1 in J)
+
+    a = wp.float32(ELBOW_A)
+    b = wp.float32(ELBOW_B)
+    # J = [[a, b], [-a, b]] (mat22 row-major in warp)
+    J = wp.mat22(a, b, -a, b)
+
+    km0 = K_m[base + 0]
+    km1 = K_m[base + 1]
+    kvm0 = Kv_m[base + 0]
+    kvm1 = Kv_m[base + 1]
+    tm0 = trq_m[base + 0]
+    tm1 = trq_m[base + 1]
+
+    # Joint-space q's
+    q_elb = q[elb_idx]
+    q_wyaw = q[wyaw_idx]
+    qd_elb = qd[elb_idx]
+    qd_wyaw = qd[wyaw_idx]
+    qt_elb = qt[elb_idx]
+    qt_wyaw = qt[wyaw_idx]
+    qdt_elb = qdt[elb_idx]
+    qdt_wyaw = qdt[wyaw_idx]
+    g_elb = gravcomp_j[elb_idx]
+    g_wyaw = gravcomp_j[wyaw_idx]
+
+    # Compute motor-space PD
+    tau_m_pd_0 = wp.float32(0.0)
+    tau_m_pd_1 = wp.float32(0.0)
+    if pd_mode == 0:
+        # Y: q_m = J·q etc., then per-motor PD
+        q_m_0 = J[0, 0] * q_elb + J[0, 1] * q_wyaw
+        q_m_1 = J[1, 0] * q_elb + J[1, 1] * q_wyaw
+        qd_m_0 = J[0, 0] * qd_elb + J[0, 1] * qd_wyaw
+        qd_m_1 = J[1, 0] * qd_elb + J[1, 1] * qd_wyaw
+        qt_m_0 = J[0, 0] * qt_elb + J[0, 1] * qt_wyaw
+        qt_m_1 = J[1, 0] * qt_elb + J[1, 1] * qt_wyaw
+        qdt_m_0 = J[0, 0] * qdt_elb + J[0, 1] * qdt_wyaw
+        qdt_m_1 = J[1, 0] * qdt_elb + J[1, 1] * qdt_wyaw
+        tau_m_pd_0 = km0 * (qt_m_0 - q_m_0) + kvm0 * (qdt_m_0 - qd_m_0)
+        tau_m_pd_1 = km1 * (qt_m_1 - q_m_1) + kvm1 * (qdt_m_1 - qd_m_1)
+    else:
+        # X: joint-diag K_j, then J^-T · τ_j
+        K_j_elb  = J[0, 0] * J[0, 0] * km0 + J[1, 0] * J[1, 0] * km1
+        K_j_wyaw = J[0, 1] * J[0, 1] * km0 + J[1, 1] * J[1, 1] * km1
+        D_j_elb  = J[0, 0] * J[0, 0] * kvm0 + J[1, 0] * J[1, 0] * kvm1
+        D_j_wyaw = J[0, 1] * J[0, 1] * kvm0 + J[1, 1] * J[1, 1] * kvm1
+        tau_j_pd_elb  = K_j_elb  * (qt_elb  - q_elb)  + D_j_elb  * (qdt_elb  - qd_elb)
+        tau_j_pd_wyaw = K_j_wyaw * (qt_wyaw - q_wyaw) + D_j_wyaw * (qdt_wyaw - qd_wyaw)
+        # J^-T = inverse(J^T)
+        J_inv_T = wp.inverse(wp.transpose(J))
+        tau_m_pd_0 = J_inv_T[0, 0] * tau_j_pd_elb + J_inv_T[0, 1] * tau_j_pd_wyaw
+        tau_m_pd_1 = J_inv_T[1, 0] * tau_j_pd_elb + J_inv_T[1, 1] * tau_j_pd_wyaw
+
+    # Gravcomp: J^-T · g_j
+    J_inv_T = wp.inverse(wp.transpose(J))
+    g_m_0 = J_inv_T[0, 0] * g_elb + J_inv_T[0, 1] * g_wyaw
+    g_m_1 = J_inv_T[1, 0] * g_elb + J_inv_T[1, 1] * g_wyaw
+
+    # Motor saturation
+    tau_m_clip_0 = wp.clamp(tau_m_pd_0 + g_m_0, -tm0, tm0)
+    tau_m_clip_1 = wp.clamp(tau_m_pd_1 + g_m_1, -tm1, tm1)
+
+    # Back to joint: J^T · τ_m
+    tau_j_elb  = J[0, 0] * tau_m_clip_0 + J[1, 0] * tau_m_clip_1
+    tau_j_wyaw = J[0, 1] * tau_m_clip_0 + J[1, 1] * tau_m_clip_1
+
+    # Safety net 은 motor 출력 tau_j 자체에 적용 (gravcomp 차감 전).
+    safety_elb  = wp.abs(J[0, 0]) * tm0 + wp.abs(J[1, 0]) * tm1
+    safety_wyaw = wp.abs(J[0, 1]) * tm0 + wp.abs(J[1, 1]) * tm1
+    tau_j_elb   = wp.clamp(tau_j_elb,   -safety_elb,  safety_elb)
+    tau_j_wyaw  = wp.clamp(tau_j_wyaw,  -safety_wyaw, safety_wyaw)
+
+    # Subtract gravcomp (MuJoCo passive re-adds it)
+    joint_f_elb  = tau_j_elb  - g_elb
+    joint_f_wyaw = tau_j_wyaw - g_wyaw
+
+    # Outputs
+    out_joint_f[elb_idx]  = joint_f_elb
+    out_joint_f[wyaw_idx] = joint_f_wyaw
+    out_ke[elb_idx]  = wp.float32(0.0)
+    out_ke[wyaw_idx] = wp.float32(0.0)
+    out_kd[elb_idx]  = wp.float32(0.0)
+    out_kd[wyaw_idx] = wp.float32(0.0)
+    out_eff[elb_idx]  = safety_elb
+    out_eff[wyaw_idx] = safety_wyaw
+    out_det[tid] = wp.abs(wp.determinant(J))
+
+
+# ----------------------------------------------------------------------------
+# [8] pd_clip_wrist — Wrist_Roll + Wrist_Pitch (2×2 q-dependent J)
+# Launch: dim = 2 (L/R), uses _wrist_jacobian(qr, qp).
+# ----------------------------------------------------------------------------
+@wp.kernel
+def pd_clip_wrist(
+    dof_idx: wp.array(dtype=int),
+    K_m: wp.array(dtype=float),
+    Kv_m: wp.array(dtype=float),
+    trq_m: wp.array(dtype=float),
+    q: wp.array(dtype=float),
+    qd: wp.array(dtype=float),
+    qt: wp.array(dtype=float),
+    qdt: wp.array(dtype=float),
+    gravcomp_j: wp.array(dtype=float),
+    pd_mode: int,
+    # FK polynomial (allex_control calcWristJoint2MotorAngle, qr/qp → motor 0/1)
+    poly_offsets: wp.array(dtype=int),   # size 3: [start_a0, start_a1, end_a1]
+    poly_exp_qr: wp.array(dtype=int),
+    poly_exp_qp: wp.array(dtype=int),
+    poly_coef:   wp.array(dtype=float),
+    out_joint_f: wp.array(dtype=float),
+    out_ke: wp.array(dtype=float),
+    out_kd: wp.array(dtype=float),
+    out_eff: wp.array(dtype=float),
+    out_det: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    base = tid * 2
+    qr_idx = dof_idx[base + 0]       # Wrist_Roll = col 0
+    qp_idx = dof_idx[base + 1]       # Wrist_Pitch = col 1
+
+    qr = q[qr_idx]
+    qp = q[qp_idx]
+    J = _wrist_jacobian(qr, qp)
+
+    km0 = K_m[base + 0]
+    km1 = K_m[base + 1]
+    kvm0 = Kv_m[base + 0]
+    kvm1 = Kv_m[base + 1]
+    tm0 = trq_m[base + 0]
+    tm1 = trq_m[base + 1]
+
+    qd_r = qd[qr_idx]
+    qd_p = qd[qp_idx]
+    qt_r = qt[qr_idx]
+    qt_p = qt[qp_idx]
+    qdt_r = qdt[qr_idx]
+    qdt_p = qdt[qp_idx]
+    g_r = gravcomp_j[qr_idx]
+    g_p = gravcomp_j[qp_idx]
+
+    tau_m_pd_0 = wp.float32(0.0)
+    tau_m_pd_1 = wp.float32(0.0)
+    if pd_mode == 0:
+        # Y: motor-space PD — position via polynomial FK, velocity via J(q).
+        a0 = poly_offsets[0]
+        a1 = poly_offsets[1]
+        a2 = poly_offsets[2]
+        q_m_0  = eval_poly_2d(qr,    qp,    poly_exp_qr, poly_exp_qp, poly_coef, a0, a1)
+        q_m_1  = eval_poly_2d(qr,    qp,    poly_exp_qr, poly_exp_qp, poly_coef, a1, a2)
+        qt_m_0 = eval_poly_2d(qt_r,  qt_p,  poly_exp_qr, poly_exp_qp, poly_coef, a0, a1)
+        qt_m_1 = eval_poly_2d(qt_r,  qt_p,  poly_exp_qr, poly_exp_qp, poly_coef, a1, a2)
+        qd_m_0 = J[0, 0] * qd_r + J[0, 1] * qd_p
+        qd_m_1 = J[1, 0] * qd_r + J[1, 1] * qd_p
+        qdt_m_0 = J[0, 0] * qdt_r + J[0, 1] * qdt_p
+        qdt_m_1 = J[1, 0] * qdt_r + J[1, 1] * qdt_p
+        tau_m_pd_0 = km0 * (qt_m_0 - q_m_0) + kvm0 * (qdt_m_0 - qd_m_0)
+        tau_m_pd_1 = km1 * (qt_m_1 - q_m_1) + kvm1 * (qdt_m_1 - qd_m_1)
+    else:
+        K_j_r = J[0, 0] * J[0, 0] * km0 + J[1, 0] * J[1, 0] * km1
+        K_j_p = J[0, 1] * J[0, 1] * km0 + J[1, 1] * J[1, 1] * km1
+        D_j_r = J[0, 0] * J[0, 0] * kvm0 + J[1, 0] * J[1, 0] * kvm1
+        D_j_p = J[0, 1] * J[0, 1] * kvm0 + J[1, 1] * J[1, 1] * kvm1
+        tau_j_pd_r = K_j_r * (qt_r - qr) + D_j_r * (qdt_r - qd_r)
+        tau_j_pd_p = K_j_p * (qt_p - qp) + D_j_p * (qdt_p - qd_p)
+        J_inv_T = wp.inverse(wp.transpose(J))
+        tau_m_pd_0 = J_inv_T[0, 0] * tau_j_pd_r + J_inv_T[0, 1] * tau_j_pd_p
+        tau_m_pd_1 = J_inv_T[1, 0] * tau_j_pd_r + J_inv_T[1, 1] * tau_j_pd_p
+
+    # Gravcomp via J^-T
+    J_inv_T = wp.inverse(wp.transpose(J))
+    g_m_0 = J_inv_T[0, 0] * g_r + J_inv_T[0, 1] * g_p
+    g_m_1 = J_inv_T[1, 0] * g_r + J_inv_T[1, 1] * g_p
+
+    tau_m_clip_0 = wp.clamp(tau_m_pd_0 + g_m_0, -tm0, tm0)
+    tau_m_clip_1 = wp.clamp(tau_m_pd_1 + g_m_1, -tm1, tm1)
+
+    tau_j_r = J[0, 0] * tau_m_clip_0 + J[1, 0] * tau_m_clip_1
+    tau_j_p = J[0, 1] * tau_m_clip_0 + J[1, 1] * tau_m_clip_1
+
+    # Safety net 은 motor 출력 tau_j 자체에 적용 (gravcomp 차감 전).
+    safety_r = wp.abs(J[0, 0]) * tm0 + wp.abs(J[1, 0]) * tm1
+    safety_p = wp.abs(J[0, 1]) * tm0 + wp.abs(J[1, 1]) * tm1
+    tau_j_r  = wp.clamp(tau_j_r, -safety_r, safety_r)
+    tau_j_p  = wp.clamp(tau_j_p, -safety_p, safety_p)
+
+    joint_f_r = tau_j_r - g_r
+    joint_f_p = tau_j_p - g_p
+
+    out_joint_f[qr_idx] = joint_f_r
+    out_joint_f[qp_idx] = joint_f_p
+    out_ke[qr_idx] = wp.float32(0.0)
+    out_ke[qp_idx] = wp.float32(0.0)
+    out_kd[qr_idx] = wp.float32(0.0)
+    out_kd[qp_idx] = wp.float32(0.0)
+    out_eff[qr_idx] = safety_r
+    out_eff[qp_idx] = safety_p
+    out_det[tid] = wp.abs(wp.determinant(J))
+
+
+# ----------------------------------------------------------------------------
+# [9] pd_clip_finger — 4-finger × 2 hands = 8 instances, 3×3 lower-triangular J
+# Launch: dim = 8, per instance 3 motors / 3 joints (ABAD/MCP/PIP).
+# J 의 nonzero cell 만 _finger_jacobian_cells 가 반환 (J00, J10, J11, J20, J21, J22).
+# ----------------------------------------------------------------------------
+@wp.kernel
+def pd_clip_finger(
+    dof_idx: wp.array(dtype=int),
+    K_m: wp.array(dtype=float),
+    Kv_m: wp.array(dtype=float),
+    trq_m: wp.array(dtype=float),
+    q: wp.array(dtype=float),
+    qd: wp.array(dtype=float),
+    qt: wp.array(dtype=float),
+    qdt: wp.array(dtype=float),
+    gravcomp_j: wp.array(dtype=float),
+    pd_mode: int,
+    # FK polynomial (allex_control cal_motorAngles_janghwan, q1/q2/q3 → m0/m1/m2)
+    poly_offsets: wp.array(dtype=int),   # size 4
+    poly_exp_q1: wp.array(dtype=int),
+    poly_exp_q2: wp.array(dtype=int),
+    poly_exp_q3: wp.array(dtype=int),
+    poly_coef:   wp.array(dtype=float),
+    # Motor-side Coulomb friction (allex_control robot_model.json):
+    #   τ_m_actual = τ_m_clip - friction_motor · tanh(qd_m · tanh_scale)
+    friction_motor:    wp.array(dtype=float),
+    friction_tanh_scl: wp.array(dtype=float),
+    out_joint_f: wp.array(dtype=float),
+    out_ke: wp.array(dtype=float),
+    out_kd: wp.array(dtype=float),
+    out_eff: wp.array(dtype=float),
+    out_det: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    base = tid * 3
+    abad_idx = dof_idx[base + 0]
+    mcp_idx  = dof_idx[base + 1]
+    pip_idx  = dof_idx[base + 2]
+
+    q1 = q[abad_idx]
+    q2 = q[mcp_idx]
+    q3 = q[pip_idx]
+    cells = _finger_jacobian_cells(q1, q2, q3)
+    j00 = cells[0]
+    j10 = cells[1]
+    j11 = cells[2]
+    j20 = cells[3]
+    j21 = cells[4]
+    j22 = cells[5]
+    # Full 3×3 J (lower-triangular)
+    J = wp.mat33(j00, wp.float32(0.0), wp.float32(0.0),
+                 j10, j11,              wp.float32(0.0),
+                 j20, j21,              j22)
+
+    km0 = K_m[base + 0]
+    km1 = K_m[base + 1]
+    km2 = K_m[base + 2]
+    kvm0 = Kv_m[base + 0]
+    kvm1 = Kv_m[base + 1]
+    kvm2 = Kv_m[base + 2]
+    tm0 = trq_m[base + 0]
+    tm1 = trq_m[base + 1]
+    tm2 = trq_m[base + 2]
+
+    qd_abad = qd[abad_idx]
+    qd_mcp  = qd[mcp_idx]
+    qd_pip  = qd[pip_idx]
+    qt_abad = qt[abad_idx]
+    qt_mcp  = qt[mcp_idx]
+    qt_pip  = qt[pip_idx]
+    qdt_abad = qdt[abad_idx]
+    qdt_mcp  = qdt[mcp_idx]
+    qdt_pip  = qdt[pip_idx]
+    g_abad = gravcomp_j[abad_idx]
+    g_mcp  = gravcomp_j[mcp_idx]
+    g_pip  = gravcomp_j[pip_idx]
+
+    tau_m_pd_0 = wp.float32(0.0)
+    tau_m_pd_1 = wp.float32(0.0)
+    tau_m_pd_2 = wp.float32(0.0)
+    if pd_mode == 0:
+        # Y: position via polynomial FK, velocity via J(q).
+        a0 = poly_offsets[0]
+        a1 = poly_offsets[1]
+        a2 = poly_offsets[2]
+        a3 = poly_offsets[3]
+        q_m_0  = eval_poly_3d(q1,       q2,      q3,      poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a0, a1)
+        q_m_1  = eval_poly_3d(q1,       q2,      q3,      poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a1, a2)
+        q_m_2  = eval_poly_3d(q1,       q2,      q3,      poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a2, a3)
+        qt_m_0 = eval_poly_3d(qt_abad,  qt_mcp,  qt_pip,  poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a0, a1)
+        qt_m_1 = eval_poly_3d(qt_abad,  qt_mcp,  qt_pip,  poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a1, a2)
+        qt_m_2 = eval_poly_3d(qt_abad,  qt_mcp,  qt_pip,  poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a2, a3)
+        qd_m_0 = j00 * qd_abad
+        qd_m_1 = j10 * qd_abad + j11 * qd_mcp
+        qd_m_2 = j20 * qd_abad + j21 * qd_mcp + j22 * qd_pip
+        qdt_m_0 = j00 * qdt_abad
+        qdt_m_1 = j10 * qdt_abad + j11 * qdt_mcp
+        qdt_m_2 = j20 * qdt_abad + j21 * qdt_mcp + j22 * qdt_pip
+        tau_m_pd_0 = km0 * (qt_m_0 - q_m_0) + kvm0 * (qdt_m_0 - qd_m_0)
+        tau_m_pd_1 = km1 * (qt_m_1 - q_m_1) + kvm1 * (qdt_m_1 - qd_m_1)
+        tau_m_pd_2 = km2 * (qt_m_2 - q_m_2) + kvm2 * (qdt_m_2 - qd_m_2)
+    else:
+        # X: diag K_j with cross-coupling ignored
+        K_j_a = j00 * j00 * km0 + j10 * j10 * km1 + j20 * j20 * km2
+        K_j_m = j11 * j11 * km1 + j21 * j21 * km2
+        K_j_p = j22 * j22 * km2
+        D_j_a = j00 * j00 * kvm0 + j10 * j10 * kvm1 + j20 * j20 * kvm2
+        D_j_m = j11 * j11 * kvm1 + j21 * j21 * kvm2
+        D_j_p = j22 * j22 * kvm2
+        tau_j_pd_a = K_j_a * (qt_abad - q1) + D_j_a * (qdt_abad - qd_abad)
+        tau_j_pd_m = K_j_m * (qt_mcp  - q2) + D_j_m * (qdt_mcp  - qd_mcp)
+        tau_j_pd_p = K_j_p * (qt_pip  - q3) + D_j_p * (qdt_pip  - qd_pip)
+        J_inv_T = wp.inverse(wp.transpose(J))
+        tau_m_pd_0 = J_inv_T[0, 0] * tau_j_pd_a + J_inv_T[0, 1] * tau_j_pd_m + J_inv_T[0, 2] * tau_j_pd_p
+        tau_m_pd_1 = J_inv_T[1, 0] * tau_j_pd_a + J_inv_T[1, 1] * tau_j_pd_m + J_inv_T[1, 2] * tau_j_pd_p
+        tau_m_pd_2 = J_inv_T[2, 0] * tau_j_pd_a + J_inv_T[2, 1] * tau_j_pd_m + J_inv_T[2, 2] * tau_j_pd_p
+
+    # Gravcomp via J^-T
+    J_inv_T = wp.inverse(wp.transpose(J))
+    g_m_0 = J_inv_T[0, 0] * g_abad + J_inv_T[0, 1] * g_mcp + J_inv_T[0, 2] * g_pip
+    g_m_1 = J_inv_T[1, 0] * g_abad + J_inv_T[1, 1] * g_mcp + J_inv_T[1, 2] * g_pip
+    g_m_2 = J_inv_T[2, 0] * g_abad + J_inv_T[2, 1] * g_mcp + J_inv_T[2, 2] * g_pip
+
+    tau_m_clip_0 = wp.clamp(tau_m_pd_0 + g_m_0, -tm0, tm0)
+    tau_m_clip_1 = wp.clamp(tau_m_pd_1 + g_m_1, -tm1, tm1)
+    tau_m_clip_2 = wp.clamp(tau_m_pd_2 + g_m_2, -tm2, tm2)
+
+    # Motor-side Coulomb friction (after motor saturation, before J^T):
+    # τ_m_actual = τ_m_clip - friction · tanh(qd_m · tanh_scale)
+    # Cap |friction| ≤ |τ_m_clip| so friction can stall the motor but cannot
+    # reverse the motor command direction (avoids tanh model jitter when motor
+    # can't overcome friction).
+    fric0 = friction_motor[base + 0] * wp.tanh(qd_m_0 * friction_tanh_scl[base + 0])
+    fric1 = friction_motor[base + 1] * wp.tanh(qd_m_1 * friction_tanh_scl[base + 1])
+    fric2 = friction_motor[base + 2] * wp.tanh(qd_m_2 * friction_tanh_scl[base + 2])
+    fric0 = wp.clamp(fric0, -wp.abs(tau_m_clip_0), wp.abs(tau_m_clip_0))
+    fric1 = wp.clamp(fric1, -wp.abs(tau_m_clip_1), wp.abs(tau_m_clip_1))
+    fric2 = wp.clamp(fric2, -wp.abs(tau_m_clip_2), wp.abs(tau_m_clip_2))
+    tau_m_clip_0 = tau_m_clip_0 - fric0
+    tau_m_clip_1 = tau_m_clip_1 - fric1
+    tau_m_clip_2 = tau_m_clip_2 - fric2
+
+    # τ_j = Jᵀ · τ_m
+    tau_j_a = j00 * tau_m_clip_0 + j10 * tau_m_clip_1 + j20 * tau_m_clip_2
+    tau_j_m = j11 * tau_m_clip_1 + j21 * tau_m_clip_2
+    tau_j_p = j22 * tau_m_clip_2
+
+    # Safety net 은 motor 출력 tau_j 자체에 적용 (gravcomp 차감 전).
+    safety_a = wp.abs(j00) * tm0 + wp.abs(j10) * tm1 + wp.abs(j20) * tm2
+    safety_m = wp.abs(j11) * tm1 + wp.abs(j21) * tm2
+    safety_p = wp.abs(j22) * tm2
+    tau_j_a  = wp.clamp(tau_j_a, -safety_a, safety_a)
+    tau_j_m  = wp.clamp(tau_j_m, -safety_m, safety_m)
+    tau_j_p  = wp.clamp(tau_j_p, -safety_p, safety_p)
+
+    joint_f_a = tau_j_a - g_abad
+    joint_f_m = tau_j_m - g_mcp
+    joint_f_p = tau_j_p - g_pip
+
+    out_joint_f[abad_idx] = joint_f_a
+    out_joint_f[mcp_idx]  = joint_f_m
+    out_joint_f[pip_idx]  = joint_f_p
+    out_ke[abad_idx] = wp.float32(0.0)
+    out_ke[mcp_idx]  = wp.float32(0.0)
+    out_ke[pip_idx]  = wp.float32(0.0)
+    out_kd[abad_idx] = wp.float32(0.0)
+    out_kd[mcp_idx]  = wp.float32(0.0)
+    out_kd[pip_idx]  = wp.float32(0.0)
+    out_eff[abad_idx] = safety_a
+    out_eff[mcp_idx]  = safety_m
+    out_eff[pip_idx]  = safety_p
+    # det(lower-triangular) = product of diagonals
+    out_det[tid] = wp.abs(j00 * j11 * j22)
+
+
+# ----------------------------------------------------------------------------
+# [10] pd_clip_thumb — 2 hands × 3 motors, 3×3 sparse J
+# Layout (motor_joint_transform.py thumb):
+#   J[0,0] = constant, J[0,1] = J[0,2] = 0
+#   J[1,0] = 0, J[1,1] = poly(q2), J[1,2] = 0
+#   J[2,0] = 0, J[2,1] = poly(q2,q3), J[2,2] = poly(q2,q3)
+# Joints in instance: Yaw=col0, CMC=col1, MCP=col2.
+# ----------------------------------------------------------------------------
+@wp.kernel
+def pd_clip_thumb(
+    dof_idx: wp.array(dtype=int),
+    K_m: wp.array(dtype=float),
+    Kv_m: wp.array(dtype=float),
+    trq_m: wp.array(dtype=float),
+    q: wp.array(dtype=float),
+    qd: wp.array(dtype=float),
+    qt: wp.array(dtype=float),
+    qdt: wp.array(dtype=float),
+    gravcomp_j: wp.array(dtype=float),
+    pd_mode: int,
+    # FK polynomial (allex_control cal_motorAngles_thumb, q1/q2/q3 → m0/m1/m2)
+    poly_offsets: wp.array(dtype=int),   # size 4
+    poly_exp_q1: wp.array(dtype=int),
+    poly_exp_q2: wp.array(dtype=int),
+    poly_exp_q3: wp.array(dtype=int),
+    poly_coef:   wp.array(dtype=float),
+    # Motor-side Coulomb friction (allex_control robot_model.json)
+    friction_motor:    wp.array(dtype=float),
+    friction_tanh_scl: wp.array(dtype=float),
+    out_joint_f: wp.array(dtype=float),
+    out_ke: wp.array(dtype=float),
+    out_kd: wp.array(dtype=float),
+    out_eff: wp.array(dtype=float),
+    out_det: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    base = tid * 3
+    yaw_idx = dof_idx[base + 0]
+    cmc_idx = dof_idx[base + 1]
+    mcp_idx = dof_idx[base + 2]
+
+    q2v = q[cmc_idx]
+    q3v = q[mcp_idx]
+    cells = _thumb_jacobian_cells(q2v, q3v)
+    j00 = cells[0]   # constant
+    j11 = cells[1]   # poly(q2)
+    j21 = cells[2]   # poly(q2,q3)
+    j22 = cells[3]   # poly(q2,q3)
+    # Sparse J as full 3×3 with zeros where appropriate
+    J = wp.mat33(j00, wp.float32(0.0), wp.float32(0.0),
+                 wp.float32(0.0), j11, wp.float32(0.0),
+                 wp.float32(0.0), j21, j22)
+
+    km0 = K_m[base + 0]
+    km1 = K_m[base + 1]
+    km2 = K_m[base + 2]
+    kvm0 = Kv_m[base + 0]
+    kvm1 = Kv_m[base + 1]
+    kvm2 = Kv_m[base + 2]
+    tm0 = trq_m[base + 0]
+    tm1 = trq_m[base + 1]
+    tm2 = trq_m[base + 2]
+
+    q1v = q[yaw_idx]
+    qd_y = qd[yaw_idx]
+    qd_c = qd[cmc_idx]
+    qd_m = qd[mcp_idx]
+    qt_y = qt[yaw_idx]
+    qt_c = qt[cmc_idx]
+    qt_m = qt[mcp_idx]
+    qdt_y = qdt[yaw_idx]
+    qdt_c = qdt[cmc_idx]
+    qdt_m = qdt[mcp_idx]
+    g_y = gravcomp_j[yaw_idx]
+    g_c = gravcomp_j[cmc_idx]
+    g_mp = gravcomp_j[mcp_idx]
+
+    tau_m_pd_0 = wp.float32(0.0)
+    tau_m_pd_1 = wp.float32(0.0)
+    tau_m_pd_2 = wp.float32(0.0)
+    if pd_mode == 0:
+        # Y: position via polynomial FK, velocity via J(q).
+        a0 = poly_offsets[0]
+        a1 = poly_offsets[1]
+        a2 = poly_offsets[2]
+        a3 = poly_offsets[3]
+        q_m_0  = eval_poly_3d(q1v,    q2v,    q3v,    poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a0, a1)
+        q_m_1  = eval_poly_3d(q1v,    q2v,    q3v,    poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a1, a2)
+        q_m_2  = eval_poly_3d(q1v,    q2v,    q3v,    poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a2, a3)
+        qt_m_0 = eval_poly_3d(qt_y,   qt_c,   qt_m,   poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a0, a1)
+        qt_m_1 = eval_poly_3d(qt_y,   qt_c,   qt_m,   poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a1, a2)
+        qt_m_2 = eval_poly_3d(qt_y,   qt_c,   qt_m,   poly_exp_q1, poly_exp_q2, poly_exp_q3, poly_coef, a2, a3)
+        qd_m_0 = j00 * qd_y
+        qd_m_1 = j11 * qd_c
+        qd_m_2 = j21 * qd_c + j22 * qd_m
+        qdt_m_0 = j00 * qdt_y
+        qdt_m_1 = j11 * qdt_c
+        qdt_m_2 = j21 * qdt_c + j22 * qdt_m
+        tau_m_pd_0 = km0 * (qt_m_0 - q_m_0) + kvm0 * (qdt_m_0 - qd_m_0)
+        tau_m_pd_1 = km1 * (qt_m_1 - q_m_1) + kvm1 * (qdt_m_1 - qd_m_1)
+        tau_m_pd_2 = km2 * (qt_m_2 - q_m_2) + kvm2 * (qdt_m_2 - qd_m_2)
+    else:
+        # X: diag K_j
+        K_j_y = j00 * j00 * km0
+        K_j_c = j11 * j11 * km1 + j21 * j21 * km2
+        K_j_m = j22 * j22 * km2
+        D_j_y = j00 * j00 * kvm0
+        D_j_c = j11 * j11 * kvm1 + j21 * j21 * kvm2
+        D_j_m = j22 * j22 * kvm2
+        tau_j_pd_y = K_j_y * (qt_y - q1v) + D_j_y * (qdt_y - qd_y)
+        tau_j_pd_c = K_j_c * (qt_c - q2v) + D_j_c * (qdt_c - qd_c)
+        tau_j_pd_m = K_j_m * (qt_m - q3v) + D_j_m * (qdt_m - qd_m)
+        J_inv_T = wp.inverse(wp.transpose(J))
+        tau_m_pd_0 = J_inv_T[0, 0] * tau_j_pd_y + J_inv_T[0, 1] * tau_j_pd_c + J_inv_T[0, 2] * tau_j_pd_m
+        tau_m_pd_1 = J_inv_T[1, 0] * tau_j_pd_y + J_inv_T[1, 1] * tau_j_pd_c + J_inv_T[1, 2] * tau_j_pd_m
+        tau_m_pd_2 = J_inv_T[2, 0] * tau_j_pd_y + J_inv_T[2, 1] * tau_j_pd_c + J_inv_T[2, 2] * tau_j_pd_m
+
+    J_inv_T = wp.inverse(wp.transpose(J))
+    g_m_0 = J_inv_T[0, 0] * g_y + J_inv_T[0, 1] * g_c + J_inv_T[0, 2] * g_mp
+    g_m_1 = J_inv_T[1, 0] * g_y + J_inv_T[1, 1] * g_c + J_inv_T[1, 2] * g_mp
+    g_m_2 = J_inv_T[2, 0] * g_y + J_inv_T[2, 1] * g_c + J_inv_T[2, 2] * g_mp
+
+    tau_m_clip_0 = wp.clamp(tau_m_pd_0 + g_m_0, -tm0, tm0)
+    tau_m_clip_1 = wp.clamp(tau_m_pd_1 + g_m_1, -tm1, tm1)
+    tau_m_clip_2 = wp.clamp(tau_m_pd_2 + g_m_2, -tm2, tm2)
+
+    # Motor-side Coulomb friction subtraction (allex_control robot_model.json):
+    # τ_m_actual = τ_m_clip - friction · tanh(qd_m · tanh_scale)
+    # Cap |friction| ≤ |τ_m_clip| (no direction reversal — friction can stall
+    # but not reverse motor).
+    fric0 = friction_motor[base + 0] * wp.tanh(qd_m_0 * friction_tanh_scl[base + 0])
+    fric1 = friction_motor[base + 1] * wp.tanh(qd_m_1 * friction_tanh_scl[base + 1])
+    fric2 = friction_motor[base + 2] * wp.tanh(qd_m_2 * friction_tanh_scl[base + 2])
+    fric0 = wp.clamp(fric0, -wp.abs(tau_m_clip_0), wp.abs(tau_m_clip_0))
+    fric1 = wp.clamp(fric1, -wp.abs(tau_m_clip_1), wp.abs(tau_m_clip_1))
+    fric2 = wp.clamp(fric2, -wp.abs(tau_m_clip_2), wp.abs(tau_m_clip_2))
+    tau_m_clip_0 = tau_m_clip_0 - fric0
+    tau_m_clip_1 = tau_m_clip_1 - fric1
+    tau_m_clip_2 = tau_m_clip_2 - fric2
+
+    # τ_j = J^T · τ_m
+    tau_j_y = j00 * tau_m_clip_0
+    tau_j_c = j11 * tau_m_clip_1 + j21 * tau_m_clip_2
+    tau_j_m = j22 * tau_m_clip_2
+
+    # Safety net 은 motor 출력 tau_j 자체에 적용 (gravcomp 차감 전).
+    safety_y = wp.abs(j00) * tm0
+    safety_c = wp.abs(j11) * tm1 + wp.abs(j21) * tm2
+    safety_m = wp.abs(j22) * tm2
+    tau_j_y  = wp.clamp(tau_j_y, -safety_y, safety_y)
+    tau_j_c  = wp.clamp(tau_j_c, -safety_c, safety_c)
+    tau_j_m  = wp.clamp(tau_j_m, -safety_m, safety_m)
+
+    joint_f_y = tau_j_y - g_y
+    joint_f_c = tau_j_c - g_c
+    joint_f_m = tau_j_m - g_mp
+
+    out_joint_f[yaw_idx] = joint_f_y
+    out_joint_f[cmc_idx] = joint_f_c
+    out_joint_f[mcp_idx] = joint_f_m
+    out_ke[yaw_idx] = wp.float32(0.0)
+    out_ke[cmc_idx] = wp.float32(0.0)
+    out_ke[mcp_idx] = wp.float32(0.0)
+    out_kd[yaw_idx] = wp.float32(0.0)
+    out_kd[cmc_idx] = wp.float32(0.0)
+    out_kd[mcp_idx] = wp.float32(0.0)
+    out_eff[yaw_idx] = safety_y
+    out_eff[cmc_idx] = safety_c
+    out_eff[mcp_idx] = safety_m
+    out_det[tid] = wp.abs(j00 * j11 * j22)
+
+
+# ----------------------------------------------------------------------------
+# [11] pd_clip_joint_nominal — pd_mode='joint_nominal' (X 모드의 nominal-pose
+# 고정 변형). J(q=0) 으로 사전계산된 K_j_nom / Kv_j_nom / τ_j_max_nom 사용,
+# 자세 변화 / via event 무시. 순수 joint-space PD + joint-space scalar clip.
+#
+# 기존 5 개 motor-space 커널 (pd_clip_*) 대신 이 단일 커널만 launch 됨.
+# dim = total active motors (= 48 for ALLEX). 한 motor = 한 joint (그룹 내부
+# coupling 은 K_j_nom 의 사전계산에서 이미 반영됨).
+#
+# mech-comp (is_mech_comp[tid] == 1) — Waist_Lower_Pitch, Neck_Pitch:
+#   gravcomp 합산 skip → motor clip 식에서 PD 만 clip
+# non-mech (== 0):
+#   PD + gravcomp 합산 후 joint-space clip → joint_f - gravcomp 로 write
+# ----------------------------------------------------------------------------
+@wp.kernel
+def pd_clip_joint_nominal(
+    dof_idx: wp.array(dtype=int),          # size = N_active (48)
+    is_mech_comp: wp.array(dtype=int),     # 1=mech, 0=actuator
+    K_j_nom: wp.array(dtype=float),        # 사전계산 J(0)²·K_m diag
+    Kv_j_nom: wp.array(dtype=float),       # 사전계산 J(0)²·Kv_m diag
+    tau_j_max_nom: wp.array(dtype=float),  # 사전계산 |J(0)|·τ_m_max
+    q: wp.array(dtype=float),
+    qd: wp.array(dtype=float),
+    qt: wp.array(dtype=float),
+    qdt: wp.array(dtype=float),
+    gravcomp_j: wp.array(dtype=float),
+    out_joint_f: wp.array(dtype=float),
+    out_ke: wp.array(dtype=float),
+    out_kd: wp.array(dtype=float),
+    out_eff: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    i = dof_idx[tid]
+    K_j  = K_j_nom[tid]
+    Kv_j = Kv_j_nom[tid]
+    tau_max = tau_j_max_nom[tid]
+
+    # Joint-space PD
+    PD = K_j * (qt[i] - q[i]) + Kv_j * (qdt[i] - qd[i])
+
+    # mech-comp 분기 — gravcomp 합산 skip
+    g_j = wp.where(is_mech_comp[tid] == 1, wp.float32(0.0), gravcomp_j[i])
+    tau_total = PD + g_j
+
+    # Joint-space scalar clip
+    tau_clip = wp.clamp(tau_total, -tau_max, tau_max)
+
+    # MuJoCo passive 가 gravcomp_j 다시 더하므로 차감
+    joint_f_val = tau_clip - g_j
+
+    out_joint_f[i] = joint_f_val
+    out_ke[i] = wp.float32(0.0)
+    out_kd[i] = wp.float32(0.0)
+    out_eff[i] = tau_max

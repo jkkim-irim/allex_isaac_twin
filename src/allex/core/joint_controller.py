@@ -213,39 +213,32 @@ class ALLEXJointController:
         is_external_active_fn: optional callable returning True when an external
         driver (e.g. trajectory playback) wants to push targets even if the ROS2
         subscriber is off.
-        pre_step_fn: optional callable invoked every step BEFORE position write —
-        used by MotorStateMirror to refresh joint PD gains from current q.
-        Runs regardless of `active` state so PD mirror works during idle / ROS2
-        teleop / trajectory playback uniformly.
-        get_target_velocities_func: optional callable returning per-DOF
-        target velocities [rad/s]. Returning ``None`` (or omitting) is fine —
-        position-only ArticulationAction is sent in that case. Newton's
-        POSITION_VELOCITY actuator mode is what makes the velocity target
-        actually drive the controller (see ``newton_bridge.
-        _force_position_velocity_mode``); without that upgrade the velocity
-        target is ignored regardless.
+        pre_step_fn: optional callable invoked every step AFTER target write —
+        used by MotorStateMirror to compute motor-space PD from the just-pushed
+        q_target / q̇_target (control.joint_target_pos / vel). Runs regardless
+        of `active` state so motor mirror keeps applying motor-clipped torque
+        during idle / ROS2 teleop / trajectory playback uniformly.
+        (이전: BEFORE target write — 단순 K_j gain refresh 용. motor-space
+        torque clip 도입 이후 fresh target 가 필요해 AFTER 로 이동.)
+        get_target_velocities_func: kept for signature backward-compat;
+        **현재 미사용**. 이유: Isaac Sim 6 의 `articulation_controller.apply_action`
+        이 joint_velocities 를 CUDA tensor 로 wrap 한 뒤 `np.isnan(...)` 직접
+        호출 (to_numpy wrapper 누락 — joint_positions 만 wrapping 정상) 해서
+        터짐. 우회: ArticulationAction 에서 joint_velocities 제거. q̇_target 은
+        scenario → MotorStateMirror 로 직접 callback 라우팅 (Newton 의 control
+        layer 미경유).
         """
         while True:
-            if pre_step_fn is not None:
-                pre_step_fn()
             active = self._ros2_subscriber_active
             if not active and is_external_active_fn is not None:
                 active = bool(is_external_active_fn())
             if articulation is not None and active:
                 target_positions = get_target_positions_func()
-                target_velocities = None
-                if get_target_velocities_func is not None:
-                    try:
-                        target_velocities = get_target_velocities_func()
-                    except Exception as exc:
-                        print(f"[ALLEX][JointCtrl] velocity provider failed: {exc}")
-                        target_velocities = None
                 articulation.apply_action(
-                    ArticulationAction(
-                        joint_positions=target_positions,
-                        joint_velocities=target_velocities,
-                    )
+                    ArticulationAction(joint_positions=target_positions)
                 )
+            if pre_step_fn is not None:
+                pre_step_fn()
             yield
 
     def get_coupled_joints_info(self):

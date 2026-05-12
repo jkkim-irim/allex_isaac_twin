@@ -32,6 +32,7 @@ class ViaCSVData:
     kps_via: np.ndarray | None = None    # (N, n_joints) CSV units
     kds_via: np.ndarray | None = None    # (N, n_joints) CSV units
     trq_via: np.ndarray | None = None    # (N, n_joints) CSV units
+    sections: list[str] | None = None    # (N,) section label per via, from "-1, <name>" markers
 
 
 # ── Hermite basis functions (and their derivatives wrt u) ──
@@ -178,6 +179,10 @@ def parse_via_csv(path: str | Path) -> ViaCSVData:
     rows_trq: list[list[float]] = []
     rows_kp: list[list[float]] = []
     rows_kd: list[list[float]] = []
+    # Section labels for each via row. `-1, <label>` lines mark END of the
+    # preceding section. We buffer the unlabeled count and back-fill on hit.
+    rows_section: list[str | None] = []
+    unlabeled_since: int = 0  # index of first via in current (unlabeled) section
 
     # Section-local schema. Reset on every "duration,..." header line.
     joint_cols: list[int] = []
@@ -219,7 +224,18 @@ def parse_via_csv(path: str | Path) -> ViaCSVData:
                 d = float(parts[0])
             except ValueError:
                 continue
-            if d <= 0:
+            # Section marker: "-1, <label>". Back-fill section label for all
+            # rows since the last marker.
+            if d < 0:
+                if len(parts) > 1:
+                    label = parts[1].strip()
+                    # Strip trailing duration annotation like "[9.0 sec]"
+                    label = label.split("[")[0].strip()
+                    for k in range(unlabeled_since, len(rows_section)):
+                        rows_section[k] = label
+                unlabeled_since = len(rows_section)
+                continue
+            if d == 0:
                 continue
 
             def cell(idx: int) -> float:
@@ -242,6 +258,7 @@ def parse_via_csv(path: str | Path) -> ViaCSVData:
             rows_trq.append(cells(trq_cols))
             rows_kp.append(cells(kp_cols))
             rows_kd.append(cells(kd_cols))
+            rows_section.append(None)  # filled in on next -1 marker
 
     if not rows_pos:
         return ViaCSVData(t_via=np.array([0.0]), pos_via=np.zeros((1, 1)))
@@ -263,6 +280,7 @@ def parse_via_csv(path: str | Path) -> ViaCSVData:
         trq_via=_arr_or_none(rows_trq),
         kps_via=_arr_or_none(rows_kp),
         kds_via=_arr_or_none(rows_kd),
+        sections=rows_section,
     )
 
 

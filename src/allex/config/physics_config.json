@@ -17,13 +17,51 @@
         "pd_scale": 0.017453292519943295,
         "use_cuda_graph": true,
         "contact_mu": 0.5,
+        "pd_mode": "motor_space",
+        "_pd_mode_doc": "MotorStateMirror PD 산출 방식. 'motor_space' (Y, allex_control 과 동치): q_m=J·q 선형화 후 motor-domain PD + motor-space clip. 'joint_space_diag' (X): joint-domain diag K_j=Σ J[k,i]²·K_m[k] PD + J⁻ᵀ·motor-clip·Jᵀ. 'joint_nominal' (baseline): USD-loaded K_j / Kv_j / effort_limit 그대로 사용, joint-space scalar clip. 제조사가 적당한 자세에서 보정한 값이라 finger/thumb 의 J(0) 계산과 다름. via event / 자세 변화 모두 무시 — 가장 단순한 baseline.",
+        "disable_torque_clip": ["finger", "thumb"],
+        "_disable_torque_clip_doc": "디버깅용 토글. 형식: bool 또는 group 이름 list. true → 모든 group (scalar/elbow/wrist/finger/thumb) clip 무효화. false → 정상. list → 해당 group 만 무효화 (예: ['finger','thumb'] → 손가락/엄지 motor τ_m_max 만 1e6, 팔/허리는 정상 clip). 모든 모드에 적용 (motor_space/joint_space_diag 의 motor clip + joint_nominal mode 의 τ_j_max_nom). via event (set_target) 가 trq_m_target 을 줄여도 motor_step_per_ms=0.001 ramp 가 trajectory 길이보다 훨씬 길어 사실상 1e6 유지.",
+        "joint_nominal_torque_source": "mjcf",
+        "_joint_nominal_torque_source_doc": "joint_nominal 모드의 τ_j_max_nom 출처. 'usd' = USD-loaded effort_limit (drive_gains 기반, motor space K_m × ratio 변환된 conservative 값). 'mjcf_peak' = asset/ALLEX/mjcf/ALLEX.xml 의 <joint actuatorfrcrange='-X X'> 값 (motor peak 기준, 훨씬 큰 값). USD 값이 너무 빡빡해 toq 부족 의심 시 mjcf_peak 으로 토글해 비교. MJCF 에 missing 한 joint 는 USD 값 유지. disable_torque_clip 이 true 면 이 설정 무시 (1e6 으로 덮어씀).",
+        "kp_scale": 1.0,
+        "kv_scale": 1.0,
+        "kp_scale_overrides": {},
+        "kv_scale_overrides": {},
+        "ramp_window_s": 1.0,
+        "_ramp_window_s_doc": "K_m / Kv_m / trq_m time-bounded ramp window. 보간은 cosine smoothstep `0.5·(1−cos(π·u))` 로 양 끝 미분=0 (sin/tanh-like). 0 = snap.",
+        "motor_step_per_ms": 0.001,
+        "_motor_step_per_ms_doc": "trq_m ramp step rate (motor unit / ms). allex_control 의 step-based ramp 와 동일. 시간 = |delta| / (rate × 1000) (예: delta 0.08 → 80ms).",
+        "_kp_kv_scale_doc": "K_m (motor stiffness) 와 Kv_m (motor damping) 에 곱하는 글로벌 scale. 1.0 = CSV 값 그대로. 0.0 → 해당 항목 off. kp_scale_overrides / kv_scale_overrides 로 substring 매칭 per-joint 오버라이드 (가장 긴 매치 우선). 예: {'Wrist': 2.0} → 'Wrist' 포함하는 모든 joint 의 kp 만 2배.",
+        "pd_gain_scale": 1.0,
+        "_pd_gain_scale_doc": "legacy — kp_scale/kv_scale 가 설정 안 됐을 때 fallback. 둘에 동일 scale 적용.",
+        "friction_scale": 1.0,
+        "_friction_scale_doc": "디버그 토글. solver.mjw_model.dof_frictionloss 에 곱하는 글로벌 scale. 1.0 = MJCF 그대로 (shoulder/elbow 1Nm 등). 0.0 = 마찰 완전 제거. dynamics mismatch 진단용. init 시점에 한 번 적용.",
+        "friction_overrides": {
+            "Waist_Yaw_Joint": 5.0,
+            "L_Shoulder_Pitch_Joint": 1.0,
+            "L_Shoulder_Roll_Joint":  2.4,
+            "L_Shoulder_Yaw_Joint":   1.0,
+            "L_Elbow_Joint":          1.4,
+            "L_Wrist_Yaw_Joint":      1.2,
+            "L_Wrist_Roll_Joint":     0.7,
+            "L_Wrist_Pitch_Joint":    0.7,
+            "R_Shoulder_Pitch_Joint": 1.0,
+            "R_Shoulder_Roll_Joint":  2.4,
+            "R_Shoulder_Yaw_Joint":   1.0,
+            "R_Elbow_Joint":          1.4,
+            "R_Wrist_Yaw_Joint":      1.2,
+            "R_Wrist_Roll_Joint":     0.7,
+            "R_Wrist_Pitch_Joint":    0.7
+        },
+        "_friction_overrides_doc": "특정 joint 의 dof_frictionloss 절대값 override (scale 적용 후). MJCF/USD 에 friction 정보 없는 joint 에 사용. 예: Waist_Yaw 는 real motor 마찰 있는데 model 에 없으므로 2.0 N·m 추가.",
+        "armature_scale": 1.0,
+        "_armature_scale_doc": "디버그 토글. solver.mjw_model.dof_armature 에 곱하는 글로벌 scale. 1.0 = MJCF 그대로 (motor 반영 회전관성). 0.0 = 모터 회전관성 제거 (joint 자체만 inertia). dynamics mismatch 진단용.",
         "gravcomp": {
             "scale": 1.0,
             "actuator_gravcomp": {
-                "enabled": true,
-                "exclude": ["Waist_Lower_Pitch_Joint", "Neck_Pitch_Joint"]
+                "enabled": false
             },
-            "_actuator_gravcomp_doc": "MuJoCo mjc:actuatorgravcomp 의 alias. false (default) = qfrc_gravcomp 별도 (PD/보상 분리), true = qfrc_actuator 합산 (실 모터가 보상까지 출력, actuatorfrcrange 한계 적용). bool 또는 {enabled: bool, joints: [...], exclude: [...]} 형식 허용. exclude 관절은 qfrc_gravcomp (passive, 스프링 모사).",
+            "_actuator_gravcomp_doc": "MuJoCo mjc:actuatorgravcomp 의 alias. false = qfrc_gravcomp 별도 (passive). true = qfrc_actuator 합산. motor-space torque clip 도입 후 전체 passive 로 통일: 우리 kernel 이 joint_f (qfrc_applied) 에 PD+gravcomp 합산-clip-차감을 처리하므로 MuJoCo 의 actuator-route gravcomp 가 켜져 있으면 qfrc_actuator 에 gravcomp 가 또 들어가 double-count. 기구적 중력보상 (Waist_Lower_Pitch, Neck_Pitch) 도 동일한 passive route 사용 — kernel 측에서 motor clip 단계에서만 gravcomp 합산을 skip.",
             "bodies": [
                 "Base_Link",
                 "Waist_Yaw_Link",
@@ -100,7 +138,7 @@
         },
         "ramp_step_sizes": {
             "motor_step_per_ms": 0.001,
-            "_doc": "실 제어기의 motor-domain ramp step (per 1ms). 모든 카테고리(kp/kv/tlp/tln) 동일 글로벌 값. MotorStateMirror 가 매 physics step 이 값으로 K_m_current 를 ramp 하고 jk_kernel.compute_*_K_j 로 joint-domain 으로 변환해 view 에 직접 write."
+            "_doc": "실 제어기의 motor-domain ramp step (per 1ms). 모든 카테고리(kp/kv/tlp/tln) 동일 글로벌 값. MotorStateMirror 가 매 physics step 이 값으로 K_m_current 를 ramp 하고 jk_kernel.compute_*_K_j 로 joint-domain 으로 변환해 view 에 직접 write. (디버그: 0.001 → 0.01 로 10x 빠르게 — transient 스파이크 감소 검증용. real 의 실제 값과 다를 수 있으므로 비교 끝나면 복원 검토.)"
         }
     },
     "debug": {
