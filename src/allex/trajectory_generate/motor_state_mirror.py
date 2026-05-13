@@ -297,6 +297,11 @@ class MotorStateMirror:
         # joint has friction. dict {joint_name: frictionloss [N·m]}.
         self._friction_overrides = dict(_newton_cfg.get("friction_overrides", {}))
         self._armature_scale = float(_newton_cfg.get("armature_scale", 1.0))
+        # Per-joint absolute joint-level damping (MuJoCo dof_damping). Applies
+        # `-d·qd` purely from velocity — independent of PD's Kv·(vt-v) tracking.
+        # MJCF default damping=0 for all ALLEX joints; set here to add passive
+        # natural damping (e.g. wrist). dict {joint_name: damping [N·m·s/rad]}.
+        self._damping_overrides = dict(_newton_cfg.get("damping_overrides", {}))
         flags = []
         if self._disable_clip_groups:
             if self._disable_clip_groups == _ALL_GROUPS:
@@ -315,6 +320,8 @@ class MotorStateMirror:
             flags.append(f"friction_scale={self._friction_scale}")
         if self._friction_overrides:
             flags.append(f"friction_overrides={self._friction_overrides}")
+        if self._damping_overrides:
+            flags.append(f"damping_overrides={self._damping_overrides}")
         if self._armature_scale != 1.0:
             flags.append(f"armature_scale={self._armature_scale}")
         flag_str = (" ⚠ " + " | ".join(flags)) if flags else ""
@@ -856,6 +863,29 @@ class MotorStateMirror:
                     arr.assign(cur)
                 except Exception as exc:
                     print(f"[ALLEX][Mirror] friction_overrides failed: {exc}")
+
+        # Per-joint damping override — MuJoCo applies `-d·qd` to each DOF as a
+        # passive joint-level dissipative force (independent of PD).  MJCF
+        # default `damping="0"` for all ALLEX joints, so without this override
+        # there's no natural damping; PD's Kv only damps target-tracking error.
+        damping_overrides = dict(self._damping_overrides)
+        if damping_overrides:
+            arr = getattr(mjw_model, "dof_damping", None)
+            if arr is None:
+                print("[ALLEX][Mirror] mjw_model.dof_damping missing; cannot apply damping_overrides")
+            else:
+                try:
+                    cur = arr.numpy().copy()
+                    for name, val in damping_overrides.items():
+                        dof = self._name_to_dof.get(name)
+                        if dof is None:
+                            print(f"[ALLEX][Mirror] damping_overrides: '{name}' dof missing; skip")
+                            continue
+                        cur[dof] = float(val)
+                        print(f"[ALLEX][Mirror] damping_overrides: {name} → {val} N·m·s/rad")
+                    arr.assign(cur)
+                except Exception as exc:
+                    print(f"[ALLEX][Mirror] damping_overrides failed: {exc}")
 
     # --------------------------------------------------------
     # Helpers

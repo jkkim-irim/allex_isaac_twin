@@ -54,6 +54,23 @@
             "R_Wrist_Pitch_Joint":    0.7
         },
         "_friction_overrides_doc": "특정 joint 의 dof_frictionloss 절대값 override (scale 적용 후). MJCF/USD 에 friction 정보 없는 joint 에 사용. 예: Waist_Yaw 는 real motor 마찰 있는데 model 에 없으므로 2.0 N·m 추가.",
+        "damping_overrides": {
+            "L_Shoulder_Pitch_Joint": 0.5,
+            "L_Shoulder_Roll_Joint":  0.5,
+            "L_Shoulder_Yaw_Joint":   0.5,
+            "L_Elbow_Joint":          0.7,
+            "L_Wrist_Yaw_Joint":      0.7,
+            "L_Wrist_Roll_Joint":     1.5,
+            "L_Wrist_Pitch_Joint":    1.5,
+            "R_Shoulder_Pitch_Joint": 0.5,
+            "R_Shoulder_Roll_Joint":  0.5,
+            "R_Shoulder_Yaw_Joint":   0.5,
+            "R_Elbow_Joint":          0.7,
+            "R_Wrist_Yaw_Joint":      0.7,
+            "R_Wrist_Roll_Joint":     1.5,
+            "R_Wrist_Pitch_Joint":    1.5
+        },
+        "_damping_overrides_doc": "joint-level natural damping (MuJoCo dof_damping). `-d·qd` 형태로 속도만 보고 저항 — PD 의 Kv·(vt-v) tracking damping 과 무관. MJCF 의 모든 joint 가 damping=0 이라 기본은 비활성. 단위 N·m·s/rad. 값 키울수록 wrist 가 묵직해짐.",
         "armature_scale": 1.0,
         "_armature_scale_doc": "디버그 토글. solver.mjw_model.dof_armature 에 곱하는 글로벌 scale. 1.0 = MJCF 그대로 (motor 반영 회전관성). 0.0 = 모터 회전관성 제거 (joint 자체만 inertia). dynamics mismatch 진단용.",
         "gravcomp": {
