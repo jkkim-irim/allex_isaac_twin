@@ -1,6 +1,6 @@
 # Real/Sim Replay — Viz Scenario Config 사용법
 
-`Real/Sim Replay` 패널의 force vector / torque ring / graph plot 시각화를 시간 기반
+`Real/Sim Replay` 패널의 force vector / torque ring 시각화를 시간 기반
 시나리오로 제어하는 통합 annotation 파일.
 
 ## 파일 위치
@@ -15,7 +15,7 @@ trajectory/<group>/
 ```
 
 **파일이 없으면 기존 default 동작**: force/torque 는 default visible (mode-only + threshold-hide),
-torque ring 은 user 토글, graph plot 없음.
+torque ring 은 user 토글.
 
 ## JSON 스키마 (전부 optional)
 
@@ -28,6 +28,15 @@ torque ring 은 user 토글, graph plot 없음.
     "real.hand_l_thumb":          [[33.0, 35.5]],
     "sim.L_Elbow__R_Palm_Back":   [[13.5, 17.6]],
     "sim.R_Palm_Net_Force":       [[33.0, 36.8]]
+  },
+
+  "force_invert": [
+    "sim.L_Elbow__R_Palm_Back"
+  ],
+
+  "force_gain": {
+    "sim.L_Elbow__R_Palm_Back": 2.0,
+    "real.arm_r":               0.5
   },
 
   "ext_torque_triggers": {
@@ -43,11 +52,7 @@ torque ring 은 user 토글, graph plot 없음.
   "ext_joint_torque_triggers": {
     "ext_joint_torque_hand_l_index_abad":    [[0.0, 4.0]],
     "ext_joint_torque_arm_r_wrist_pitch":    [[5.0, 8.0]]
-  },
-
-  "graph_plots": [
-    /* Phase 3 — 미구현. 작성해도 현재는 무시 (보관만 됨). */
-  ]
+  }
 }
 ```
 
@@ -185,6 +190,42 @@ prim    = /World/AllexForceViz/sim/<channel>
 ```
 
 real `contact_pos_<topic_id>_*` 컬럼이 없으면 chest_origin link world 위치로 fallback.
+
+### `force_invert` — 채널별 force vector 방향 반전
+
+CSV 값을 음수로 push 해서 화살표를 반대 방향으로 그리는 viz-only 옵션. 데이터는
+건드리지 않고 시각화만 바뀐다 (origin 위치는 그대로). 활성 시간창 내에서만 영향.
+
+```json
+"force_invert": [
+  "sim.L_Elbow__R_Palm_Back",
+  "sim.L_Palm_Back__R_Elbow",
+  "real.arm_r"
+]
+```
+
+- 항목 형식: `"sim.<channel>"` 또는 `"real.<topic_id>"` — `force_triggers` 와 같은 dotted key.
+- sim aggregate (예 `sim.R_Palm_Net_Force`) 는 default 가 이미 `-normal*mag` 라
+  `force_invert` 에 넣으면 부호가 한 번 더 뒤집혀 **CSV normal 방향 그대로** 출력.
+- 잘못된 entry (prefix 가 sim/real 아님, dot 없음 등) 는 WARNING + skip.
+
+### `force_gain` — 채널별 magnitude 배율
+
+화면상 화살표 길이만 채널별로 키우거나 줄이고 싶을 때. 데이터 값은 그대로,
+시각화 magnitude 만 `gain` 배. visualizer 의 global `FORCE_GAIN` (viz_config) 위에
+**추가로** 곱해진다.
+
+```json
+"force_gain": {
+  "sim.L_Elbow__R_Palm_Back": 2.0,
+  "real.arm_r":               0.5
+}
+```
+
+- 값은 **양의 finite float** — 음수/0/NaN/Inf 은 WARNING + skip (방향 반전은 `force_invert`).
+- 누락된 채널은 1.0 (변화 없음).
+- `force_invert` 와 같이 쓰면 `vec → -vec * gain` (둘 다 적용).
+- 활성 시간창 (`force_triggers`) 안에서만 영향.
 
 ---
 
@@ -592,14 +633,6 @@ ALLEX_CSV_JOINT_NAMES 와 다름.
 
 ---
 
-## 5) `graph_plots` — Phase 3 미구현
-
-스키마 자리만 잡아둠. 현재 작성해도 무시됨 (load 시 INFO 로그에 plots=N 만 표시).
-
-설계 메모는 `dvcc/21_viz_scenario_config_design.md` 의 Phase 3 섹션 참조.
-
----
-
 ## 시간 결정 흐름
 
 1. **sim 있으면**: 같은 group sim replay → "닿았다" 시점 시각으로 확인
@@ -614,7 +647,7 @@ ALLEX_CSV_JOINT_NAMES 와 다름.
 - 콘솔 INFO 로그:
   ```
   [replay] viz_scenario loaded: force=Nch, ext_torque=Nch, torque_ring=Nch,
-                                ext_joint_torque=Nch, plots=N
+                                ext_joint_torque=Nch
   ```
 - 잘못된 entry (prefix 안 맞음, range 가 list 아님, t_on >= t_off, 비-숫자, invalid 채널 키 등)
   는 WARNING 한 줄씩 + skip

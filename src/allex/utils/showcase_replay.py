@@ -39,13 +39,12 @@ def _load_viz_scenario(group_dir: Path) -> dict:
       "force_triggers":            {"real.<id>"/"sim.<ch>":     [[t_on, t_off], ...] | "off"},
       "ext_torque_triggers":       {"real.<id>":                [[t_on, t_off], ...] | "off"},
       "torque_ring_triggers":      {"<src>[.<region>]":         [[t_on, t_off], ...] | "off"},
-      "ext_joint_torque_triggers": {"ext_joint_torque_<short>": [[t_on, t_off], ...] | "off"},
-      "graph_plots":               [ {plot_spec}, ... ]
+      "ext_joint_torque_triggers": {"ext_joint_torque_<short>": [[t_on, t_off], ...] | "off"}
     }
     ```
 
     파일이 없으면 빈 dict — 기존 default 동작 (force 는 default visible, torque ring
-    은 user 토글, ext_joint_torque substitution 없음, graph plot 없음).
+    은 user 토글, ext_joint_torque substitution 없음).
     """
     p = group_dir / _VIZ_SCENARIO_FILE
     if not p.is_file():
@@ -348,8 +347,6 @@ class ShowcaseReplayControls:
             scen_parts.append(f"torque_ring={len(viz_scenario['torque_ring_triggers'])}ch")
         if viz_scenario.get("ext_joint_torque_triggers"):
             scen_parts.append(f"ext_jtq={len(viz_scenario['ext_joint_torque_triggers'])}ch")
-        if viz_scenario.get("graph_plots"):
-            scen_parts.append(f"plots={len(viz_scenario['graph_plots'])}")
         scen_tag = (", scenario={" + ",".join(scen_parts) + "}") if scen_parts else ""
         self._set_status(
             f"Status: Playing main={main_src} ({reader_main.duration_s:.2f}s, "

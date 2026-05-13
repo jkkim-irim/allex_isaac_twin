@@ -51,6 +51,7 @@ plt.style.use("dark_background")
 # viz_config.colors.real / colors.sim 와 같은 값. plot_proc 는 독립 subprocess 라
 # viz_config import 가 안 되므로 hard-code.
 _REAL_COLOR = (1.0, 0.0, 0.0)
+# _SIM_COLOR = (0.0, 0.8, 0.0)  # green override — plot 만 적용 (subprocess hardcode)
 _SIM_COLOR = (0.0, 0.8, 1.0)
 
 
@@ -408,7 +409,7 @@ def main() -> int:
     # rect=[left, bottom, right, top] — 위 strip 은 Hide/Show 버튼, 아래는 x-label,
     # 왼쪽은 y-label, 오른쪽도 숨 좀 트이게 작은 여백. 0(=가장자리 붙임) 이면 figure
     # 가 좁을 때 라벨이나 마지막 tick 이 잘림.
-    fig.tight_layout(rect=[0.03, 0.02, 0.99, 0.92], h_pad=1.5)
+    fig.tight_layout(rect=[0.05, 0.02, 0.99, 0.92], h_pad=1.5)
 
     def _set_all_visible(visible: bool):
         for _ax, _sl, _rl, leg, _yl, _ch in axis_specs:

@@ -17,6 +17,7 @@ from the per-step update.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -139,9 +140,10 @@ class CsvReplayer:
 
         # viz_scenario_config.json 에서 로드된 시나리오 dict. 키 (전부 optional):
         #   "force_triggers":       {"real.<topic_id>"/"sim.<channel>": [[t_on, t_off], ...]}
+        #   "force_invert":         ["sim.<channel>", ...]  — 방향 뒤집어 push (-vec)
+        #   "force_gain":           {"sim.<channel>": 2.0, ...}  — 채널별 magnitude 배율
         #   "ext_torque_triggers":  {"real.<topic_id>":                  [[t_on, t_off], ...]}
         #   "torque_ring_triggers": {"real": [...], "sim": [...]}
-        #   "graph_plots":          [ {plot_spec}, ... ]
         # 각 섹션은 _parse_*_triggers 헬퍼로 검증·정규화 후 내부 dict 에 저장.
         viz_scenario = viz_scenario or {}
 
@@ -160,6 +162,19 @@ class CsvReplayer:
         # 매 _push_force_frame_sim 호출 시 sim 채널별 최신 origin 캐시 —
         # _push_real_force_routed 가 alias resolve 할 때 lookup.
         self._sim_origin_cache: dict = {}
+        # --- force_invert 파싱 ---
+        # JSON form: ["sim.<channel>", "real.<topic_id>", ...] — 해당 채널의 force vec 를
+        # 음수로 push (시각화 방향 반전). 내부 storage = frozenset of (source, name) tuple.
+        self._force_invert: frozenset = self._parse_force_invert(
+            viz_scenario.get("force_invert") or []
+        )
+        # --- force_gain 파싱 ---
+        # JSON form: {"sim.<channel>": float, "real.<topic_id>": float, ...} — 채널별
+        # magnitude 배율 (visualizer 의 global FORCE_GAIN 위에 추가로 곱해짐). 누락된
+        # 채널은 1.0. invert 와 독립 — 둘 다 있으면 vec → -vec * gain.
+        self._force_gain: dict = self._parse_force_gain(
+            viz_scenario.get("force_gain") or {}
+        )
 
         # --- ext_torque_triggers 파싱 ---
         # Wrench 의 torque (Nm) ring 게이팅. real CSV 만 — sim 쪽엔 Wrench torque 없음.
@@ -188,19 +203,14 @@ class CsvReplayer:
             viz_scenario.get("ext_joint_torque_triggers") or {}
         )
 
-        # --- graph_plots: Phase 3 에서 처리 — 현재는 보관만, 미사용. ---
-        self._graph_plot_specs = list(viz_scenario.get("graph_plots") or [])
-
         if (self._force_triggers or self._ext_torque_triggers
-                or self._torque_ring_triggers or self._ext_jtq_triggers
-                or self._graph_plot_specs):
+                or self._torque_ring_triggers or self._ext_jtq_triggers):
             logger.info(
                 f"[replay] viz_scenario loaded: "
                 f"force={len(self._force_triggers)}ch, "
                 f"ext_torque={len(self._ext_torque_triggers)}ch, "
                 f"torque_ring={len(self._torque_ring_triggers)}ch, "
-                f"ext_joint_torque={len(self._ext_jtq_triggers)}ch, "
-                f"plots={len(self._graph_plot_specs)}"
+                f"ext_joint_torque={len(self._ext_jtq_triggers)}ch"
             )
         if self._real_origin_alias:
             logger.info(
@@ -1477,6 +1487,68 @@ class CsvReplayer:
         return out
 
     @staticmethod
+    def _parse_force_gain(raw) -> dict:
+        """``force_gain`` dict → internal dict[(source, channel)] = float.
+
+        JSON form: ``{"sim.<channel>": 2.0, "real.<topic_id>": 0.5, ...}``. 값은
+        finite float — non-finite (NaN/Inf) 또는 음수 ≤ 0 은 WARNING + skip
+        (방향 반전은 ``force_invert`` 로 다룬다). 파싱 실패 항목도 skip.
+        """
+        if not raw:
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning(f"[viz_scenario] force_gain must be dict, got {type(raw).__name__}; ignored")
+            return {}
+        out: dict = {}
+        for key, val in raw.items():
+            if not isinstance(key, str) or "." not in key:
+                logger.warning(f"[viz_scenario] force_gain key {key!r} not 'sim.<x>' / 'real.<x>'; skip")
+                continue
+            src, _, ch = key.partition(".")
+            src = src.strip().lower()
+            ch = ch.strip()
+            if src not in ("sim", "real") or not ch:
+                logger.warning(f"[viz_scenario] force_gain key {key!r} invalid; skip")
+                continue
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                logger.warning(f"[viz_scenario] force_gain[{key!r}] = {val!r} not numeric; skip")
+                continue
+            if not math.isfinite(f) or f <= 0.0:
+                logger.warning(f"[viz_scenario] force_gain[{key!r}] = {f} must be positive finite; skip")
+                continue
+            out[(src, ch)] = f
+        return out
+
+    @staticmethod
+    def _parse_force_invert(raw) -> frozenset:
+        """``force_invert`` list → frozenset of (source, channel) tuple.
+
+        JSON form: ``["sim.<channel>", "real.<topic_id>", ...]``. 각 항목 검증:
+        dotted prefix 가 ``sim``/``real`` 이고 채널명이 비어있지 않아야 함.
+        실패한 항목은 WARNING 한 줄 + skip.
+        """
+        if not raw:
+            return frozenset()
+        if not isinstance(raw, list):
+            logger.warning(f"[viz_scenario] force_invert must be list, got {type(raw).__name__}; ignored")
+            return frozenset()
+        out = set()
+        for entry in raw:
+            if not isinstance(entry, str) or "." not in entry:
+                logger.warning(f"[viz_scenario] force_invert entry {entry!r} not 'sim.<x>' / 'real.<x>'; skip")
+                continue
+            src, _, ch = entry.partition(".")
+            src = src.strip().lower()
+            ch = ch.strip()
+            if src not in ("sim", "real") or not ch:
+                logger.warning(f"[viz_scenario] force_invert entry {entry!r} invalid; skip")
+                continue
+            out.add((src, ch))
+        return frozenset(out)
+
+    @staticmethod
     def _parse_force_triggers(raw: dict) -> dict:
         """JSON 의 force_triggers section 을 internal dict 로 변환.
 
@@ -1717,6 +1789,10 @@ class CsvReplayer:
                 self._set_force_prim_visible(viz, sanitized_pair, "sim", False)
                 continue
             vec = vec_arr[idx]
+            sign = -1.0 if ("sim", sanitized_pair) in self._force_invert else 1.0
+            gain = sign * self._force_gain.get(("sim", sanitized_pair), 1.0)
+            if gain != 1.0:
+                vec = (float(vec[0]) * gain, float(vec[1]) * gain, float(vec[2]) * gain)
             origin_arr = reader.pair_contact_pos.get(sanitized_pair)
             origin = origin_arr[idx] if origin_arr is not None else (0.0, 0.0, 0.0)
             self._set_or_add(viz, sanitized_pair, "sim", origin, vec)
@@ -1730,9 +1806,11 @@ class CsvReplayer:
             mag = float(agg["mag"][idx])
             normal = agg["normal"][idx]
             origin = agg["origin"][idx]
-            vec = (-float(normal[0]) * mag,
-                   -float(normal[1]) * mag,
-                   -float(normal[2]) * mag)
+            sign = 1.0 if ("sim", tag) in self._force_invert else -1.0
+            k = sign * self._force_gain.get(("sim", tag), 1.0)
+            vec = (k * float(normal[0]) * mag,
+                   k * float(normal[1]) * mag,
+                   k * float(normal[2]) * mag)
             self._set_or_add(viz, tag, "sim", origin, vec)
             self._cache_sim_origin(tag, origin)
 
@@ -1787,6 +1865,12 @@ class CsvReplayer:
 
             f_chest = force_arr[real_idx]
             f_world = self._xform_vec_chest_to_world(f_chest, chest_mat)
+            sign = -1.0 if ("real", topic_id) in self._force_invert else 1.0
+            gain = sign * self._force_gain.get(("real", topic_id), 1.0)
+            if gain != 1.0:
+                f_world = (float(f_world[0]) * gain,
+                           float(f_world[1]) * gain,
+                           float(f_world[2]) * gain)
 
             cpos_arr = real_reader.topic_contact_pos.get(topic_id)
             if cpos_arr is not None:

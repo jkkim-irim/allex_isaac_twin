@@ -40,6 +40,7 @@ def _tup3(v) -> tuple:
 # 색상
 # ---------------------------------------------------------------------------
 REAL_COLOR = _tup3(_cfg["colors"]["real"])
+# SIM_COLOR = (0.0, 0.8, 0.0)  # green override — force vector + torque ring 둘 다 적용
 SIM_COLOR = _tup3(_cfg["colors"]["sim"])
 
 
