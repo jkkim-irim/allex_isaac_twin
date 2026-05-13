@@ -664,22 +664,24 @@ def compute_thumb_K_j(
 # Newton 의 내부 clip 도 이중 안전망으로 활용.
 #
 # 모드:
-#   pd_mode = 0 (motor_space, Y) — q_m = J·q 변환 후 motor-domain PD.
+#   pd_mode = 0 (motor_space, Y) — q_m = f(q) (비선형 FK) 변환 후 motor-domain PD.
 #   pd_mode = 1 (joint_space_diag, X) — joint-domain diag K_j=Σ J[k,i]²·K_m[k]
 #                                       로 PD 계산 후 J⁻ᵀ 로 motor 변환.
 # scalar 그룹은 X≡Y 라 모드 분기 없음. coupled (elbow/wrist/finger/thumb)
 # 에서만 분기 발생.
 #
-# 비-mech-comp motor 의 처리 흐름:
-#   q_m, qt_m = J·q, J·qt   (Y 모드)
-#   τ_m_pd    = K_m·(qt_m−q_m) + Kv_m·(qdt_m−qd_m)
-#   g_m       = J⁻ᵀ · g_j
-#   τ_m_des   = τ_m_pd + g_m
-#   τ_m_clip  = clamp(τ_m_des, ±τ_m_max)
-#   τ_j_clip  = Jᵀ · τ_m_clip
-#   joint_f   = τ_j_clip − g_j         (MuJoCo passive 가 g_j 다시 더함)
-#   safety    = |J|ᵀ · τ_m_max
-#   joint_f   = clamp(joint_f, ±safety)
+# 비-mech-comp motor 의 처리 흐름 (position 은 비선형 FK, velocity/torque 만 Jacobian):
+#   q_m, qt_m   = f(q), f(qt)               # wrist/finger/thumb 는 다항식 FK
+#                                            # elbow 는 J 상수라 f(q)=J·q
+#   qd_m, qdt_m = J·qd, J·qdt               # J = ∂f/∂q
+#   τ_m_pd      = K_m·(qt_m−q_m) + Kv_m·(qdt_m−qd_m)
+#   g_m         = J⁻ᵀ · g_j
+#   τ_m_des     = τ_m_pd + g_m
+#   τ_m_clip    = clamp(τ_m_des, ±τ_m_max)
+#   τ_j_clip    = Jᵀ · τ_m_clip
+#   joint_f     = τ_j_clip − g_j            # MuJoCo passive 가 g_j 다시 더함
+#   safety      = |J|ᵀ · τ_m_max
+#   joint_f     = clamp(joint_f, ±safety)
 # mech-comp motor: gravcomp 합산 단계 skip (scalar 그룹 내부에서만).
 
 
