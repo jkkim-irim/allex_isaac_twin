@@ -10,7 +10,7 @@
     "gain_shoulder": 0.05,
     "gain_elbow": 0.06,
     "gain_wrist": 0.08,
-    "gain_finger": 0.25,
+    "gain_finger": 6.0,
     "min_scale": 0.03,
     "max_scale": 3.0,
     "ring_offset_along_axis": {
@@ -26,10 +26,10 @@
   },
   "force": {
     "_doc": "force arrow scale = clip(|F|*gain, min_scale, max_scale). hide_below 미만이면 화살표 prim 을 visible=false 로.",
-    "gain": 2.0,
+    "gain": 20.0,
     "min_scale": -60.0,
     "max_scale": 60.0,
-    "hide_below": 1.0
+    "hide_below": 6.0
   },
   "ext_torque": {
     "_doc": "외력 wrench 의 torque (Nm) 시각화 — contact_pos 중심 free-floating torque ring (arrow 아님). ring 의 +Z 축 = torque 벡터 방향, scale = clip(|τ|*gain, min_scale, max_scale). |τ|<hide_below 이면 ring 전체 invisible (Nm 단위). 기존 joint torque ring 과 prim 분리: /World/AllexTorqueRing/<source>/<name>. color_real/sim 가 null 이면 colors.real/sim 사용.",
@@ -70,7 +70,7 @@
     "_doc": "TorquePlotter rolling window / y-axis 설정. window_seconds 는 body/hand 공통. y_lim_<subset> 은 null 이면 autoscale, [ymin, ymax] (Nm) 이면 고정. 잘못된 형식이면 autoscale fallback.",
     "window_seconds": 20.0,
     "y_lim_body": null,
-    "y_lim_hand": [-1.0, 2.0],
+    "y_lim_hand": null,
     "subsets": {
       "_doc": "TorquePlotter subset 별 subplot 정의. 키 = subset 명 ('body'|'hand' 등 TorquePlotter(subset=...) 인자와 매칭). 값 = subplot 들의 list, 각 entry = {'name': subplot 제목, 'joints': USD dof_name 의 list}. dof_names 에 없는 joint 는 자동 drop. subsets 자체가 없거나 비어있으면 regex 기반 fallback (hand → Hand L/R 전체, body → Arm L/R + Waist+Neck).",
       "body": [
@@ -95,51 +95,15 @@
         {
           "name": "Hand L",
           "joints": [
-            "L_Thumb_Yaw_Joint",
-            "L_Thumb_CMC_Joint",
-            "L_Thumb_MCP_Joint",
-            "L_Thumb_IP_Joint",
-            "L_Index_ABAD_Joint",
             "L_Index_MCP_Joint",
-            "L_Index_PIP_Joint",
-            "L_Index_DIP_Joint",
-            "L_Middle_ABAD_Joint",
-            "L_Middle_MCP_Joint",
-            "L_Middle_PIP_Joint",
-            "L_Middle_DIP_Joint",
-            "L_Ring_ABAD_Joint",
-            "L_Ring_MCP_Joint",
-            "L_Ring_PIP_Joint",
-            "L_Ring_DIP_Joint",
-            "L_Little_ABAD_Joint",
-            "L_Little_MCP_Joint",
-            "L_Little_PIP_Joint",
-            "L_Little_DIP_Joint"
+            "L_Index_PIP_Joint"
           ]
         },
         {
           "name": "Hand R",
           "joints": [
-            "R_Thumb_Yaw_Joint",
-            "R_Thumb_CMC_Joint",
-            "R_Thumb_MCP_Joint",
-            "R_Thumb_IP_Joint",
-            "R_Index_ABAD_Joint",
             "R_Index_MCP_Joint",
-            "R_Index_PIP_Joint",
-            "R_Index_DIP_Joint",
-            "R_Middle_ABAD_Joint",
-            "R_Middle_MCP_Joint",
-            "R_Middle_PIP_Joint",
-            "R_Middle_DIP_Joint",
-            "R_Ring_ABAD_Joint",
-            "R_Ring_MCP_Joint",
-            "R_Ring_PIP_Joint",
-            "R_Ring_DIP_Joint",
-            "R_Little_ABAD_Joint",
-            "R_Little_MCP_Joint",
-            "R_Little_PIP_Joint",
-            "R_Little_DIP_Joint"
+            "R_Index_PIP_Joint"
           ]
         }
       ]

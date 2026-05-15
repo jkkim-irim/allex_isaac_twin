@@ -39,6 +39,11 @@ torque ring 은 user 토글.
     "real.arm_r":               0.5
   },
 
+  "force_origin": {
+    "real.arm_r":        "sim.L_Elbow__R_Palm_Back",
+    "real.hand_r_index": ["link:R_Index_Distal_Link", [0.0, 0.0, -0.02]]
+  },
+
   "ext_torque_triggers": {
     "real.arm_r":        [[33.0, 38.5]],
     "real.hand_l_thumb": "off"
@@ -226,6 +231,49 @@ CSV 값을 음수로 push 해서 화살표를 반대 방향으로 그리는 viz-
 - 누락된 채널은 1.0 (변화 없음).
 - `force_invert` 와 같이 쓰면 `vec → -vec * gain` (둘 다 적용).
 - 활성 시간창 (`force_triggers`) 안에서만 영향.
+
+### `force_origin` — Real force vector 의 world origin 을 다른 channel/link 에 anchor
+
+기본적으로 `real.<topic_id>` force vector 는 자기 토픽의 `contact_pos` 를 chest→world
+변환해서 origin 으로 쓴다 (`topic_contact_pos` 가 CSV 에 없으면 chest 위치로 fallback).
+**해당 origin 이 실제 contact 지점과 안 맞을 때** sim 채널의 contact 또는 임의 link
+의 world 위치에 origin 을 맞춘다. 매 frame dynamic — link/sim 채널이 움직이면 따라감.
+
+```json
+"force_origin": {
+  "real.arm_r":         "sim.L_Elbow__R_Palm_Back",
+  "real.hand_r_thumb":  "link:R_Thumb_Distal_Link",
+  "real.hand_r_index":  ["link:R_Index_Distal_Link", [0.0, 0.0, -0.02]]
+}
+```
+
+- **Key**: `real.<topic_id>` 만. sim 채널의 origin 은 CSV 가 결정하므로 override
+  불가.
+- **Value** — string 또는 `[string, [x, y, z]]` 배열:
+  - `"sim.<channel>"` — 그 sim 채널의 매 frame contact origin 따라감. sim push 가
+    real push 보다 먼저 호출되므로 같은 frame 값 보장. 활성 sim 채널이 없으면
+    fallback (CSV 기본 origin).
+  - `"link:<usd_link_name>"` — `/ALLEX/<usd_link_name>` 의 world transform.
+    Offset 없으면 **link 의 원점 = joint pivot** (보통 segment 의 base 쪽).
+    절대 경로가 필요하면 `"link:/some/abs/Path"`.
+  - `[string, [x, y, z]]` — 위 string 형식 + **link-local frame** offset (m).
+    link 의 worldMatrix 로 회전·평행이동돼서 anchor 가 link 표면/끝점 등 임의
+    위치로 옮겨짐. **link 의 origin 이 finger 의 시작 (joint pivot) 이므로**
+    손가락 끝/중앙을 찍으려면 거의 항상 offset 이 필요. (`sim.` alias 와
+    같이 쓰면 rotation 정보가 없어 offset 무시 + warning.)
+- 잘못된 entry (key 가 real 아님, value 가 위 형식 아님 등) 는 WARNING + skip.
+- 같은 topic 에 대해 inline alias (legacy: `force_triggers` 값 리스트에 `"sim.X"`
+  문자열 섞기) 와 `force_origin` 양쪽이 정의돼 있으면 **`force_origin` 우선** +
+  WARNING. 신규 코드는 `force_origin` 만 사용 권장.
+- link prim 이 stage 에 없거나 fabric worldMatrix 가 없으면 1회 WARNING 후
+  default origin fallback. (오타 디버깅 단서.)
+- Offset 좌표계는 **link local** (link 의 joint frame). USD Composer 또는
+  `asset/ALLEX/mjcf/ALLEX.xml` 의 `body pos`/child mesh transform 을 참고해서
+  대략값 잡고 한 번 돌려보면서 미세조정 추천.
+
+흔한 link 이름 예시 (`asset/ALLEX/mjcf/ALLEX.xml` 참조):
+`R_Index_Distal_Link`, `R_Thumb_Distal_Link`, `R_Middle_Distal_Link`,
+`L_Index_Distal_Link`, `Chest_Origin_Link`, `R_Palm_Link`, `L_Palm_Link` 등.
 
 ---
 

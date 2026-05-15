@@ -142,6 +142,8 @@ class CsvReplayer:
         #   "force_triggers":       {"real.<topic_id>"/"sim.<channel>": [[t_on, t_off], ...]}
         #   "force_invert":         ["sim.<channel>", ...]  — 방향 뒤집어 push (-vec)
         #   "force_gain":           {"sim.<channel>": 2.0, ...}  — 채널별 magnitude 배율
+        #   "force_origin":         {"real.<topic_id>": "sim.<ch>" | "link:<name>"}
+        #                            — real prim 의 world origin 을 sim 채널/link 로 anchor
         #   "ext_torque_triggers":  {"real.<topic_id>":                  [[t_on, t_off], ...]}
         #   "torque_ring_triggers": {"real": [...], "sim": [...]}
         # 각 섹션은 _parse_*_triggers 헬퍼로 검증·정규화 후 내부 dict 에 저장.
@@ -154,7 +156,9 @@ class CsvReplayer:
         # backward-compat: "ext_force_<topic_id>" 도 "real.<topic_id>" 로 해석 (warning 1회).
         # real.* value list 에 "sim.<channel>" 문자열이 섞여 있으면 origin-alias 로
         # 분리 — 활성 시간창 동안 real prim 의 origin 을 그 sim 의 최신 origin 으로 맞춤.
-        self._real_origin_alias: dict[str, str] = {}
+        # 권장: 새 force_origin 블록 사용 (아래). inline 방식은 backward-compat.
+        # 내부 storage: {topic_id: ("sim", channel)} 또는 {topic_id: ("link", link_name)}.
+        self._real_origin_alias: dict[str, tuple] = {}
         clean_force_triggers = self._extract_real_origin_aliases(
             viz_scenario.get("force_triggers") or {}, self._real_origin_alias
         )
@@ -162,6 +166,18 @@ class CsvReplayer:
         # 매 _push_force_frame_sim 호출 시 sim 채널별 최신 origin 캐시 —
         # _push_real_force_routed 가 alias resolve 할 때 lookup.
         self._sim_origin_cache: dict = {}
+        # --- force_origin 파싱 (권장 방식, inline alias 보다 우선) ---
+        # JSON form: {"real.<id>": "sim.<channel>" | "link:<usd_link_name>"}.
+        #   - "sim.<ch>"   → 기존 alias (sim CSV channel 의 contact origin 따라감)
+        #   - "link:<name>" → /ALLEX/<name> 의 world translation 매 frame query
+        #                     ("link:/abs/path" 도 허용)
+        # 같은 topic_id 가 inline + force_origin 양쪽 있으면 force_origin 우선 + warning.
+        self._parse_force_origin(
+            viz_scenario.get("force_origin") or {}, self._real_origin_alias
+        )
+        # link alias 의 usdrt prim cache — 매 frame stage lookup 회피.
+        self._link_origin_rt_cache: dict[str, object] = {}
+        self._link_origin_warned: set[str] = set()
         # --- force_invert 파싱 ---
         # JSON form: ["sim.<channel>", "real.<topic_id>", ...] — 해당 채널의 force vec 를
         # 음수로 push (시각화 방향 반전). 내부 storage = frozenset of (source, name) tuple.
@@ -213,10 +229,13 @@ class CsvReplayer:
                 f"ext_joint_torque={len(self._ext_jtq_triggers)}ch"
             )
         if self._real_origin_alias:
+            def _fmt(k, entry):
+                kind, v, off = entry
+                suf = "" if off is None else f" +offset{off}"
+                return f"real.{k} <- {kind}:{v}{suf}"
             logger.info(
                 "[replay] real-force origin aliases: "
-                + ", ".join(f"real.{k} <- sim.{v}"
-                            for k, v in self._real_origin_alias.items())
+                + ", ".join(_fmt(k, e) for k, e in self._real_origin_alias.items())
             )
         # DataPlotter 인스턴스(들). plot 도 CSV 값을 보여주려면 sim tau / real dict
         # override 를 매 step 흘려야 함.
@@ -1482,9 +1501,109 @@ class CsvReplayer:
                     continue
                 kept.append(item)
             if sim_alias is not None and topic_id:
-                alias_out[topic_id] = sim_alias
+                alias_out[topic_id] = ("sim", sim_alias, None)
             out[raw_key] = kept
         return out
+
+    @staticmethod
+    def _parse_force_origin(raw, alias_out: dict) -> None:
+        """``force_origin`` dict → ``alias_out`` (in-place merge).
+
+        JSON form::
+
+            "force_origin": {
+              "real.arm_r":        "sim.L_Elbow__R_Palm_Back",
+              "real.hand_r_index": ["link:R_Index_Distal_Link", [0.0, 0.0, -0.02]]
+            }
+
+        값 형식:
+          - 문자열 ``"sim.<channel>"`` → ``("sim", channel, None)`` — sim CSV
+            채널의 contact origin 을 매 frame 따라감.
+          - 문자열 ``"link:<name>"``   → ``("link", name, None)`` — ``/ALLEX/<name>``
+            (또는 ``"link:/abs"`` 절대 경로) 의 world translation.
+          - 배열 ``[<str>, [x, y, z]]`` → 첫 원소는 위 두 string 형식 중 하나,
+            두 번째는 **link-local frame** 의 offset (m). link 의 worldMatrix 로
+            회전·평행이동돼서 anchor 가 link 표면/끝점 등 임의 위치로 옮겨짐.
+            ``sim.`` 와 같이 쓰면 offset 은 무시 + warning (sim alias 는 rotation
+            정보 미보유).
+
+        키는 ``real.<topic_id>`` 만 허용. force_triggers inline alias 와 겹치면
+        force_origin 우선 + warning.
+        """
+        if not raw:
+            return
+        if not isinstance(raw, dict):
+            logger.warning(
+                f"[viz_scenario] force_origin must be dict, got "
+                f"{type(raw).__name__}; ignored"
+            )
+            return
+        for key, val in raw.items():
+            if not isinstance(key, str) or not key.startswith("real."):
+                logger.warning(
+                    f"[viz_scenario] force_origin key {key!r} must be 'real.<id>'; skip"
+                )
+                continue
+            topic_id = key.split(".", 1)[1].strip()
+            if not topic_id:
+                logger.warning(f"[viz_scenario] force_origin key {key!r} empty topic; skip")
+                continue
+            spec_str: Optional[str] = None
+            offset: Optional[tuple] = None
+            if isinstance(val, str):
+                spec_str = val
+            elif isinstance(val, list) and len(val) == 2 and isinstance(val[0], str):
+                spec_str = val[0]
+                off_raw = val[1]
+                if (isinstance(off_raw, (list, tuple)) and len(off_raw) == 3):
+                    try:
+                        offset = (float(off_raw[0]), float(off_raw[1]),
+                                  float(off_raw[2]))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"[viz_scenario] force_origin[{key!r}] offset "
+                            f"{off_raw!r} not numeric; ignored"
+                        )
+                        offset = None
+                else:
+                    logger.warning(
+                        f"[viz_scenario] force_origin[{key!r}] offset must be "
+                        f"[x, y, z] list of 3 floats; ignored"
+                    )
+            else:
+                logger.warning(
+                    f"[viz_scenario] force_origin[{key!r}] = {val!r} not "
+                    f"string or [string, [x,y,z]]; skip"
+                )
+                continue
+            s = spec_str.strip()
+            parsed: Optional[tuple] = None
+            if s.lower().startswith("sim."):
+                target = s[4:].strip()
+                if target:
+                    if offset is not None:
+                        logger.warning(
+                            f"[viz_scenario] force_origin[{key!r}]: offset "
+                            f"ignored for sim alias (rotation 미보유)"
+                        )
+                        offset = None
+                    parsed = ("sim", target, None)
+            elif s.lower().startswith("link:"):
+                target = s[5:].strip()
+                if target:
+                    parsed = ("link", target, offset)
+            if parsed is None:
+                logger.warning(
+                    f"[viz_scenario] force_origin[{key!r}] spec {spec_str!r} not "
+                    f"'sim.<ch>' or 'link:<name>'; skip"
+                )
+                continue
+            if topic_id in alias_out and alias_out[topic_id] != parsed:
+                logger.warning(
+                    f"[viz_scenario] force_origin overrides inline alias for "
+                    f"real.{topic_id}: {alias_out[topic_id]} → {parsed}"
+                )
+            alias_out[topic_id] = parsed
 
     @staticmethod
     def _parse_force_gain(raw) -> dict:
@@ -1881,18 +2000,27 @@ class CsvReplayer:
                            float(chest_mat[3][1]),
                            float(chest_mat[3][2]))
 
-            # Origin alias — 활성 시간창 동안 real prim 의 origin 을 매핑된 sim
-            # 채널의 최신 origin 으로 덮어쓴다. sim push 가 _apply_at 안에서 real
-            # push 보다 먼저 호출되므로 cache 는 이 시점에 같은 frame 의 sim 값을 갖고 있음.
+            # Origin alias — 활성 시간창 동안 real prim 의 origin 을 매핑된 target
+            # 의 world 위치로 덮어쓴다.
+            #   ("sim",  ch, None)   → _sim_origin_cache lookup. sim push 가
+            #                          _apply_at 안에서 real push 보다 먼저
+            #                          호출돼 same-frame 값 보장.
+            #   ("link", nm, off|None) → /ALLEX/<nm> 의 worldMatrix. off 있으면
+            #                            link-local offset 을 worldMatrix 로 변환.
             alias_target = self._real_origin_alias.get(topic_id)
             if alias_target is not None:
-                sim_origin = self._sim_origin_cache.get(alias_target)
-                if sim_origin is not None:
-                    p_world = sim_origin
+                kind, name, off = alias_target
+                resolved: Optional[tuple] = None
+                if kind == "sim":
+                    resolved = self._sim_origin_cache.get(name)
+                elif kind == "link":
+                    resolved = self._resolve_link_world_position(name, off)
+                if resolved is not None:
+                    p_world = resolved
                 elif self._step_count % 200 == 0:
                     logger.debug(
                         f"[replay] real.{topic_id} origin alias "
-                        f"'sim.{alias_target}' not cached yet"
+                        f"'{kind}:{name}' not resolved this frame"
                     )
 
             self._set_or_add(viz, topic_id, "real", p_world, f_world)
@@ -2038,6 +2166,81 @@ class CsvReplayer:
                 pass
         except Exception as exc:
             logger.debug(f"[replay] torque ring visibility toggle warn: {exc}")
+
+    def _resolve_link_world_position(self, link_name: str,
+                                     offset_local: Optional[tuple] = None
+                                     ) -> Optional[tuple]:
+        """``force_origin: "link:<name>"`` resolve — link 의 world 위치.
+
+        path 규칙:
+          - ``link_name`` 가 '/' 로 시작하면 그대로 사용 (절대 경로).
+          - 그 외엔 ``/ALLEX/<link_name>``.
+
+        매 frame ``omni:fabric:worldMatrix`` (row-major, translation in row 3)
+        를 읽는다. ``offset_local`` 이 주어지면 link-local 좌표를 worldMatrix 로
+        변환해서 anchor 를 link 표면/끝점 등으로 옮긴다 (없으면 link 원점 =
+        joint pivot).
+        실패 (stage 미준비/prim 없음/attr 없음/NaN) → None + 1회 WARNING.
+        """
+        if not link_name:
+            return None
+        cache_key = link_name
+        try:
+            import omni.usd
+            import usdrt
+        except Exception:
+            return None
+        if getattr(self, "_rt_stage", None) is None:
+            try:
+                stage_id = omni.usd.get_context().get_stage_id()
+                self._rt_stage = usdrt.Usd.Stage.Attach(stage_id)
+            except Exception:
+                return None
+            if self._rt_stage is None:
+                return None
+        rt_prim = self._link_origin_rt_cache.get(cache_key)
+        if rt_prim is None:
+            path = link_name if link_name.startswith("/") else f"/ALLEX/{link_name}"
+            try:
+                rt_prim = self._rt_stage.GetPrimAtPath(usdrt.Sdf.Path(path))
+            except Exception as exc:
+                if cache_key not in self._link_origin_warned:
+                    logger.warning(f"[replay] force_origin link lookup '{path}': {exc}")
+                    self._link_origin_warned.add(cache_key)
+                return None
+            if not rt_prim:
+                if cache_key not in self._link_origin_warned:
+                    logger.warning(
+                        f"[replay] force_origin link prim missing: '{path}' "
+                        f"(real.* origin alias will fall back to default)"
+                    )
+                    self._link_origin_warned.add(cache_key)
+                return None
+            self._link_origin_rt_cache[cache_key] = rt_prim
+        try:
+            attr = rt_prim.GetAttribute("omni:fabric:worldMatrix")
+            if not attr or not attr.IsValid():
+                return None
+            mat = attr.Get()
+            if mat is None:
+                return None
+            if offset_local is None:
+                wx = float(mat[3][0])
+                wy = float(mat[3][1])
+                wz = float(mat[3][2])
+            else:
+                # row-major: world_pt = local_pt * mat (translation in row 3).
+                lx, ly, lz = (float(offset_local[0]), float(offset_local[1]),
+                              float(offset_local[2]))
+                wx = lx * mat[0][0] + ly * mat[1][0] + lz * mat[2][0] + mat[3][0]
+                wy = lx * mat[0][1] + ly * mat[1][1] + lz * mat[2][1] + mat[3][1]
+                wz = lx * mat[0][2] + ly * mat[1][2] + lz * mat[2][2] + mat[3][2]
+                wx, wy, wz = float(wx), float(wy), float(wz)
+        except Exception:
+            return None
+        if not (np.isfinite(wx) and np.isfinite(wy) and np.isfinite(wz)):
+            return None
+        return (wx, wy, wz)
 
     def _cache_sim_origin(self, channel: str, origin) -> None:
         """현재 sim push 의 origin 을 채널별 캐시. real-side origin alias 가 lookup."""

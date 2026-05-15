@@ -18,8 +18,8 @@ rosbag2 → CSV 변환기. 두 가지 출력 포맷 지원.
   Real/Sim Replay 패널이 읽는 단일 full-robot CSV (showcase_logger 와 동일 포맷).
   - 행 = 시점 (rosbag 절대 timestamp 기준 상대시간)
   - 컬럼: time, pos_<joint_full_name> [rad], torque_<joint_full_name> [Nm]
-  - Position 출처: joint_positions_deg (current = measured, deg→rad)
-  - Torque 출처:   /result/<group>/joint/torque  (필터된 joint torque — outbound 대신)
+  - Position 출처: /result/<group>/joint/position  (필터된 joint position [rad] — outbound 대신)
+  - Torque 출처:   /result/<group>/joint/torque   (필터된 joint torque — outbound 대신)
   - 14 그룹 토픽을 union 시간축으로 합치고, 각 시점에서 해당 토픽의 최신 값 사용.
   - Contact / force_vec 컬럼은 rosbag 에 그 토픽이 없으면 자동 생략.
   Output:
@@ -71,12 +71,15 @@ CSV_GROUPS = (
 
 # 변환 대상 topic suffix → 저장 sub-folder ("" = 루트 = 재생용)
 # 재생은 joint_ang_target_deg(desired) 기본. 나머지는 추후 분석/비교용.
+# 주의: "joint_position" suffix 는 /result/<group>/joint/position [rad] 에서 옴
+# (outbound /robot_outbound_data/<group>/joint_positions_deg 는 skip).
+# 따라서 _current/<group>.csv 의 단위는 rad — 이전 deg 출력에서 변경됨.
 TOPIC_TO_SUBDIR = {
-    "joint_ang_target_deg":   "",                 # 재생 대상
-    "joint_positions_deg":    "_current",         # 실측 위치
-    "joint_torque":           "_torque",          # 실측 토크
-    "joint_velocities_deg_s": "_velocity",        # 실측 속도
-    "joint_trq_target":       "_torque_target",   # 목표 토크
+    "joint_ang_target_deg":   "",                 # 재생 대상 [deg]
+    "joint_position":         "_current",         # 실측 위치 [rad] (필터됨)
+    "joint_torque":           "_torque",          # 실측 토크 [Nm]
+    "joint_velocities_deg_s": "_velocity",        # 실측 속도 [deg/s]
+    "joint_trq_target":       "_torque_target",   # 목표 토크 [Nm]
 }
 # 변환 스킵 (재생·분석 모두 불필요): joint_output_deg, motor_*, servo_status,
 # control_mode, now_traj_file, traj_status, articulation_now, poses,
@@ -137,17 +140,31 @@ def _parse_bag(input_dir: str):
 
     # 관심 topic 필터:
     #
-    # 1) /robot_outbound_data/<group>/<suffix>  — pos / vel / target 등.
-    # 2) /result/<group>/joint/torque           — joint_torque 의 **필터된** 버전.
+    # 1) /robot_outbound_data/<group>/<suffix>  — vel / ang_target 등 (pos / torque 제외).
+    # 2) /result/<group>/joint/position         — 필터된 joint position [rad]. outbound
+    #    /robot_outbound_data/<group>/joint_positions_deg (deg, 필터 전) 대신 이쪽을 쓴다.
+    #    내부 dispatch suffix = "joint_position" — showcase CSV 의 pos_* 컬럼,
+    #    _current/<group>.csv 모두 필터된 rad 값을 사용 (이전 deg 출력에서 변경).
+    # 3) /result/<group>/joint/torque           — joint_torque 의 **필터된** 버전.
     #    /robot_outbound_data/<group>/joint_torque (raw motor cmd 잔차 포함) 대신
     #    이쪽을 쓴다. 동일 group / 동일 dispatch 경로 (suffix="joint_torque") 로
     #    내부 처리 → showcase CSV 의 torque_* 컬럼, _torque/<group>.csv 둘 다
     #    필터된 데이터를 사용하게 됨.
-    # 3) ext_force / contact_pos — 위 dict 매핑 그대로.
+    # 4) /result/<group>/joint/ext_torque       — per-joint external torque.
+    # 5) ext_force / contact_pos — 위 dict 매핑 그대로.
     keep = []
     topic_meta = {}  # topic → (group, suffix)
     for name in type_map:
         parts = name.strip("/").split("/")
+        # /result/<group>/joint/position (필터된 joint position [rad])
+        if (len(parts) == 4 and parts[0] == "result"
+                and parts[2] == "joint" and parts[3] == "position"):
+            group = parts[1]
+            if group not in CSV_GROUPS:
+                continue
+            keep.append(name)
+            topic_meta[name] = (group, "joint_position")
+            continue
         # /result/<group>/joint/torque (필터된 joint torque)
         if (len(parts) == 4 and parts[0] == "result"
                 and parts[2] == "joint" and parts[3] == "torque"):
@@ -168,13 +185,16 @@ def _parse_bag(input_dir: str):
             keep.append(name)
             topic_meta[name] = (group, "joint_ext_torque")
             continue
-        # /robot_outbound_data/<group>/<suffix>  (단 joint_torque 는 위에서 처리)
+        # /robot_outbound_data/<group>/<suffix>  (단 joint_torque / joint_positions_deg 는 위에서 처리)
         if len(parts) == 3 and parts[0] == "robot_outbound_data":
             group, suffix = parts[1], parts[2]
             if group not in CSV_GROUPS:
                 continue
             if suffix == "joint_torque":
                 # raw torque skip — 필터된 /result/<group>/joint/torque 만 쓴다.
+                continue
+            if suffix == "joint_positions_deg":
+                # raw position skip — 필터된 /result/<group>/joint/position [rad] 만 쓴다.
                 continue
             if suffix not in TOPIC_TO_SUBDIR:
                 continue
@@ -317,8 +337,6 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     이 범위는 모든 publisher 가 publish 중인 구간이라 전 row 가 빈 셀 없이 채워짐.
     각 컬럼은 해당 시점 기준 nearest-prior lookup.
     """
-    import math
-
     # 1) joint full name 등장 순서 보존.
     column_joint_order: list[str] = []
     for group, names in ALLEX_CSV_JOINT_NAMES.items():
@@ -327,13 +345,14 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     # 2) Per-joint stream: full_name → list[(t_ns, value)] (pos / torque 따로).
     #
     # 토픽 → 컬럼 매핑 표 (group 별 N 개 joint, ALLEX_CSV_JOINT_NAMES 순서대로 인덱싱):
-    #   /robot_outbound_data/<group>/joint_positions_deg [deg]
-    #       → pos_<full_joint_name>   (deg → rad 변환)
+    #   /result/<group>/joint/position                   [rad]  ← 필터된 joint position
+    #       → pos_<full_joint_name>    (단위 그대로)
     #   /result/<group>/joint/torque                     [Nm]   ← 필터된 joint torque
     #       → torque_<full_joint_name> (단위 그대로)
-    # _parse_bag 가 /result/<group>/joint/torque 를 (group, "joint_torque") 로 매핑하므로
-    # 아래 `suffix == "joint_torque"` 분기는 그대로 동작. raw 잔차 포함된
-    # /robot_outbound_data/<group>/joint_torque 는 _parse_bag 에서 skip 됨.
+    # _parse_bag 가 /result/<group>/joint/{position,torque} 를 (group, "joint_position"
+    # /"joint_torque") 로 매핑하므로 아래 분기 두 개로 처리. raw 잔차 포함된
+    # /robot_outbound_data/<group>/{joint_positions_deg, joint_torque} 는
+    # _parse_bag 에서 명시적으로 skip 됨.
     pos_streams: dict[str, list] = {n: [] for n in column_joint_order}
     trq_streams: dict[str, list] = {n: [] for n in column_joint_order}
     # ext_joint_torque streams — column key = joint_full_name. EXT_TORQUE_JOINT_NAMES
@@ -396,9 +415,9 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
         joint_names = ALLEX_CSV_JOINT_NAMES.get(group)
         if joint_names is None:
             continue
-        if suffix == "joint_positions_deg":
+        if suffix == "joint_position":
             target = pos_streams
-            scale = math.pi / 180.0  # deg → rad
+            scale = 1.0  # /result/<group>/joint/position 는 이미 rad
         elif suffix == "joint_torque":
             target = trq_streams
             scale = 1.0
@@ -423,7 +442,7 @@ def _write_showcase_csv(out_path: Path, data: dict, topic_meta: dict,
     active_trq_joints = [n for n in column_joint_order if trq_streams[n]]
     active_ext_trq_joints = [n for n in ext_torque_joint_order if ext_trq_streams[n]]
     if not active_pos_joints:
-        print("[ERROR] showcase 모드: joint_positions_deg 데이터가 없습니다.")
+        print("[ERROR] showcase 모드: /result/<group>/joint/position 데이터가 없습니다.")
         return 0
 
     # 4) Intersection range = max(first_t) ~ min(last_t) — 모든 stream 이 valid 한 구간.
