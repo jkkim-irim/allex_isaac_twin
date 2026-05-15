@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
 
@@ -219,14 +219,23 @@ class CsvReplayer:
             viz_scenario.get("ext_joint_torque_triggers") or {}
         )
 
+        # --- trail_triggers 파싱 ---
+        # JSON form: {"sim.<channel>": N | [[t_on,t_off],...] | "off", ...}
+        # 내부 dict 키 = (source, channel), 값 = ("window", float N) | ("ranges", list[(t_on,t_off)]).
+        self._trail_triggers: dict = self._parse_trail_triggers(
+            viz_scenario.get("trail_triggers") or {}
+        )
+
         if (self._force_triggers or self._ext_torque_triggers
-                or self._torque_ring_triggers or self._ext_jtq_triggers):
+                or self._torque_ring_triggers or self._ext_jtq_triggers
+                or self._trail_triggers):
             logger.info(
                 f"[replay] viz_scenario loaded: "
                 f"force={len(self._force_triggers)}ch, "
                 f"ext_torque={len(self._ext_torque_triggers)}ch, "
                 f"torque_ring={len(self._torque_ring_triggers)}ch, "
-                f"ext_joint_torque={len(self._ext_jtq_triggers)}ch"
+                f"ext_joint_torque={len(self._ext_jtq_triggers)}ch, "
+                f"trail={len(self._trail_triggers)}ch"
             )
         if self._real_origin_alias:
             def _fmt(k, entry):
@@ -411,6 +420,15 @@ class CsvReplayer:
         # custom torque ring 등록 상태 (ext_torque ring 전용).
         self._registered_torque_ring_keys: set[tuple[str, str]] = set()
 
+        # trail viz 상태 ─────────────────────────────────────────────
+        # key = (source, channel). window mode → deque[(t, x, y, z)] 로 시간 기반 정리.
+        # ranges mode → list[list[(t, x, y, z)]] (각 range 별 segment).
+        self._trail_buffers: dict[tuple[str, str], object] = {}
+        # ranges mode 만 사용 — range 별 freeze flag.
+        self._trail_freeze: dict[tuple[str, str], list[bool]] = {}
+        # add_custom_trail 된 key 추적 (lifecycle remove 용).
+        self._registered_trail_keys: set[tuple[str, str]] = set()
+
         # debug pause/resume 용 — wall-clock baseline 보정.
         self._pause_t: Optional[float] = None
 
@@ -495,6 +513,18 @@ class CsvReplayer:
 
         # 재시작 안전화: 이전 run 이 남긴 stale state 명시 reset.
         self._registered_force_keys.clear()
+        # 이전 run 의 trail prim 도 명시 제거 + buffer/freeze 초기화 — replay
+        # 두 번째 run 의 frame 0 에서 prim 이 빈 상태로 시작하도록.
+        viz_for_reset = self._viz
+        if viz_for_reset is not None and hasattr(viz_for_reset, "remove_custom_trail"):
+            for src, nm in list(self._registered_trail_keys):
+                try:
+                    viz_for_reset.remove_custom_trail(nm, src)
+                except Exception as exc:
+                    logger.debug(f"[replay] remove_custom_trail warn: {exc}")
+        self._registered_trail_keys.clear()
+        self._trail_buffers.clear()
+        self._trail_freeze.clear()
         self._torque_gate_prev.clear()
         self._paused = False
         self._pause_t = None
@@ -611,6 +641,13 @@ class CsvReplayer:
                     viz.remove_custom_force_vector(name, source=src)
                 except Exception as exc:
                     logger.debug(f"[replay] remove_custom_force_vector warn: {exc}")
+            # Trail prim 도 동일하게 제거.
+            if hasattr(viz, "remove_custom_trail"):
+                for src, nm in list(self._registered_trail_keys):
+                    try:
+                        viz.remove_custom_trail(nm, src)
+                    except Exception as exc:
+                        logger.debug(f"[replay] remove_custom_trail warn: {exc}")
             # torque ring lock 해제 — 정상 sim 측정이 다시 ring 을 갱신하도록.
             if hasattr(viz, "set_external_torque_sources"):
                 try:
@@ -638,6 +675,9 @@ class CsvReplayer:
             except Exception as exc:
                 logger.debug(f"[replay] plotter override clear warn: {exc}")
         self._registered_force_keys.clear()
+        self._registered_trail_keys.clear()
+        self._trail_buffers.clear()
+        self._trail_freeze.clear()
         # contact-local CSV flush (flag on 일 때만).
         if self._export_records is not None:
             try:
@@ -1865,6 +1905,82 @@ class CsvReplayer:
                 out[(ch, region)] = clean
         return out
 
+    @staticmethod
+    def _parse_trail_triggers(raw) -> dict:
+        """trail_triggers section parser.
+
+        Key form (force_triggers 와 동일 dotted form):
+          - ``"real.<topic_id>"`` / ``"sim.<channel>"``
+
+        Value 형식:
+          - ``N`` (positive finite scalar, int/float — bool 제외):
+              tagged = ``("window", float(N))`` — rolling time window N s.
+          - ``[[t_on, t_off], ...]`` (list-of-list):
+              tagged = ``("ranges", [(t_on, t_off), ...])`` — 각 segment 동안
+              점 누적, t_off 후 freeze.
+          - ``"off"`` / ``false`` / ``[]`` :
+              tagged = ``("ranges", [])`` — explicit OFF sentinel (force_triggers
+              와 동일).
+          - 단일 ``[t_on, t_off]`` (평탄화) 은 받지 않음 — list-of-list 만.
+
+        Returns: ``dict[(source, channel) -> tagged]``.
+        """
+        if not isinstance(raw, dict):
+            return {}
+        out: dict = {}
+        for raw_key, val in raw.items():
+            if not isinstance(raw_key, str):
+                continue
+            source: Optional[str] = None
+            channel: Optional[str] = None
+            if "." in raw_key:
+                src_part, ch_part = raw_key.split(".", 1)
+                src_part = src_part.strip()
+                ch_part = ch_part.strip()
+                if src_part in ("real", "sim") and ch_part:
+                    source, channel = src_part, ch_part
+            if source is None or channel is None:
+                logger.warning(
+                    f"[replay] trail_trigger key {raw_key!r} 은 "
+                    f"'real.<id>' / 'sim.<id>' 형태여야 합니다. skip."
+                )
+                continue
+            # OFF sentinel (scalar 검사 전에 평가 — False 가 number 로 잡히지 않도록).
+            is_off = (val is False
+                      or (isinstance(val, str) and val.strip().lower() == "off")
+                      or (isinstance(val, list) and len(val) == 0))
+            if is_off:
+                out[(source, channel)] = ("ranges", [])
+                continue
+            # Scalar window mode — bool 제외 (False 는 위에서 잡힘, True 도 거부).
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                try:
+                    n = float(val)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"[replay] trail_trigger {raw_key!r}: window value 변환 실패. skip."
+                    )
+                    continue
+                if not (math.isfinite(n) and n > 0.0):
+                    logger.warning(
+                        f"[replay] trail_trigger {raw_key!r}: window N 은 양의 finite "
+                        f"여야 합니다 (got {val!r}). skip."
+                    )
+                    continue
+                out[(source, channel)] = ("window", n)
+                continue
+            # Ranges mode — list-of-list 만 허용.
+            if isinstance(val, list):
+                clean = _validate_ranges(f"trail_trigger '{raw_key}'", val)
+                if clean:
+                    out[(source, channel)] = ("ranges", clean)
+                continue
+            logger.warning(
+                f"[replay] trail_trigger {raw_key!r}: 지원하지 않는 value 타입 "
+                f"{type(val).__name__} (scalar N / list-of-list / 'off' 만). skip."
+            )
+        return out
+
     def _reader_idx_for(self, source: str, idx_main: int,
                         sec_idx: Optional[int]) -> tuple:
         """source ('sim'/'real') 에 해당하는 (reader, idx) 리턴. 없으면 (None, None)."""
@@ -1914,6 +2030,7 @@ class CsvReplayer:
                 vec = (float(vec[0]) * gain, float(vec[1]) * gain, float(vec[2]) * gain)
             origin_arr = reader.pair_contact_pos.get(sanitized_pair)
             origin = origin_arr[idx] if origin_arr is not None else (0.0, 0.0, 0.0)
+            self._trail_buffer_push("sim", sanitized_pair, origin, t_rel)
             self._set_or_add(viz, sanitized_pair, "sim", origin, vec)
             self._cache_sim_origin(sanitized_pair, origin)
 
@@ -1930,6 +2047,7 @@ class CsvReplayer:
             vec = (k * float(normal[0]) * mag,
                    k * float(normal[1]) * mag,
                    k * float(normal[2]) * mag)
+            self._trail_buffer_push("sim", tag, origin, t_rel)
             self._set_or_add(viz, tag, "sim", origin, vec)
             self._cache_sim_origin(tag, origin)
 
@@ -2023,6 +2141,7 @@ class CsvReplayer:
                         f"'{kind}:{name}' not resolved this frame"
                     )
 
+            self._trail_buffer_push("real", topic_id, p_world, current_t_rel)
             self._set_or_add(viz, topic_id, "real", p_world, f_world)
 
     def _push_real_torque_routed(self, real_reader: ShowcaseReader,
@@ -2253,6 +2372,109 @@ class CsvReplayer:
         if not (np.isfinite(ox) and np.isfinite(oy) and np.isfinite(oz)):
             return
         self._sim_origin_cache[channel] = (ox, oy, oz)
+
+    def _estimate_reader_fps(self, source: str) -> float:
+        """Trail window 의 deque maxlen 추정용 CSV 샘플링 rate.
+
+        Window mode 에선 시간 기반 popleft 가 정확성을 책임지고, maxlen 은 단순한
+        memory cap 이라 fps 가 살짝 빗나가도 무방 (margin 으로 안전 마진).
+        sim 채널이면 main/sec 중 sim source 를 쓰는 reader, real 도 동일.
+        """
+        reader = None
+        if self._main_src == source:
+            reader = self._main
+        elif self._sec_src == source and self._sec is not None:
+            reader = self._sec
+        if reader is None or reader.num_samples < 2 or reader.duration_s <= 0.0:
+            return 200.0  # ALLEX twin 의 일반적 sim/real rate fallback.
+        return float(reader.num_samples - 1) / float(reader.duration_s)
+
+    def _trail_buffer_push(self, source: str, name: str,
+                            origin, t_rel: float) -> None:
+        """Trail 버퍼에 점 추가 + viz prim 갱신.
+
+        - ``self._trail_triggers[(source, name)]`` 가 없으면 즉시 return (활성 채널만).
+        - tagged == ``("window", N)`` → time-based rolling deque, oldest 점은
+          ``t < t_rel - N`` 이면 popleft.
+        - tagged == ``("ranges", ranges)`` → range 별 segment list. ``t_off`` 넘으면
+          freeze (이후 grow 안 함).
+        - 빈 버퍼/origin invalid 면 push 만 skip, prim 자체는 유지 (다음 sample 에 채워질
+          수 있음).
+        """
+        viz = self._viz
+        if viz is None:
+            return
+        key = (source, name)
+        tagged = self._trail_triggers.get(key)
+        if tagged is None:
+            return
+        try:
+            ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
+        except Exception:
+            return
+        if not (np.isfinite(ox) and np.isfinite(oy) and np.isfinite(oz)):
+            return
+
+        mode, param = tagged
+        # prim 최초 생성 (둘 다 비활성/빈 sentinel 이어도 prim 만 만들어 둠).
+        if key not in self._registered_trail_keys:
+            try:
+                if hasattr(viz, "add_custom_trail"):
+                    viz.add_custom_trail(name, source)
+                self._registered_trail_keys.add(key)
+            except Exception as exc:
+                logger.debug(f"[replay] add_custom_trail warn: {exc}")
+                return
+
+        if mode == "window":
+            n_sec = float(param)
+            buf = self._trail_buffers.get(key)
+            if buf is None:
+                fps = self._estimate_reader_fps(source)
+                maxlen = int(n_sec * fps) + 64
+                buf = deque(maxlen=maxlen)
+                self._trail_buffers[key] = buf
+            buf.append((t_rel, ox, oy, oz))
+            cutoff = t_rel - n_sec
+            while buf and buf[0][0] < cutoff:
+                buf.popleft()
+            points = [(p[1], p[2], p[3]) for p in buf]
+            try:
+                if hasattr(viz, "set_custom_trail"):
+                    viz.set_custom_trail(name, source, points)
+            except Exception as exc:
+                logger.debug(f"[replay] set_custom_trail warn: {exc}")
+            return
+
+        if mode == "ranges":
+            ranges = param
+            if not ranges:
+                return  # explicit OFF sentinel — prim 만 생성, 점 X.
+            segs = self._trail_buffers.get(key)
+            freeze = self._trail_freeze.get(key)
+            if segs is None:
+                segs = [[] for _ in ranges]
+                freeze = [False] * len(ranges)
+                self._trail_buffers[key] = segs
+                self._trail_freeze[key] = freeze
+            changed = False
+            for i, (t_on, t_off) in enumerate(ranges):
+                if freeze[i]:
+                    continue
+                if t_rel > t_off:
+                    freeze[i] = True
+                    continue
+                if t_on <= t_rel <= t_off:
+                    segs[i].append((ox, oy, oz))
+                    changed = True
+                # t_rel < t_on 이면 skip.
+            if changed:
+                try:
+                    if hasattr(viz, "set_custom_trail"):
+                        viz.set_custom_trail(name, source, segs)
+                except Exception as exc:
+                    logger.debug(f"[replay] set_custom_trail warn: {exc}")
+            return
 
     def _set_or_add(self, viz, name: str, source: str, origin, vec,
                     kind: str = "force") -> None:

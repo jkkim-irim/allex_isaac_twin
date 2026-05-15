@@ -184,6 +184,11 @@ class ForceTorqueVisualizer:
         #           "last_vec": (fx, fy, fz) or None}
         self._custom_force_prims: dict = {}
 
+        # Custom trail (BasisCurves) 테이블. key = "{source}::{name}".
+        # rec: {"prim", "prim_path", "source", "name"}. points 는 csv_replayer 측이
+        # 매 frame set_custom_trail 로 갱신 — visualizer 는 prim lifecycle 만 관리.
+        self._custom_trail_prims: dict = {}
+
         # 사용자 정의 custom torque ring 테이블 — free-floating ring (joint 가 아닌
         # contact_pos 같은 임의 위치 + 임의 axis). key = "{source}::{name}".
         # rec: {"prim", "prim_path", "parent_path", "source", "name",
@@ -1039,6 +1044,145 @@ class ForceTorqueVisualizer:
         추후 animated / time-varying vector 지원 시 여기서 step 별 갱신.
         """
         return
+
+    # ========================================
+    # Custom trail — replay 점 누적 BasisCurves (single linear curve, 단색)
+    # ========================================
+
+    @staticmethod
+    def _trail_key(name: str, source: str) -> str:
+        return f"{source}::{name}"
+
+    def add_custom_trail(self, name: str, source: str) -> str | None:
+        """Trail prim (UsdGeom.BasisCurves, linear) 을 session layer 에 생성.
+
+        ``points`` 는 빈 상태 (curveVertexCounts=[]) 로 author — RTX 가 0-vertex
+        curve 를 skip 한다. 점 누적은 ``set_custom_trail`` 가 담당.
+
+        prim path: ``/World/AllexForceViz/<source>/<name>_trail`` (force prim 형제).
+        Returns: 성공 시 prim path, 실패 시 None. 이미 존재하면 그 path 그대로 반환.
+        """
+        if not name:
+            logger.warning("[viz] add_custom_trail: name required")
+            return None
+        src = str(source).lower()
+        if src not in ("real", "sim", "user"):
+            logger.warning(f"[viz] add_custom_trail: invalid source '{source}'")
+            return None
+        key = self._trail_key(name, src)
+        rec = self._custom_trail_prims.get(key)
+        if rec is not None:
+            return rec.get("prim_path")
+        stage = self._get_stage()
+        if stage is None:
+            logger.warning("[viz] add_custom_trail: stage unavailable")
+            return None
+
+        from pxr import UsdGeom, Vt, Sdf, Gf
+
+        parent = f"{self.CUSTOM_FORCE_ROOT}/{src}"
+        prim_path = f"{parent}/{name}_trail"
+        color = self._SOURCE_COLOR.get(src, REAL_COLOR)
+
+        with self._session_edit():
+            parent_prim = stage.GetPrimAtPath(parent)
+            if not parent_prim or not parent_prim.IsValid():
+                stage.DefinePrim(parent, "Xform")
+            curves = UsdGeom.BasisCurves.Define(stage, Sdf.Path(prim_path))
+            curves.CreateTypeAttr().Set(UsdGeom.Tokens.linear)
+            curves.CreateWrapAttr().Set(UsdGeom.Tokens.nonperiodic)
+            curves.CreatePointsAttr().Set(Vt.Vec3fArray())
+            curves.CreateCurveVertexCountsAttr().Set(Vt.IntArray())
+            # 5 mm 두께 constant width.
+            widths_attr = curves.CreateWidthsAttr()
+            widths_attr.Set(Vt.FloatArray([0.005]))
+            curves.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+            # 단색 displayColor (constant interp, primvar).
+            primvars = UsdGeom.PrimvarsAPI(curves.GetPrim())
+            disp = primvars.CreatePrimvar(
+                "displayColor", Sdf.ValueTypeNames.Color3fArray,
+                UsdGeom.Tokens.constant,
+            )
+            disp.Set(Vt.Vec3fArray([Gf.Vec3f(float(color[0]),
+                                              float(color[1]),
+                                              float(color[2]))]))
+
+        self._custom_trail_prims[key] = {
+            "prim": curves.GetPrim(),
+            "prim_path": prim_path,
+            "source": src,
+            "name": name,
+        }
+        return prim_path
+
+    def set_custom_trail(self, name: str, source: str, points) -> bool:
+        """Trail prim 의 points / curveVertexCounts 갱신.
+
+        ``points`` 두 형태 지원:
+          - ``list[tuple[float,float,float]]`` (단일 curve, window mode):
+              vertexCounts=[len(points)] (len<2 면 [] — RTX 가 skip).
+          - ``list[list[tuple]]`` (multi-segment, ranges mode):
+              flat = concat of inner lists; vertexCounts = [len(seg) for seg in segs
+              if len(seg) >= 2]. 1-vertex segment 는 BasisCurves linear 가 그릴 수
+              없으므로 빈 결과로 두고, 다음 sample 에 2 점이 되면 출력.
+        """
+        src = str(source).lower()
+        key = self._trail_key(name, src)
+        rec = self._custom_trail_prims.get(key)
+        if rec is None:
+            return False
+        prim = rec.get("prim")
+        if prim is None or not prim.IsValid():
+            return False
+
+        from pxr import UsdGeom, Vt, Gf
+
+        # multi-segment 판별 — 첫 요소가 list/tuple-of-3float 인지 vs list 인지.
+        flat_pts: list = []
+        counts: list[int] = []
+        is_multi = (
+            isinstance(points, list) and len(points) > 0
+            and isinstance(points[0], list)
+        )
+        if is_multi:
+            for seg in points:
+                if not isinstance(seg, list) or len(seg) < 2:
+                    continue
+                counts.append(len(seg))
+                for p in seg:
+                    flat_pts.append(Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])))
+        else:
+            if isinstance(points, list) and len(points) >= 2:
+                counts.append(len(points))
+                for p in points:
+                    flat_pts.append(Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])))
+
+        try:
+            curves = UsdGeom.BasisCurves(prim)
+            with self._session_edit():
+                curves.GetPointsAttr().Set(Vt.Vec3fArray(flat_pts))
+                curves.GetCurveVertexCountsAttr().Set(Vt.IntArray(counts))
+        except Exception as exc:
+            logger.debug(f"[viz] set_custom_trail warn: {exc}")
+            return False
+        return True
+
+    def remove_custom_trail(self, name: str, source: str) -> bool:
+        """Trail prim 제거 (session edit)."""
+        src = str(source).lower()
+        key = self._trail_key(name, src)
+        rec = self._custom_trail_prims.pop(key, None)
+        if rec is None:
+            return False
+        prim_path = rec.get("prim_path")
+        stage = self._get_stage()
+        if stage is not None and prim_path:
+            try:
+                with self._session_edit():
+                    stage.RemovePrim(prim_path)
+            except Exception as exc:
+                logger.debug(f"[viz] remove_custom_trail warn: {exc}")
+        return True
 
     # ========================================
     # Custom torque ring — contact_pos 같은 free-floating 위치에 ring 생성/갱신

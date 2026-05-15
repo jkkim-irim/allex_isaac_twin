@@ -681,6 +681,79 @@ ALLEX_CSV_JOINT_NAMES 와 다름.
 
 ---
 
+## 5) `trail_triggers` — Force origin 점 누적 trail (BasisCurves)
+
+force vector arrow 의 **origin (contact_pos)** 을 시간에 따라 점으로 누적해
+`UsdGeom.BasisCurves` 한 줄로 그려준다. fingertip / contact 위치의 reach
+trajectory 같은 시각화에 사용. arrow 와 별개 prim (`<name>_trail`) 이지만,
+push site 가 force arrow 의 update 경로와 동일하기 때문에 **`force_triggers`
+gate 와 `force_origin` alias 의 영향을 같이 받는다** (해당 channel 이
+`force_triggers` 로 hide 되면 그 시점엔 trail 도 push 안 됨). 한 채널의
+force arrow 와 trail 을 시간 axis 로 다르게 보여주고 싶으면 force_triggers
+범위가 trail_triggers 범위를 cover 하도록 설정 — 또는 force arrow 는
+`hide_below` 로 가리고 trail 만 보이게 운용.
+
+### Key 형식
+
+`force_triggers` 와 동일 dotted form:
+
+- `"real.<topic_id>"` : real CSV 의 ext_force topic
+- `"sim.<channel>"` : sim CSV 의 pair_force_vec sanitized key 또는 aggregate key
+
+### Value 형식
+
+| value 형식 | 의미 |
+|---|---|
+| `N` (positive finite scalar) | **rolling window mode** — 직전 N 초 점만 유지 (그 이전 점은 자동 popleft). |
+| `[[t_on, t_off], ...]` (list-of-list) | **ranges mode** — 각 구간에 점 누적, `t > t_off` 후 freeze (replay 끝까지 prim 유지). 단일 `[t_on, t_off]` 평탄화 형식은 받지 않음. |
+| `"off"` / `false` / `[]` | explicit OFF — prim 만 만들고 점은 비워둠 (다른 trigger 와 동일 sentinel) |
+
+```json
+"trail_triggers": {
+  "sim.R_Palm_Net_Force":     2.0,
+  "sim.L_Elbow__R_Palm_Back": [[5.0, 7.0]],
+  "real.arm_l":               [[3.0, 4.0], [8.0, 9.0]],
+  "sim.Foo":                  "off"
+}
+```
+
+### 동작
+
+- color = source 단색 (real / sim 의 `_SOURCE_COLOR`). v1 에선 tail fade
+  미구현 — `primvars:displayColor=constant`.
+- prim path: `/World/AllexForceViz/<source>/<name>_trail` (force prim 형제).
+- prim type: `UsdGeom.BasisCurves`, `type=linear`, `wrap=nonperiodic`,
+  width 5 mm constant.
+- 점 push 위치 = force arrow 가 사용하는 **최종 origin** 그대로 (sim pair:
+  `pair_contact_pos`, sim aggregate: `agg["origin"]`, real: chest→world 변환된
+  `contact_pos` 또는 fallback). real 채널에 `force_origin` alias 가 설정돼
+  있으면 alias resolution 된 좌표가 trail 에도 동일하게 적용된다 — force arrow
+  와 trail 이 같은 점을 trace.
+- ranges mode 에서 한 segment 의 점이 1개 이하면 BasisCurves 가 그릴 수
+  없으므로 그 segment 만 건너뛴다 (2점부터 line 출력).
+- replay `start()` / `stop()` 에서 trail buffer + prim 점 초기화 / prim 제거.
+- 한 replay run 안에서 t 는 monotonic 가정 (seek-backward 미지원).
+
+### 사용 사례
+
+- `sim.R_Palm_Net_Force` 같은 양손 clasp aggregate 의 contact 중심 궤적을
+  rolling window 로 보여줘서 "최근 N 초간 손등이 어디로 움직였는지" 확인.
+- pair 채널 ranges mode 로 motion 1 ~ 7 s 구간의 reach 끝점을 freeze 시켜서
+  사후 trajectory 검증.
+
+### 우선순위
+
+- `force_triggers` gate 의 영향을 받음 — gate 가 hide 인 동안엔 trail push
+  자체가 skip. 결과적으로 그 시간 구간은 trail 에 점이 누적 안 됨. (force
+  arrow 는 hide, trail 만 살리는 운용을 원하면 force `hide_below` 를 크게
+  설정해서 화살표만 invisible, trail push 는 계속 들어가도록.)
+- `force_origin` alias 도 영향을 받음 (real 채널 한정) — alias 된 좌표가
+  trail trace 점으로도 사용됨.
+- prim namespace 는 분리 (`<name>_trail` 별도 prim) — visibility / scale 등
+  prim-level attribute 충돌은 없음.
+
+---
+
 ## 시간 결정 흐름
 
 1. **sim 있으면**: 같은 group sim replay → "닿았다" 시점 시각으로 확인
@@ -695,7 +768,7 @@ ALLEX_CSV_JOINT_NAMES 와 다름.
 - 콘솔 INFO 로그:
   ```
   [replay] viz_scenario loaded: force=Nch, ext_torque=Nch, torque_ring=Nch,
-                                ext_joint_torque=Nch
+                                ext_joint_torque=Nch, trail=Nch
   ```
 - 잘못된 entry (prefix 안 맞음, range 가 list 아님, t_on >= t_off, 비-숫자, invalid 채널 키 등)
   는 WARNING 한 줄씩 + skip
@@ -745,6 +818,14 @@ sim CSV 의 pair/aggregate force 도 같은 `force_triggers` 안에서 `sim.<cha
   - `csv_replayer.py::_parse_channel_triggers` — torque_ring_triggers
   - `csv_replayer.py::_parse_ext_joint_torque_triggers` — ext_joint_torque_triggers
     (CSV column 그대로 → joint_full reverse-map)
+  - `csv_replayer.py::_parse_trail_triggers` — trail_triggers
+    (scalar N / list-of-list / "off" 분기)
+- Trail buffer push + prim 갱신:
+  `csv_replayer.py::_trail_buffer_push` (window/ranges 분기), 호출 site 는
+  sim pair / sim aggregate / real ext_force push 직전.
+- Custom trail API (BasisCurves):
+  `force_torque_visualizer.py::add_custom_trail` / `set_custom_trail` /
+  `remove_custom_trail`
 - Visualizer gate API: `force_torque_visualizer.py::set_torque_region_gate` /
   `clear_torque_region_gates` / `_dof_abbr_to_regions` (region 매핑)
 - Custom force arrow API:
