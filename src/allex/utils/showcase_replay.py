@@ -92,6 +92,7 @@ class ShowcaseReplayControls:
         self._availability_label: ui.Label | None = None
         self._main_combo: ui.ComboBox | None = None
         self._status_label: ui.Label | None = None
+        self._record_check: ui.CheckBox | None = None
 
     # ------------------------------------------------------------------
     # UI build
@@ -121,6 +122,11 @@ class ShowcaseReplayControls:
                     ui.Label("Main source:", width=UILayout.LABEL_WIDTH_LARGE)
                     self._main_combo = ui.ComboBox(0, "sim", "real",
                                                    height=UILayout.BUTTON_HEIGHT)
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Record forces (CSV):",
+                             width=UILayout.LABEL_WIDTH_LARGE)
+                    self._record_check = ui.CheckBox()
 
                 UIComponentFactory.create_separator(UILayout.SEPARATOR_HEIGHT)
 
@@ -164,6 +170,7 @@ class ShowcaseReplayControls:
         self._main_combo = None
         self._status_label = None
         self._availability_label = None
+        self._record_check = None
 
     # ------------------------------------------------------------------
     # Dropdown
@@ -316,6 +323,15 @@ class ShowcaseReplayControls:
         # 없으면 빈 dict → 기존 default 동작 그대로.
         viz_scenario = _load_viz_scenario(_TRAJECTORY_DIR / group)
 
+        record_forces = False
+        if self._record_check is not None:
+            try:
+                record_forces = bool(
+                    self._record_check.model.get_value_as_bool()
+                )
+            except Exception:
+                record_forces = False
+
         try:
             replayer = CsvReplayer(
                 reader_main=reader_main,
@@ -325,6 +341,7 @@ class ShowcaseReplayControls:
                 main_source=main_src,
                 plotters=plotters,
                 viz_scenario=viz_scenario,
+                record_forces=record_forces,
             )
         except Exception as exc:
             self._set_status(f"Status: replayer init failed: {exc}")
@@ -348,9 +365,10 @@ class ShowcaseReplayControls:
         if viz_scenario.get("ext_joint_torque_triggers"):
             scen_parts.append(f"ext_jtq={len(viz_scenario['ext_joint_torque_triggers'])}ch")
         scen_tag = (", scenario={" + ",".join(scen_parts) + "}") if scen_parts else ""
+        rec_tag = ", rec=on" if record_forces else ""
         self._set_status(
             f"Status: Playing main={main_src} ({reader_main.duration_s:.2f}s, "
-            f"sec={sec_tag}{scen_tag})"
+            f"sec={sec_tag}{scen_tag}{rec_tag})"
         )
 
     def _on_stop(self) -> None:

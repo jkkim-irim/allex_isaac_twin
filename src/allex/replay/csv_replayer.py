@@ -124,6 +124,7 @@ class CsvReplayer:
         main_source: str,
         plotters: Optional[list] = None,
         viz_scenario: Optional[dict] = None,
+        record_forces: bool = False,
     ):
         if reader_main is None:
             raise ValueError("reader_main is required")
@@ -428,6 +429,12 @@ class CsvReplayer:
         self._trail_freeze: dict[tuple[str, str], list[bool]] = {}
         # add_custom_trail 된 key 추적 (lifecycle remove 용).
         self._registered_trail_keys: set[tuple[str, str]] = set()
+        # 마지막 set_custom_trail 호출 시점 (t_rel 기준) — display rate cap 용.
+        # rolling/ranges 모두 push 는 sim rate (200~1000Hz) 인데, USD prim 의 points
+        # array 를 그 속도로 통째 re-author 하면 RTX 가 매 frame curve 를 re-tessellate
+        # 해서 line 전체가 sub-pixel shimmer ("우글우글") 처럼 보임. 화면 갱신 rate
+        # 이상으로 set 해봐야 보이지도 않고 비용만 발생 → 16 ms 간격 cap.
+        self._trail_last_set_t: dict[tuple[str, str], float] = {}
 
         # debug pause/resume 용 — wall-clock baseline 보정.
         self._pause_t: Optional[float] = None
@@ -460,6 +467,12 @@ class CsvReplayer:
         # 매 rendering frame 마다 진행해야 함 (timeline pause / physics rate 변경에 영향 X).
         self._update_sub = None
         self._self_ticking: bool = False
+
+        # Visualized force 의 world-frame fx/fy/fz 기록 버퍼 (UI checkbox).
+        # 매 push 마다 (t_rel, source, channel, fx, fy, fz) tuple append.
+        # stop() 에서 main CSV 옆에 recorded_forces_<stem>.csv 로 flush.
+        self._record_forces_enabled: bool = bool(record_forces)
+        self._force_record_buf: list[tuple] = []
 
         # contact-local CSV export 버퍼 (flag on 일 때만).
         self._export_records: Optional[list[dict]] = None
@@ -525,10 +538,14 @@ class CsvReplayer:
         self._registered_trail_keys.clear()
         self._trail_buffers.clear()
         self._trail_freeze.clear()
+        self._trail_last_set_t.clear()
         self._torque_gate_prev.clear()
         self._paused = False
         self._pause_t = None
         self._prev_idx_main_for_plot = -1
+        # Visualized force 기록 버퍼 리셋 — 같은 인스턴스 재시작 대비.
+        if self._record_forces_enabled:
+            self._force_record_buf = []
         # contact-local export 캐시 — flag on 일 때만 records 재생성.
         if EXPORT_CONTACT_LOCAL_CSV:
             self._export_records = []
@@ -678,6 +695,13 @@ class CsvReplayer:
         self._registered_trail_keys.clear()
         self._trail_buffers.clear()
         self._trail_freeze.clear()
+        self._trail_last_set_t.clear()
+        # Visualized force CSV flush (UI checkbox on 일 때만).
+        if self._record_forces_enabled and self._force_record_buf:
+            try:
+                self._write_force_record_csv()
+            except Exception as exc:
+                logger.warning(f"[replay] force-record CSV flush warn: {exc}")
         # contact-local CSV flush (flag on 일 때만).
         if self._export_records is not None:
             try:
@@ -717,6 +741,12 @@ class CsvReplayer:
     # 디버깅용 슬로우모션 — contact frame 을 Property panel 로 inspect 하기 좋게.
     # 1.0 = realtime, 0.1 = 10배 느리게, 0.0 < x < 1 권장. 운영시 1.0 으로 둘 것.
     TIME_SCALE: float = 1.0
+
+    # Trail prim re-author rate cap (sec). sim push rate 보다 화면 rate 가 낮은데
+    # 매 push 마다 USD points array 를 다시 Set 하면 RTX 가 매 frame curve 를 새로
+    # tessellate 해서 line 전체에 sub-pixel shimmer 가 보임. ~60 FPS 화면 가정 후
+    # 16 ms 간격으로 cap (point 는 buffer 에 계속 누적, prim 갱신만 throttle).
+    _TRAIL_SET_MIN_DT: float = 1.0 / 60.0
 
     # 외부에서 토글 가능한 pause flag — True 면 advance 가 idx 진행 멈춤 (현재 frame 유지).
     _paused: bool = False
@@ -1213,6 +1243,31 @@ class CsvReplayer:
                     "world_x": wx, "world_y": wy, "world_z": wz,
                     "local_x": local[0], "local_y": local[1], "local_z": local[2],
                 })
+
+    def _write_force_record_csv(self) -> None:
+        """Visualized force 의 world-frame fx/fy/fz 를 main CSV 옆에 long-format 으로 flush.
+
+        Columns: t_rel, source, channel, fx, fy, fz.
+        - t_rel : 각 source CSV 의 첫 sample 기준 상대시간 (sim/real reader 별 독립).
+        - source: "sim" | "real".
+        - channel: sim 의 sanitized pair name / aggregate tag, real 의 topic_id.
+        - fx,fy,fz: gain·invert·chest->world 변환 이후의 world-frame force vector.
+                    overlay norm 직전 값과 동일.
+        """
+        import csv
+        out_path = self._main.path.parent / f"recorded_forces_{self._main.path.stem}.csv"
+        try:
+            with out_path.open("w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["t_rel", "source", "channel", "fx", "fy", "fz"])
+                for row in self._force_record_buf:
+                    w.writerow(row)
+            logger.info(
+                f"[replay] recorded forces CSV written: {out_path}  "
+                f"rows={len(self._force_record_buf)}"
+            )
+        except Exception as exc:
+            logger.warning(f"[replay] force-record CSV write failed: {exc}")
 
     def _write_export_csv(self) -> None:
         if not self._export_records:
@@ -2033,6 +2088,11 @@ class CsvReplayer:
             self._trail_buffer_push("sim", sanitized_pair, origin, t_rel)
             self._set_or_add(viz, sanitized_pair, "sim", origin, vec)
             self._cache_sim_origin(sanitized_pair, origin)
+            if self._record_forces_enabled:
+                self._force_record_buf.append(
+                    (t_rel, "sim", sanitized_pair,
+                     float(vec[0]), float(vec[1]), float(vec[2]))
+                )
 
         # aggregate — CSV 의 normal 은 reaction 기준이라 -1 곱해 손등 위로 향하게.
         for tag, agg in reader.aggregate.items():
@@ -2050,6 +2110,11 @@ class CsvReplayer:
             self._trail_buffer_push("sim", tag, origin, t_rel)
             self._set_or_add(viz, tag, "sim", origin, vec)
             self._cache_sim_origin(tag, origin)
+            if self._record_forces_enabled:
+                self._force_record_buf.append(
+                    (t_rel, "sim", tag,
+                     float(vec[0]), float(vec[1]), float(vec[2]))
+                )
 
     def _push_real_force_routed(self, real_reader: ShowcaseReader,
                                 real_idx: int) -> None:
@@ -2143,6 +2208,11 @@ class CsvReplayer:
 
             self._trail_buffer_push("real", topic_id, p_world, current_t_rel)
             self._set_or_add(viz, topic_id, "real", p_world, f_world)
+            if self._record_forces_enabled:
+                self._force_record_buf.append(
+                    (current_t_rel, "real", topic_id,
+                     float(f_world[0]), float(f_world[1]), float(f_world[2]))
+                )
 
     def _push_real_torque_routed(self, real_reader: ShowcaseReader,
                                  real_idx: int) -> None:
@@ -2438,10 +2508,14 @@ class CsvReplayer:
             cutoff = t_rel - n_sec
             while buf and buf[0][0] < cutoff:
                 buf.popleft()
+            last_set = self._trail_last_set_t.get(key, -1e9)
+            if t_rel - last_set < self._TRAIL_SET_MIN_DT:
+                return  # display rate cap — buffer 는 갱신, prim Set 만 skip.
             points = [(p[1], p[2], p[3]) for p in buf]
             try:
                 if hasattr(viz, "set_custom_trail"):
                     viz.set_custom_trail(name, source, points)
+                    self._trail_last_set_t[key] = t_rel
             except Exception as exc:
                 logger.debug(f"[replay] set_custom_trail warn: {exc}")
             return
@@ -2469,9 +2543,13 @@ class CsvReplayer:
                     changed = True
                 # t_rel < t_on 이면 skip.
             if changed:
+                last_set = self._trail_last_set_t.get(key, -1e9)
+                if t_rel - last_set < self._TRAIL_SET_MIN_DT:
+                    return  # display rate cap — segs 는 갱신, prim Set 만 skip.
                 try:
                     if hasattr(viz, "set_custom_trail"):
                         viz.set_custom_trail(name, source, segs)
+                        self._trail_last_set_t[key] = t_rel
                 except Exception as exc:
                     logger.debug(f"[replay] set_custom_trail warn: {exc}")
             return
