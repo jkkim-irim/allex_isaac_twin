@@ -882,7 +882,9 @@ class ForceTorqueVisualizer:
                     overlay.add(prim_path, source)
                     anchor = self._compute_force_label_anchor(
                         prim, mag, kind, overlay)
-                    label_visible = (mag >= hide_below) and (anchor is not None)
+                    # arrow visibility 와 동일한 post-gain 임계 적용.
+                    s = _clip(mag * gain, lo, hi)
+                    label_visible = (s >= hide_below) and (anchor is not None)
                     if anchor is not None:
                         overlay.update(prim_path, anchor, mag, label_visible)
                 except Exception as exc:
@@ -983,7 +985,9 @@ class ForceTorqueVisualizer:
                             anchor = self._compute_force_label_anchor(
                                 prim, magnitude, kind, overlay)
                             if anchor is not None and prim_path:
-                                label_visible = magnitude >= hide_below
+                                # arrow visibility 와 동일한 post-gain 임계 적용.
+                                s = _clip(magnitude * gain, lo, hi)
+                                label_visible = s >= hide_below
                                 overlay.update(prim_path, anchor, magnitude,
                                                 label_visible)
                     except Exception as exc:
