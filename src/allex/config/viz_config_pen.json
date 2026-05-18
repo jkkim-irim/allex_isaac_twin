@@ -2,7 +2,8 @@
   "_notes": "Force/Torque visualization 설정. viz_config.py 가 이 JSON 을 로드해서 module-level 상수와 HAND_JOINT_TORQUE_RING_MAP/TUPLES, FORCE_VIZ_PARENT_LINKS 를 구성한다. 다른 *_config.json 들과 일관성 맞추기 위해 Python 분리.",
   "colors": {
     "real": [1.0, 0.0, 0.0],
-    "sim": [0.0, 0.8, 1.0]
+    "sim": [0.0, 0.8, 1.0],
+    "trail_real": [1.0, 0.0, 0.0]
   },
   "torque": {
     "_doc": "torque ring scale = clip(|τ|*gain, min_scale, max_scale). gain_<group> 은 단일 float (양쪽 공통) 또는 {\"L\": float, \"R\": float} (좌우 별도) 형식 모두 지원. gain_default 는 waist/neck 등 side 없는 joint 용 단일 float. ring_offset_along_axis 는 USD ring prim 을 joint 회전축 방향으로 mm 단위 미세 이동. 없는 joint 는 0.0.",

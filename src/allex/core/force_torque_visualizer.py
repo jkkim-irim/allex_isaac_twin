@@ -27,6 +27,7 @@ import carb
 
 from ..config.viz_config import (
     REAL_COLOR, SIM_COLOR,
+    TRAIL_REAL_COLOR, TRAIL_SIM_COLOR,
     TORQUE_GAIN, TORQUE_MIN_SCALE, TORQUE_MAX_SCALE,
     TORQUE_GAIN_SHOULDER, TORQUE_GAIN_ELBOW, TORQUE_GAIN_WRIST, TORQUE_GAIN_FINGER,
     FORCE_GAIN, FORCE_MIN_SCALE, FORCE_MAX_SCALE,
@@ -644,6 +645,12 @@ class ForceTorqueVisualizer:
         "sim": SIM_COLOR,
         "user": (1.0, 1.0, 0.0),    # 노랑 — 사용자 임의 vector
     }
+    # Force vector 색과 독립적인 trail (origin trajectory) 색상.
+    _TRAIL_SOURCE_COLOR = {
+        "real": TRAIL_REAL_COLOR,
+        "sim": TRAIL_SIM_COLOR,
+        "user": (1.0, 1.0, 0.0),
+    }
 
     @staticmethod
     def _custom_key(name: str, source: str) -> str:
@@ -1082,7 +1089,7 @@ class ForceTorqueVisualizer:
 
         parent = f"{self.CUSTOM_FORCE_ROOT}/{src}"
         prim_path = f"{parent}/{name}_trail"
-        color = self._SOURCE_COLOR.get(src, REAL_COLOR)
+        color = self._TRAIL_SOURCE_COLOR.get(src, TRAIL_REAL_COLOR)
 
         with self._session_edit():
             parent_prim = stage.GetPrimAtPath(parent)

@@ -43,6 +43,10 @@ REAL_COLOR = _tup3(_cfg["colors"]["real"])
 # SIM_COLOR = (0.0, 0.8, 0.0)  # green override — force vector + torque ring 둘 다 적용
 SIM_COLOR = _tup3(_cfg["colors"]["sim"])
 
+# Trail (force origin trajectory BasisCurves) 전용 색상. 없으면 force 색 fallback.
+TRAIL_REAL_COLOR = _tup3(_cfg["colors"].get("trail_real", _cfg["colors"]["real"]))
+TRAIL_SIM_COLOR = _tup3(_cfg["colors"].get("trail_sim", _cfg["colors"]["sim"]))
+
 
 # ---------------------------------------------------------------------------
 # Torque 링 스케일
