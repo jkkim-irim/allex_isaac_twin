@@ -30,11 +30,11 @@ Real CSV (from rosbag_to_csv.py --format showcase):
                                               (e.g. hand_l_index_abad). 내부적으로는
                                               joint_full → self.ext_joint_torque[joint_full]
                                               로 reverse-map 해서 저장.
-  ext_force_<topic_id>_{x,y,z}               — N, chest_origin frame. → topic_force_vec.
-  ext_torque_<topic_id>_{x,y,z}              — Nm, chest_origin frame. → topic_torque_vec.
+  ext_force_<topic_id>_{x,y,z}               — N, base_link frame. → topic_force_vec.
+  ext_torque_<topic_id>_{x,y,z}              — Nm, base_link frame. → topic_torque_vec.
                                               (Wrench 의 torque.x/y/z. per-joint 스칼라는
                                                별도 `ext_joint_torque_` prefix 라 충돌 없음.)
-  contact_pos_<topic_id>_{x,y,z}             — m, chest_origin frame. → topic_contact_pos.
+  contact_pos_<topic_id>_{x,y,z}             — m, base_link frame. → topic_contact_pos.
   (topic_id 예: arm_l, arm_r, shoulder_l, shoulder_r — ext_force_topics 매핑)
 
 Sim 의 pair name 은 ``<->`` / 공백 포함 → sanitize 해서 ``<linkA>__<linkB>`` 형태로
@@ -147,8 +147,8 @@ class ShowcaseReader:
         #   pair_force_vec[sanitized_pair]    ← force_vec_<linkA> <-> <linkB>_*  (world)
         #   pair_contact_pos[sanitized_pair]  ← contact_pos_<linkA> <-> <linkB>_*  (world)
         # Real CSV (topic):
-        #   topic_force_vec[topic_id]         ← ext_force_<id>_*  (chest_origin)
-        #   topic_contact_pos[topic_id]       ← contact_pos_<id>_*  (chest_origin)
+        #   topic_force_vec[topic_id]         ← ext_force_<id>_*  (base_link)
+        #   topic_contact_pos[topic_id]       ← contact_pos_<id>_*  (base_link)
         # contact_pos_ 컬럼은 sim/real 모두 같은 prefix 라 raw key 안에 ``<->`` 또는
         # ``__`` 가 포함됐는지로 분기.
         self.pair_force_vec: Dict[str, np.ndarray] = {}

@@ -982,7 +982,7 @@ class CsvReplayer:
         real_reader, real_idx = self._reader_idx_for("real", idx_main, sec_idx)
         if real_reader is not None and real_idx is not None:
             self._push_real_force_routed(real_reader, real_idx)
-            # ext_torque arrow (Wrench.torque). force 와 독립 게이팅, 같은 chest 변환.
+            # ext_torque arrow (Wrench.torque). force 와 독립 게이팅, 같은 base 변환.
             self._push_real_torque_routed(real_reader, real_idx)
 
         # 5) CSV 에 없는 follower (DIP/IP) ring 은 0 push → base_scale 거대값 → floor.
@@ -1251,7 +1251,7 @@ class CsvReplayer:
         - t_rel : 각 source CSV 의 첫 sample 기준 상대시간 (sim/real reader 별 독립).
         - source: "sim" | "real".
         - channel: sim 의 sanitized pair name / aggregate tag, real 의 topic_id.
-        - fx,fy,fz: gain·invert·chest->world 변환 이후의 world-frame force vector.
+        - fx,fy,fz: gain·invert·base->world 변환 이후의 world-frame force vector.
                     overlay norm 직전 값과 동일.
         """
         import csv
@@ -1476,16 +1476,15 @@ class CsvReplayer:
                 _fill_real_from(self._sec, idx_sec)
 
     # ──────────────────────────────────────────────────────────────────
-    # Chest_Origin_Link runtime transform (Fabric API).
-    # rosbag_to_csv.py 의 ext_force / contact_pos pair 들 (이름에 "_to_" 포함) 은
-    # CSV 에 chest_origin frame 의 RAW 값 그대로 박혀 있다 — sim runtime 의
-    # 실제 chest world transform 으로 매 frame 변환해서 viz 에 push.
-    # parallel 4-bar linkage 의 pitch-induced 평행이동까지 정확히 반영됨.
+    # Base_Link runtime transform (Fabric API).
+    # showcase CSV 의 ext_force / contact_pos 열은 base_link frame 의 RAW
+    # 값. sim runtime 의 Base_Link world matrix 로 매 frame world 변환해
+    # viz 에 push.
     # ──────────────────────────────────────────────────────────────────
-    _CHEST_PRIM_PATH = "/ALLEX/Chest_Origin_Link"
+    _BASE_PRIM_PATH = "/ALLEX/Base_Link"
 
-    def _get_chest_world_matrix(self):
-        """Chest_Origin_Link 의 omni:fabric:worldMatrix (usdrt Matrix4d) — 또는 None."""
+    def _get_base_world_matrix(self):
+        """Base_Link 의 omni:fabric:worldMatrix (usdrt Matrix4d) — 또는 None."""
         try:
             import omni.usd
             import usdrt
@@ -1496,41 +1495,41 @@ class CsvReplayer:
                 stage_id = omni.usd.get_context().get_stage_id()
                 self._rt_stage = usdrt.Usd.Stage.Attach(stage_id)
             except Exception as e:
-                if not getattr(self, "_chest_xform_warned", False):
-                    logger.warning(f"[replay] usdrt stage attach failed for chest xform: {e}")
-                    self._chest_xform_warned = True
+                if not getattr(self, "_base_xform_warned", False):
+                    logger.warning(f"[replay] usdrt stage attach failed for base xform: {e}")
+                    self._base_xform_warned = True
                 return None
         try:
-            rt_prim = self._rt_stage.GetPrimAtPath(usdrt.Sdf.Path(self._CHEST_PRIM_PATH))
+            rt_prim = self._rt_stage.GetPrimAtPath(usdrt.Sdf.Path(self._BASE_PRIM_PATH))
             if not rt_prim:
-                if not getattr(self, "_chest_prim_warned", False):
-                    logger.warning(f"[replay] chest prim missing: {self._CHEST_PRIM_PATH} — "
-                                   f"ext_force/contact_pos 변환 불가, raw chest-frame 값 그대로 push.")
-                    self._chest_prim_warned = True
+                if not getattr(self, "_base_prim_warned", False):
+                    logger.warning(f"[replay] base prim missing: {self._BASE_PRIM_PATH} — "
+                                   f"ext_force/contact_pos 변환 불가, raw base-frame 값 그대로 push.")
+                    self._base_prim_warned = True
                 return None
             attr = rt_prim.GetAttribute("omni:fabric:worldMatrix")
             if not attr or not attr.IsValid():
                 return None
             return attr.Get()
         except Exception as e:
-            if not getattr(self, "_chest_xform_runtime_warned", False):
-                logger.warning(f"[replay] chest xform query warn: {e}")
-                self._chest_xform_runtime_warned = True
+            if not getattr(self, "_base_xform_runtime_warned", False):
+                logger.warning(f"[replay] base xform query warn: {e}")
+                self._base_xform_runtime_warned = True
             return None
 
     @staticmethod
-    def _xform_vec_chest_to_world(vec_chest, mat) -> tuple:
+    def _xform_vec_base_to_world(vec_base, mat) -> tuple:
         """Force vector — rotation only (translation 무시).
         usdrt Matrix4d 는 row-major (translation 이 row 3): rotation 은 0..2 행."""
-        x, y, z = float(vec_chest[0]), float(vec_chest[1]), float(vec_chest[2])
+        x, y, z = float(vec_base[0]), float(vec_base[1]), float(vec_base[2])
         return (x * mat[0][0] + y * mat[1][0] + z * mat[2][0],
                 x * mat[0][1] + y * mat[1][1] + z * mat[2][1],
                 x * mat[0][2] + y * mat[1][2] + z * mat[2][2])
 
     @staticmethod
-    def _xform_pt_chest_to_world(pt_chest, mat) -> tuple:
+    def _xform_pt_base_to_world(pt_base, mat) -> tuple:
         """Contact point — full SE3 (rotation + translation)."""
-        x, y, z = float(pt_chest[0]), float(pt_chest[1]), float(pt_chest[2])
+        x, y, z = float(pt_base[0]), float(pt_base[1]), float(pt_base[2])
         return (x * mat[0][0] + y * mat[1][0] + z * mat[2][0] + mat[3][0],
                 x * mat[0][1] + y * mat[1][1] + z * mat[2][1] + mat[3][1],
                 x * mat[0][2] + y * mat[1][2] + z * mat[2][2] + mat[3][2])
@@ -2047,7 +2046,7 @@ class CsvReplayer:
 
     def _push_force_frame_sim(self, reader: ShowcaseReader, idx: int,
                               t_rel: float) -> None:
-        """Sim CSV 의 force vector 채널들 push (source='sim'). World frame 그대로 — chest 변환 없음.
+        """Sim CSV 의 force vector 채널들 push (source='sim'). World frame 그대로 — base 변환 없음.
 
         Channel:
           - pair_force_vec[<pair>] : showcase_logger 의 contact pair (allowlist).
@@ -2137,8 +2136,8 @@ class CsvReplayer:
         if viz is None:
             return
 
-        chest_mat = self._get_chest_world_matrix()
-        if chest_mat is None:
+        base_mat = self._get_base_world_matrix()
+        if base_mat is None:
             return
 
         # trigger 시간 비교용 — real CSV 첫 sample 을 0 으로 한 상대시간 (사용자가
@@ -2165,8 +2164,8 @@ class CsvReplayer:
                 self._set_force_prim_visible(viz, topic_id, "real", False)
                 continue
 
-            f_chest = force_arr[real_idx]
-            f_world = self._xform_vec_chest_to_world(f_chest, chest_mat)
+            f_base = force_arr[real_idx]
+            f_world = self._xform_vec_base_to_world(f_base, base_mat)
             sign = -1.0 if ("real", topic_id) in self._force_invert else 1.0
             gain = sign * self._force_gain.get(("real", topic_id), 1.0)
             if gain != 1.0:
@@ -2176,12 +2175,12 @@ class CsvReplayer:
 
             cpos_arr = real_reader.topic_contact_pos.get(topic_id)
             if cpos_arr is not None:
-                p_chest = cpos_arr[real_idx]
-                p_world = self._xform_pt_chest_to_world(p_chest, chest_mat)
+                p_base = cpos_arr[real_idx]
+                p_world = self._xform_pt_base_to_world(p_base, base_mat)
             else:
-                p_world = (float(chest_mat[3][0]),
-                           float(chest_mat[3][1]),
-                           float(chest_mat[3][2]))
+                p_world = (float(base_mat[3][0]),
+                           float(base_mat[3][1]),
+                           float(base_mat[3][2]))
 
             # Origin alias — 활성 시간창 동안 real prim 의 origin 을 매핑된 target
             # 의 world 위치로 덮어쓴다.
@@ -2220,7 +2219,7 @@ class CsvReplayer:
         (arrow 아님!) 으로 push.
 
         Iteration: ``real_reader.topic_torque_vec.keys()``. 각 topic_id 에 대해
-        chest→world 변환 후 ``torque_<topic_id>`` 이름으로 free-floating ring 생성.
+        base→world 변환 후 ``torque_<topic_id>`` 이름으로 free-floating ring 생성.
         기존 joint torque ring 과는 prim namespace 분리 (``/World/AllexTorqueRing/real/...``).
 
         Gate 결정 순서 (ext_torque_triggers 만 보고 결정 — ext_force gate 와 독립):
@@ -2231,7 +2230,7 @@ class CsvReplayer:
              (hide_below 임계가 알아서 작은 |τ| 자동 hide)
 
         Ring 의 +Z 축 = torque vector 방향 (world frame). 위치 = contact_pos
-        (topic_contact_pos 가 있으면 chest→world, 없으면 chest_origin link 위치).
+        (topic_contact_pos 가 있으면 base→world, 없으면 base_link 위치).
         스케일 = clip(|τ|*EXT_TORQUE_GAIN, EXT_TORQUE_MIN_SCALE, EXT_TORQUE_MAX_SCALE).
         """
         viz = self._viz
@@ -2240,8 +2239,8 @@ class CsvReplayer:
         if not real_reader.topic_torque_vec:
             return
 
-        chest_mat = self._get_chest_world_matrix()
-        if chest_mat is None:
+        base_mat = self._get_base_world_matrix()
+        if base_mat is None:
             return
 
         current_t_rel = float(real_reader.t[real_idx] - real_reader.t[0])
@@ -2264,20 +2263,20 @@ class CsvReplayer:
                 self._set_torque_ring_prim_visible(viz, prim_name, "real", False)
                 continue
 
-            t_chest = torque_arr[real_idx]
-            t_world = self._xform_vec_chest_to_world(t_chest, chest_mat)
+            t_base = torque_arr[real_idx]
+            t_world = self._xform_vec_base_to_world(t_base, base_mat)
             magnitude = float((t_world[0] * t_world[0]
                                + t_world[1] * t_world[1]
                                + t_world[2] * t_world[2]) ** 0.5)
 
             cpos_arr = real_reader.topic_contact_pos.get(topic_id)
             if cpos_arr is not None:
-                p_chest = cpos_arr[real_idx]
-                p_world = self._xform_pt_chest_to_world(p_chest, chest_mat)
+                p_base = cpos_arr[real_idx]
+                p_world = self._xform_pt_base_to_world(p_base, base_mat)
             else:
-                p_world = (float(chest_mat[3][0]),
-                           float(chest_mat[3][1]),
-                           float(chest_mat[3][2]))
+                p_world = (float(base_mat[3][0]),
+                           float(base_mat[3][1]),
+                           float(base_mat[3][2]))
 
             self._set_or_add_torque_ring(viz, prim_name, "real",
                                          p_world, t_world, magnitude)

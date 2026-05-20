@@ -182,9 +182,9 @@ trigger 가 다른 source 의 게이트에 영향 주지 않음.
 
 ```
 # real
-vector  = ext_force_<topic_id>_{x,y,z}     ← real CSV (chest_origin frame)
-origin  = contact_pos_<topic_id>_{x,y,z}   ← real CSV (chest_origin frame)
-        → chest→world transform (sim Chest_Origin_Link world matrix, Fabric API)
+vector  = ext_force_<topic_id>_{x,y,z}     ← real CSV (base_link frame)
+origin  = contact_pos_<topic_id>_{x,y,z}   ← real CSV (base_link frame)
+        → base→world transform (sim Base_Link world matrix, Fabric API)
 prim    = /World/AllexForceViz/real/<topic_id>
 
 # sim
@@ -194,7 +194,7 @@ origin  = contact_pos / aggregate origin   ← sim CSV
 prim    = /World/AllexForceViz/sim/<channel>
 ```
 
-real `contact_pos_<topic_id>_*` 컬럼이 없으면 chest_origin link world 위치로 fallback.
+real `contact_pos_<topic_id>_*` 컬럼이 없으면 base_link world 위치로 fallback.
 
 ### `force_invert` — 채널별 force vector 방향 반전
 
@@ -328,15 +328,15 @@ prefix 에서 `ext_torque_` 떼고 `real.` 붙임. topic_id 는 `force_triggers`
 ### Visualization 파이프라인
 
 ```
-torque_vec   = ext_torque_<topic_id>_{x,y,z}   ← real CSV (chest_origin frame)
-position     = contact_pos_<topic_id>_{x,y,z}  ← real CSV (chest_origin frame)
-             → chest→world transform (sim Chest_Origin_Link world matrix, Fabric API)
+torque_vec   = ext_torque_<topic_id>_{x,y,z}   ← real CSV (base_link frame)
+position     = contact_pos_<topic_id>_{x,y,z}  ← real CSV (base_link frame)
+             → base→world transform (sim Base_Link world matrix, Fabric API)
 ring +Z axis = torque_vec_world / |torque_vec_world|
 ring scale   = clip(|τ|*EXT_TORQUE_GAIN, EXT_TORQUE_MIN_SCALE, EXT_TORQUE_MAX_SCALE)
 prim_path    = /World/AllexTorqueRing/real/torque_<topic_id>
 ```
 
-contact_pos 컬럼이 없으면 chest_origin link world 위치로 fallback (force arrow 와 동일).
+contact_pos 컬럼이 없으면 base_link world 위치로 fallback (force arrow 와 동일).
 
 ### Visibility
 
