@@ -129,14 +129,27 @@ for _hand_up, _hand_lo in (("L", "l"), ("R", "r")):
 del _hand_up, _hand_lo, _finger, _tid
 
 
-def _parse_bag(input_dir: str):
-    """bag 을 읽어 {topic_name: [(t_ns, [values])...] } 리턴."""
+def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
+    """bag 을 읽어 {topic_name: [(t_ns, [values])...] } 리턴.
+
+    storage_id: "mcap" 또는 "sqlite3".
+    namespace : bag 토픽 prefix (예: "/allex/p001"). 매칭 전 떼고 표준 토픽 이름과 비교.
+                keep / topic_meta 의 키는 원본(stripped 안 된) 이름 — reader 가 그걸 알아야 하므로.
+    """
     reader = rosbag2_py.SequentialReader()
     reader.open(
-        rosbag2_py.StorageOptions(uri=input_dir, storage_id="mcap"),
+        rosbag2_py.StorageOptions(uri=input_dir, storage_id=storage_id),
         rosbag2_py.ConverterOptions("", ""),
     )
     type_map = {t.name: t.type for t in reader.get_all_topics_and_types()}
+
+    ns = namespace.rstrip("/") if namespace else ""
+
+    def _strip_ns(n: str) -> str:
+        """bag 의 원본 토픽 이름에서 namespace prefix 제거."""
+        if ns and n.startswith(ns + "/"):
+            return n[len(ns):]
+        return n
 
     # 관심 topic 필터:
     #
@@ -153,8 +166,10 @@ def _parse_bag(input_dir: str):
     # 4) /result/<group>/joint/ext_torque       — per-joint external torque.
     # 5) ext_force / contact_pos — 위 dict 매핑 그대로.
     keep = []
-    topic_meta = {}  # topic → (group, suffix)
-    for name in type_map:
+    topic_meta = {}  # topic(orig) → (group, suffix)
+    # matching 은 namespace-stripped 이름으로, keep/topic_meta 의 키는 원본(orig) 이름.
+    for orig in type_map:
+        name = _strip_ns(orig)
         parts = name.strip("/").split("/")
         # /result/<group>/joint/position (필터된 joint position [rad])
         if (len(parts) == 4 and parts[0] == "result"
@@ -162,8 +177,8 @@ def _parse_bag(input_dir: str):
             group = parts[1]
             if group not in CSV_GROUPS:
                 continue
-            keep.append(name)
-            topic_meta[name] = (group, "joint_position")
+            keep.append(orig)
+            topic_meta[orig] = (group, "joint_position")
             continue
         # /result/<group>/joint/torque (필터된 joint torque)
         if (len(parts) == 4 and parts[0] == "result"
@@ -171,8 +186,8 @@ def _parse_bag(input_dir: str):
             group = parts[1]
             if group not in CSV_GROUPS:
                 continue
-            keep.append(name)
-            topic_meta[name] = (group, "joint_torque")
+            keep.append(orig)
+            topic_meta[orig] = (group, "joint_torque")
             continue
         # /result/<group>/joint/ext_torque (per-joint external torque, Nm)
         # element 순서는 EXT_TORQUE_JOINT_NAMES (follower 포함) 기준. showcase CSV 에
@@ -182,8 +197,8 @@ def _parse_bag(input_dir: str):
             group = parts[1]
             if group not in CSV_GROUPS:
                 continue
-            keep.append(name)
-            topic_meta[name] = (group, "joint_ext_torque")
+            keep.append(orig)
+            topic_meta[orig] = (group, "joint_ext_torque")
             continue
         # /robot_outbound_data/<group>/<suffix>  (단 joint_torque / joint_positions_deg 는 위에서 처리)
         if len(parts) == 3 and parts[0] == "robot_outbound_data":
@@ -198,23 +213,30 @@ def _parse_bag(input_dir: str):
                 continue
             if suffix not in TOPIC_TO_SUBDIR:
                 continue
-            keep.append(name)
-            topic_meta[name] = (group, suffix)
+            keep.append(orig)
+            topic_meta[orig] = (group, suffix)
             continue
         # ext_force 토픽 — topic_id 가 그대로 CSV 컬럼 suffix.
         if name in EXT_FORCE_TOPICS:
-            keep.append(name)
-            topic_meta[name] = ("_ext_force", EXT_FORCE_TOPICS[name])
+            keep.append(orig)
+            topic_meta[orig] = ("_ext_force", EXT_FORCE_TOPICS[name])
             continue
         # contact_pos 토픽 — 1:1 매핑 (각 팔의 EE position).
         if name in EXT_CONTACT_POS_TOPICS:
-            keep.append(name)
-            topic_meta[name] = ("_contact_pos", EXT_CONTACT_POS_TOPICS[name])
+            keep.append(orig)
+            topic_meta[orig] = ("_contact_pos", EXT_CONTACT_POS_TOPICS[name])
             continue
 
     if not keep:
-        print("[ERROR] 대상 topic 을 찾지 못했어요. bag 경로를 확인하세요.")
+        print("[ERROR] 대상 topic 을 찾지 못했어요. bag 경로 / --namespace 인자를 확인하세요.")
         return {}, {}
+
+    # /result/ 토픽 부재 진단 — fallback 안 함, 빠진 컬럼만 경고.
+    result_groups = {g for (g, s) in topic_meta.values() if s in ("joint_position", "joint_torque", "joint_ext_torque")}
+    missing_result = [g for g in CSV_GROUPS if g not in result_groups]
+    if missing_result:
+        print(f"[WARN] /result/<group>/joint/* 누락 그룹: {missing_result}")
+        print(f"       해당 그룹의 pos_*/torque_*/ext_torque_* 컬럼은 출력 CSV 에서 비어있거나 누락됩니다.")
 
     reader.set_filter(rosbag2_py.StorageFilter(topics=keep))
 
@@ -620,6 +642,11 @@ def main():
                         help="시간 offset [s]. + 값: 첫 sample 값을 그만큼 앞에 복제 패딩 "
                              "(전체 길이 +offset). - 값: 앞에서 |offset| 초 만큼 trim "
                              "(전체 길이 -|offset|). default 0 = 변형 없음.")
+    parser.add_argument("--storage", choices=("auto", "mcap", "sqlite3"), default="auto",
+                        help="rosbag2 storage backend. auto = bag dir 안 *.mcap / *.db3 로 감지.")
+    parser.add_argument("--namespace", default="",
+                        help="bag topic prefix (예: '/allex/p001'). 매칭 전 떼고 표준 토픽 "
+                             "이름과 비교. 제어기 버전에 따라 namespace 가 다를 수 있음.")
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -630,12 +657,12 @@ def main():
     # rosbag2 storage 는 metadata.yaml 이 같이 있는 디렉토리를 기대.
     # metadata.yaml 없이 .mcap 만 있는 형태도 흔해서 자동 감지:
     #   - input 이 .mcap 파일       → 그대로 reader 에 넘김
-    #   - input 이 dir + metadata.yaml 있음 → dir 그대로
+    #   - input 이 dir + metadata.yaml 있음 → dir 그대로 (mcap / sqlite3 둘 다 가능)
     #   - input 이 dir + metadata 없음 + 단일 .mcap 있음 → 그 .mcap 으로 fallback
     bag_uri = input_path
     if input_path.is_dir():
         if (input_path / "metadata.yaml").exists():
-            pass  # 표준 rosbag2 layout
+            pass  # 표준 rosbag2 layout (mcap or sqlite3)
         else:
             mcaps = sorted(input_path.glob("*.mcap"))
             if len(mcaps) == 1:
@@ -649,6 +676,23 @@ def main():
                       f"파일 한 개를 직접 인자로 넘겨주세요.")
                 return
 
+    # Storage backend 결정 — auto 면 dir 내용으로 추론.
+    storage_id = args.storage
+    if storage_id == "auto":
+        probe_dir = bag_uri if bag_uri.is_dir() else bag_uri.parent
+        has_mcap = bool(list(probe_dir.glob("*.mcap"))) or bag_uri.suffix == ".mcap"
+        has_db3 = bool(list(probe_dir.glob("*.db3")))
+        if has_mcap and not has_db3:
+            storage_id = "mcap"
+        elif has_db3 and not has_mcap:
+            storage_id = "sqlite3"
+        elif has_mcap and has_db3:
+            print(f"[WARN] mcap 과 db3 가 같이 있음 → mcap 사용 (강제 변경은 --storage 인자)")
+            storage_id = "mcap"
+        else:
+            print(f"[WARN] storage 자동 감지 실패 → mcap 가정")
+            storage_id = "mcap"
+
     if args.output:
         output_dir = Path(args.output).resolve()
     else:
@@ -660,11 +704,12 @@ def main():
     print(f"입력: {input_path}")
     print(f"출력: {output_dir}")
     print(f"포맷: {args.format}")
+    print(f"Storage: {storage_id}, Namespace: {args.namespace or '(없음)'}")
     if args.format == "trajstudio":
         print(f"재생용 Hz: {args.hz}, 분석용 Hz: {args.torque_hz}")
     print()
 
-    data, topic_meta = _parse_bag(str(bag_uri))
+    data, topic_meta = _parse_bag(str(bag_uri), storage_id=storage_id, namespace=args.namespace)
     if not data:
         return
 
