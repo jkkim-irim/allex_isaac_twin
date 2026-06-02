@@ -11,7 +11,9 @@ import asyncio
 import gc
 from pathlib import Path
 
+import carb.input
 import omni
+import omni.appwindow
 import omni.kit.commands
 import omni.timeline
 import omni.ui as ui
@@ -95,6 +97,21 @@ class Extension(omni.ext.IExt):
             self._hysteresis_callback,
             description=f"Add {HYSTERESIS_TITLE} Extension to UI toolbar",
         )
+        action_registry.register_action(
+            ext_id,
+            "RunShowcaseReplay",
+            self._run_showcase_replay,
+            description="Run Showcase Replay (current group + main source)",
+        )
+
+        # Global hotkey: Ctrl+Shift+R → Run Showcase Replay.
+        # 전체화면/extension UI 가린 상태에서도 동작. modifier 조합이라 입력 충돌 적음.
+        self._input_iface = carb.input.acquire_input_interface()
+        self._app_window = omni.appwindow.get_default_app_window()
+        keyboard = self._app_window.get_keyboard()
+        self._hotkey_sub = self._input_iface.subscribe_to_keyboard_events(
+            keyboard, self._on_global_key_event
+        )
         self._menu_items = [
             MenuItemDescription(name=EXTENSION_TITLE, onclick_action=(ext_id, f"CreateUIExtension:{EXTENSION_TITLE}")),
             MenuItemDescription(name=HYSTERESIS_TITLE, onclick_action=(ext_id, f"CreateUIExtension:{HYSTERESIS_TITLE}")),
@@ -123,9 +140,25 @@ class Extension(omni.ext.IExt):
         newton_bridge.uninstall()
         remove_menu_items(self._menu_items, EXTENSION_TITLE)
 
+        # Global hotkey unsubscribe.
+        try:
+            if getattr(self, "_hotkey_sub", None) is not None and self._app_window is not None:
+                self._input_iface.unsubscribe_to_keyboard_events(
+                    self._app_window.get_keyboard(), self._hotkey_sub
+                )
+        except Exception:
+            pass
+        self._hotkey_sub = None
+        self._app_window = None
+        self._input_iface = None
+
         action_registry = omni.kit.actions.core.get_action_registry()
         action_registry.deregister_action(self.ext_id, f"CreateUIExtension:{EXTENSION_TITLE}")
         action_registry.deregister_action(self.ext_id, f"CreateUIExtension:{HYSTERESIS_TITLE}")
+        try:
+            action_registry.deregister_action(self.ext_id, "RunShowcaseReplay")
+        except Exception:
+            pass
 
         if self._window:
             self._window = None
@@ -185,6 +218,33 @@ class Extension(omni.ext.IExt):
     def _menu_callback(self):
         self._window.visible = not self._window.visible
         self.ui_builder.on_menu_callback()
+
+    def _run_showcase_replay(self):
+        """Action callback — ShowcaseReplayControls 의 ▶ 와 동일 동작 호출.
+
+        Showcase Replay 가 아직 UI 빌드 안 된 경우 (window 한 번도 안 열림) 에는
+        instance 없음 → 경고만 출력. window 열면 build_ui 가 instance 만듦.
+        """
+        ui_builder = getattr(self, "ui_builder", None)
+        showcase = getattr(ui_builder, "_showcase_replay", None) if ui_builder else None
+        if showcase is None:
+            print("[ALLEX] hotkey: Showcase Replay UI 미빌드 — extension window 한 번 열어주세요")
+            return
+        try:
+            showcase.trigger_run()
+        except Exception as exc:
+            print(f"[ALLEX] hotkey RunShowcaseReplay 실패: {exc}")
+
+    def _on_global_key_event(self, event, *_args, **_kwargs):
+        """Ctrl+Shift+R → Run Showcase Replay 단축키."""
+        if event.type != carb.input.KeyboardEventType.KEY_PRESS:
+            return True
+        mods = event.modifiers
+        ctrl = bool(mods & carb.input.KEYBOARD_MODIFIER_FLAG_CONTROL)
+        shift = bool(mods & carb.input.KEYBOARD_MODIFIER_FLAG_SHIFT)
+        if ctrl and shift and event.input == carb.input.KeyboardInput.R:
+            self._run_showcase_replay()
+        return True
 
     def _hysteresis_callback(self):
         """Hysteresis 메뉴 토글 — 최초 클릭 시에만 UI 빌드, 이후엔 visible 토글."""

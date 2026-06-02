@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -192,6 +193,14 @@ class CsvReplayer:
         self._force_gain: dict = self._parse_force_gain(
             viz_scenario.get("force_gain") or {}
         )
+        # --- force_mirror 파싱 ---
+        # JSON form: {"sim.<ch>": {"name": "<mirror_name>", "origin": "link:<x>"|"sim.<ch>"}}
+        # 원본 sim 채널을 push 할 때마다 -vec 와 다른 origin 으로 derived channel
+        # 한 개를 추가로 push (Newton's 3rd law 반대편 arrow). origin spec 은
+        # force_origin 과 동일 규칙. real.* 은 미지원 (이미 양방향 topic 존재).
+        self._force_mirror: dict = self._parse_force_mirror(
+            viz_scenario.get("force_mirror") or {}
+        )
 
         # --- ext_torque_triggers 파싱 ---
         # Wrench 의 torque (Nm) ring 게이팅. real CSV 만 — sim 쪽엔 Wrench torque 없음.
@@ -227,16 +236,88 @@ class CsvReplayer:
             viz_scenario.get("trail_triggers") or {}
         )
 
+        # --- force_label_channels 파싱 ---
+        # JSON form: ["real.<topic_id>", "sim.<channel>", ...]
+        # UI 의 magnitude label toggle 이 ON 인 상태에서 추가로 채널 화이트리스트 적용.
+        # None / 빈 list → 필터 없음 (현재 visible force vector 전부 라벨 표시).
+        # 비어있지 않으면 그 채널만. visualizer.set_force_label_filter 로 push.
+        raw_label_ch = viz_scenario.get("force_label_channels")
+        self._force_label_channels: list[str] = []
+        if isinstance(raw_label_ch, list):
+            for item in raw_label_ch:
+                if isinstance(item, str) and "." in item:
+                    self._force_label_channels.append(item)
+        try:
+            if hasattr(self._viz, "set_force_label_filter"):
+                self._viz.set_force_label_filter(
+                    self._force_label_channels or None
+                )
+        except Exception as exc:
+            logger.debug(f"[replay] set_force_label_filter warn: {exc}")
+
+        # --- force_label style override (size / unit_size / x,y,z offset) ---
+        # 시나리오 별 라벨 크기 / 단위 글자 / world XYZ lift 미세조정.
+        # overlay 가 singleton 이라 이전 시나리오 값이 그대로 carry-over 되는 걸 막기 위해
+        # **매 replay 시작 시 reset_style() + clear_channel_offsets() 로 module default 로
+        # 복귀** 후 config 값으로 override. 누락된 키는 module default 그대로.
+        # 값이 잘못된 타입이면 silently skip — overlay setter 가 알아서 무시.
+        self._force_label_offsets: dict = {}
+        try:
+            from ..core.force_label_overlay import get_force_label_overlay
+            from ..core.force_torque_visualizer import ForceTorqueVisualizer
+            overlay = get_force_label_overlay()
+            overlay.reset_style()
+            overlay.clear_channel_offsets()
+            overlay.set_style(
+                size_px=viz_scenario.get("force_label_size"),
+                unit_size_px=viz_scenario.get("force_label_unit_size"),
+                x_offset_m=viz_scenario.get("force_label_x_offset"),
+                y_offset_m=viz_scenario.get("force_label_y_offset"),
+                z_offset_m=viz_scenario.get("force_label_z_offset"),
+            )
+            # per-channel override: {"source.name": [x, y, z]}.
+            # 각 컴포넌트가 null 이면 그 축은 instance global 상속.
+            raw_offsets = viz_scenario.get("force_label_offsets")
+            if isinstance(raw_offsets, dict):
+                for ch_key, off in raw_offsets.items():
+                    if not (isinstance(ch_key, str) and "." in ch_key):
+                        continue
+                    if not (isinstance(off, (list, tuple)) and len(off) == 3):
+                        continue
+                    src, _, nm = ch_key.partition(".")
+                    if not nm:
+                        continue
+                    prim_path = ForceTorqueVisualizer.force_label_prim_path(src, nm)
+                    overlay.set_channel_offset(
+                        prim_path,
+                        x=off[0], y=off[1], z=off[2],
+                    )
+                    self._force_label_offsets[ch_key] = tuple(off)
+                    logger.info(
+                        f"[replay] force_label_offset push: "
+                        f"{ch_key} -> {prim_path} = {tuple(off)}"
+                    )
+        except Exception as exc:
+            import traceback
+            logger.warning(
+                f"[replay] force_label set_style failed: {exc}\n"
+                f"{traceback.format_exc()}"
+            )
+
         if (self._force_triggers or self._ext_torque_triggers
                 or self._torque_ring_triggers or self._ext_jtq_triggers
-                or self._trail_triggers):
+                or self._trail_triggers or self._force_label_channels
+                or self._force_mirror):
             logger.info(
                 f"[replay] viz_scenario loaded: "
                 f"force={len(self._force_triggers)}ch, "
                 f"ext_torque={len(self._ext_torque_triggers)}ch, "
                 f"torque_ring={len(self._torque_ring_triggers)}ch, "
                 f"ext_joint_torque={len(self._ext_jtq_triggers)}ch, "
-                f"trail={len(self._trail_triggers)}ch"
+                f"trail={len(self._trail_triggers)}ch, "
+                f"force_label={len(self._force_label_channels)}ch, "
+                f"force_label_offsets={len(self._force_label_offsets)}ch, "
+                f"force_mirror={len(self._force_mirror)}ch"
             )
         if self._real_origin_alias:
             def _fmt(k, entry):
@@ -1762,6 +1843,122 @@ class CsvReplayer:
         return frozenset(out)
 
     @staticmethod
+    def _parse_force_mirror(raw) -> dict:
+        """``force_mirror`` dict → ``dict[(source, channel)] = (mirror_name, origin_spec)``.
+
+        JSON form::
+
+            "force_mirror": {
+              "sim.L_Palm_R_Palm": {
+                "name":   "R_Palm_L_Palm",
+                "origin": "link:R_Palm_Link"
+              }
+            }
+
+        의미: 원본 sim 채널을 push 할 때마다, 같은 magnitude·반전 방향의 vector 를
+        ``mirror_name`` 이름으로 추가 push (origin 은 ``origin`` 으로 옮겨짐).
+        Newton's 3rd law 의 반대편 arrow 를 한 데이터로 그릴 때 사용.
+
+        - source 는 ``sim`` 만 지원 (real CSV 는 이미 양방향 ext_force topic 존재).
+        - ``origin`` spec 은 ``force_origin`` 과 동일 — ``"link:<name>"``
+          (또는 절대 ``"link:/abs"``) 또는 ``"sim.<channel>"``.
+          ``[<str>, [x,y,z]]`` 형태로 link-local offset 추가도 허용.
+        - ``mirror_name`` 은 원본 채널과 달라야 함 (충돌 시 skip + warning).
+        """
+        out: dict = {}
+        if not raw:
+            return out
+        if not isinstance(raw, dict):
+            logger.warning(
+                f"[viz_scenario] force_mirror must be dict, got "
+                f"{type(raw).__name__}; ignored"
+            )
+            return out
+        for key, val in raw.items():
+            if not isinstance(key, str) or "." not in key:
+                logger.warning(
+                    f"[viz_scenario] force_mirror key {key!r} not 'sim.<ch>'; skip"
+                )
+                continue
+            src, _, ch = key.partition(".")
+            src = src.strip().lower()
+            ch = ch.strip()
+            if src != "sim" or not ch:
+                logger.warning(
+                    f"[viz_scenario] force_mirror key {key!r}: only 'sim.<ch>' supported; skip"
+                )
+                continue
+            if not isinstance(val, dict):
+                logger.warning(
+                    f"[viz_scenario] force_mirror[{key!r}] must be object with "
+                    f"name/origin; got {type(val).__name__}; skip"
+                )
+                continue
+            mirror_name = val.get("name")
+            origin_raw = val.get("origin")
+            if not isinstance(mirror_name, str) or not mirror_name.strip():
+                logger.warning(
+                    f"[viz_scenario] force_mirror[{key!r}].name missing or empty; skip"
+                )
+                continue
+            mirror_name = mirror_name.strip()
+            if mirror_name == ch:
+                logger.warning(
+                    f"[viz_scenario] force_mirror[{key!r}].name same as source "
+                    f"channel; skip"
+                )
+                continue
+            # origin spec parsing — force_origin 과 동일 규칙 재사용.
+            spec_str: Optional[str] = None
+            offset: Optional[tuple] = None
+            if isinstance(origin_raw, str):
+                spec_str = origin_raw
+            elif (isinstance(origin_raw, list) and len(origin_raw) == 2
+                  and isinstance(origin_raw[0], str)):
+                spec_str = origin_raw[0]
+                off_raw = origin_raw[1]
+                if isinstance(off_raw, (list, tuple)) and len(off_raw) == 3:
+                    try:
+                        offset = (float(off_raw[0]), float(off_raw[1]),
+                                  float(off_raw[2]))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"[viz_scenario] force_mirror[{key!r}] offset "
+                            f"{off_raw!r} not numeric; ignored"
+                        )
+                        offset = None
+            else:
+                logger.warning(
+                    f"[viz_scenario] force_mirror[{key!r}].origin = {origin_raw!r} "
+                    f"not string or [string, [x,y,z]]; skip"
+                )
+                continue
+            s = spec_str.strip()
+            parsed: Optional[tuple] = None
+            if s.lower().startswith("sim."):
+                target = s[4:].strip()
+                if target:
+                    if offset is not None:
+                        logger.warning(
+                            f"[viz_scenario] force_mirror[{key!r}]: offset "
+                            f"ignored for sim alias"
+                        )
+                        offset = None
+                    parsed = ("sim", target, None)
+            elif s.lower().startswith("link:"):
+                target = s[5:].strip()
+                if target:
+                    parsed = ("link", target, offset)
+            if parsed is None:
+                logger.warning(
+                    f"[viz_scenario] force_mirror[{key!r}].origin {spec_str!r} "
+                    f"not 'sim.<ch>' or 'link:<name>'; skip"
+                )
+                continue
+            out[(src, ch)] = (mirror_name, parsed)
+        return out
+
+    @staticmethod
     def _parse_force_triggers(raw: dict) -> dict:
         """JSON 의 force_triggers section 을 internal dict 로 변환.
 
@@ -2074,8 +2271,11 @@ class CsvReplayer:
             return True
 
         for sanitized_pair, vec_arr in reader.pair_force_vec.items():
+            mirror = self._force_mirror.get(("sim", sanitized_pair))
             if not _sim_active(sanitized_pair):
                 self._set_force_prim_visible(viz, sanitized_pair, "sim", False)
+                if mirror is not None:
+                    self._set_force_prim_visible(viz, mirror[0], "sim", False)
                 continue
             vec = vec_arr[idx]
             sign = -1.0 if ("sim", sanitized_pair) in self._force_invert else 1.0
@@ -2083,7 +2283,14 @@ class CsvReplayer:
             if gain != 1.0:
                 vec = (float(vec[0]) * gain, float(vec[1]) * gain, float(vec[2]) * gain)
             origin_arr = reader.pair_contact_pos.get(sanitized_pair)
-            origin = origin_arr[idx] if origin_arr is not None else (0.0, 0.0, 0.0)
+            if origin_arr is not None:
+                origin = origin_arr[idx]
+            else:
+                # CSV 에 contact_pos 없으면 — pair 이름 suffix `_(L|R)_Palm` 에서
+                # palm link 추출, 그 link 의 world translation 사용 (default).
+                # 명시 override 는 force_origin (현재 real.* 만 지원) — 추후 sim.* 확장 시
+                # 같은 alias 가 이 default 보다 우선.
+                origin = self._default_pair_origin(sanitized_pair) or (0.0, 0.0, 0.0)
             self._trail_buffer_push("sim", sanitized_pair, origin, t_rel)
             self._set_or_add(viz, sanitized_pair, "sim", origin, vec)
             self._cache_sim_origin(sanitized_pair, origin)
@@ -2092,6 +2299,33 @@ class CsvReplayer:
                     (t_rel, "sim", sanitized_pair,
                      float(vec[0]), float(vec[1]), float(vec[2]))
                 )
+
+            # --- force_mirror: derived 채널을 -vec + override origin 으로 push ---
+            # Newton's 3rd law 반대편 arrow. 원본이 inactive 면 위에서 hide 처리됨.
+            if mirror is not None:
+                mirror_name, origin_spec = mirror
+                kind, target, off = origin_spec
+                mirror_origin = None
+                if kind == "link":
+                    mirror_origin = self._resolve_link_world_position(target, off)
+                elif kind == "sim":
+                    mirror_origin = self._sim_origin_cache.get(target)
+                if mirror_origin is not None:
+                    mirror_vec = (-float(vec[0]), -float(vec[1]), -float(vec[2]))
+                    self._trail_buffer_push("sim", mirror_name, mirror_origin, t_rel)
+                    self._set_or_add(viz, mirror_name, "sim", mirror_origin, mirror_vec)
+                    self._cache_sim_origin(mirror_name, mirror_origin)
+                    if self._record_forces_enabled:
+                        self._force_record_buf.append(
+                            (t_rel, "sim", mirror_name,
+                             float(mirror_vec[0]), float(mirror_vec[1]),
+                             float(mirror_vec[2]))
+                        )
+                elif self._step_count % 200 == 0:
+                    logger.debug(
+                        f"[replay] force_mirror sim.{sanitized_pair} → "
+                        f"{mirror_name}: origin '{kind}:{target}' not resolved"
+                    )
 
         # aggregate — CSV 의 normal 은 reaction 기준이라 -1 곱해 손등 위로 향하게.
         for tag, agg in reader.aggregate.items():
@@ -2354,6 +2588,27 @@ class CsvReplayer:
                 pass
         except Exception as exc:
             logger.debug(f"[replay] torque ring visibility toggle warn: {exc}")
+
+    _PAIR_PALM_RE = re.compile(r"_(L|R)_Palm$")
+
+    def _default_pair_origin(self, sanitized_pair: str) -> Optional[tuple]:
+        """sim pair 의 default contact origin — pair 이름 suffix 에서 palm link 추출.
+
+        Naming convention: ``<linkA>_<linkB>`` 에서 linkB 가 ``(L|R)_Palm`` 이면
+        그 palm link 의 world translation 을 origin 으로 사용. e.g.::
+
+            "L_Elbow_R_Palm"  → R_Palm_Link
+            "L_Palm_R_Palm"   → R_Palm_Link
+            "R_Elbow_L_Palm"  → L_Palm_Link
+
+        SimDynamicReader 처럼 ``pair_contact_pos`` 가 비어있을 때 호출.
+        매칭 실패하거나 link transform 못 가져오면 None.
+        """
+        m = self._PAIR_PALM_RE.search(sanitized_pair)
+        if not m:
+            return None
+        link_name = f"{m.group(1)}_Palm_Link"
+        return self._resolve_link_world_position(link_name)
 
     def _resolve_link_world_position(self, link_name: str,
                                      offset_local: Optional[tuple] = None

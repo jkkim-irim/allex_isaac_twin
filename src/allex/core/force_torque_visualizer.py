@@ -185,6 +185,11 @@ class ForceTorqueVisualizer:
         #           "last_vec": (fx, fy, fz) or None}
         self._custom_force_prims: dict = {}
 
+        # force magnitude label filter — None or empty 면 visible 한 모든 force vector
+        # 가 라벨 표시. frozenset of (source, name) tuples 가 설정되면 그 채널만 표시.
+        # csv_replayer 가 viz_scenario_config 의 "force_label_channels" 를 파싱해 push.
+        self._force_label_filter: frozenset | None = None
+
         # Custom trail (BasisCurves) 테이블. key = "{source}::{name}".
         # rec: {"prim", "prim_path", "source", "name"}. points 는 csv_replayer 측이
         # 매 frame set_custom_trail 로 갱신 — visualizer 는 prim lifecycle 만 관리.
@@ -657,6 +662,16 @@ class ForceTorqueVisualizer:
         """source + name 조합으로 내부 key. ``_custom_force_prims`` 에 사용."""
         return f"{source}::{name}"
 
+    @classmethod
+    def force_label_prim_path(cls, source: str, name: str) -> str:
+        """custom force vector 의 prim_path (= overlay 가 key 로 쓰는 식별자) 를 미리 계산.
+
+        force vector 가 아직 등록되기 전에도 overlay.set_channel_offset 같은 메서드를
+        호출할 수 있게 하기 위한 helper. ``add_custom_force_vector`` 의 default
+        parent (``CUSTOM_FORCE_ROOT/<source>``) 와 동일한 규칙을 사용한다.
+        """
+        return f"{cls.CUSTOM_FORCE_ROOT}/{str(source).lower()}/{name}"
+
     def _overlay(self):
         """force_label_overlay singleton getter. 매 호출마다 dynamic import 로 현재 모듈
         상태에서 getter 를 resolve — extension reload 후 singleton desync 방지."""
@@ -884,7 +899,8 @@ class ForceTorqueVisualizer:
                         prim, mag, kind, overlay)
                     # arrow visibility 와 동일한 post-gain 임계 적용.
                     s = _clip(mag * gain, lo, hi)
-                    label_visible = (s >= hide_below) and (anchor is not None)
+                    label_visible = (s >= hide_below) and (anchor is not None) \
+                        and self._force_label_allowed(source, name)
                     if anchor is not None:
                         overlay.update(prim_path, anchor, mag, label_visible)
                 except Exception as exc:
@@ -987,7 +1003,8 @@ class ForceTorqueVisualizer:
                             if anchor is not None and prim_path:
                                 # arrow visibility 와 동일한 post-gain 임계 적용.
                                 s = _clip(magnitude * gain, lo, hi)
-                                label_visible = s >= hide_below
+                                label_visible = (s >= hide_below) \
+                                    and self._force_label_allowed(source, name)
                                 overlay.update(prim_path, anchor, magnitude,
                                                 label_visible)
                     except Exception as exc:
@@ -1049,6 +1066,57 @@ class ForceTorqueVisualizer:
         return [rec["name"]
                 for rec in self._custom_force_prims.values()
                 if rec.get("source") == source]
+
+    def set_force_label_filter(self, channels) -> None:
+        """magnitude label 시각화 채널 화이트리스트 설정.
+
+        channels: None / 빈 iterable → 필터 해제 (visible 한 모든 force vector 가 라벨 표시).
+                  iterable of (source, name) tuple 또는 "source.name" 문자열
+                  → 매칭되는 채널만 라벨 표시.
+
+        UI master toggle 과 독립적으로 동작 — toggle OFF 면 어차피 overlay 가 no-op.
+        """
+        if channels is None:
+            self._force_label_filter = None
+            return
+        try:
+            items = list(channels)
+        except TypeError:
+            self._force_label_filter = None
+            return
+        parsed: set = set()
+        for it in items:
+            if isinstance(it, tuple) and len(it) == 2:
+                parsed.add((str(it[0]).lower(), str(it[1])))
+            elif isinstance(it, str) and "." in it:
+                src, _, nm = it.partition(".")
+                parsed.add((src.lower(), nm))
+        self._force_label_filter = frozenset(parsed) if parsed else None
+        # 이미 등록된 force prim 들 → overlay 상태를 새 필터로 즉시 재반영.
+        overlay = self._overlay()
+        if overlay is None or not overlay.is_enabled():
+            return
+        for rec in self._custom_force_prims.values():
+            if rec.get("kind", "force") != "force":
+                continue
+            prim_path = rec.get("prim_path")
+            if not prim_path:
+                continue
+            source = rec.get("source", "user")
+            name = rec.get("name", "")
+            if not self._force_label_allowed(source, name):
+                try:
+                    last_pos = rec.get("last_position") or (0.0, 0.0, 0.0)
+                    overlay.update(prim_path, last_pos, 0.0, False)
+                except Exception as exc:
+                    logger.debug(f"[viz] force_label_filter hide warn: {exc}")
+
+    def _force_label_allowed(self, source: str, name: str) -> bool:
+        """현재 필터가 (source, name) 채널의 라벨을 허용하는지. 필터 없음 = True."""
+        flt = self._force_label_filter
+        if not flt:
+            return True
+        return (str(source).lower(), str(name)) in flt
 
     def _update_custom_force_vectors(self):
         """update() 훅. 현재는 set_*/add_* 가 즉시 반영하므로 no-op.

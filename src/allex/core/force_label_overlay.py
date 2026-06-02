@@ -26,8 +26,12 @@ _SOURCE_COLOR = {
     "user": (1.0, 0.2, 0.2, 1.0),
 }
 _DEFAULT_COLOR = (1.0, 0.2, 0.2, 1.0)
-_LABEL_SIZE_PX = 16
-# world Z up offset (m) — anchor 를 살짝 올려 arrow head 와 글자가 겹치지 않게.
+_LABEL_SIZE_PX = 27         # 숫자 (magnitude) 크기
+_LABEL_UNIT_SIZE_PX = 18    # "[N]" 단위 크기 (숫자보다 작게)
+# world XYZ offset (m) — anchor 를 살짝 띄워 arrow head 와 글자가 겹치지 않게.
+# scenario 별 (또는 force 별) override 가 없으면 이 값이 모든 라벨에 적용.
+_LABEL_X_OFFSET = 0.0
+_LABEL_Y_OFFSET = 0.0
 _LABEL_Z_OFFSET = 0.03
 
 
@@ -48,6 +52,21 @@ class ForceLabelOverlay:
         # 위치 계산은 visualizer 가 담당하고, overlay 는 mode 값만 보관해
         # 사용자/visualizer 가 공유 — UI 토글 시 visualizer 가 이 값을 읽어 분기.
         self._anchor_mode: str = "origin"
+
+        # 라벨 스타일 — 모듈 상수에서 default 복사. scenario 별로 setter 로 override 가능.
+        # (viz_scenario_config 의 force_label_size / force_label_unit_size /
+        # force_label_z_offset 키 → csv_replayer 가 setter 호출.)
+        self._size_px: int = _LABEL_SIZE_PX
+        self._unit_size_px: int = _LABEL_UNIT_SIZE_PX
+        # world offset (m) — scenario-global default. per-channel override 가 없는 라벨에 적용.
+        self._x_offset_m: float = _LABEL_X_OFFSET
+        self._y_offset_m: float = _LABEL_Y_OFFSET
+        self._z_offset_m: float = _LABEL_Z_OFFSET
+
+        # per-channel world offset override.
+        #   key (= force vector prim_path) -> (x|None, y|None, z|None).
+        #   컴포넌트가 None 이면 그 축은 위 _*_offset_m global 값을 상속.
+        self._channel_offsets: dict = {}
 
         # key -> {"source", "transform", "label", "color"}
         self._entries: dict = {}
@@ -75,6 +94,119 @@ class ForceLabelOverlay:
         # last_state 좌표가 이전 모드 기준이라 dirty-check 가 새 좌표를 거를 수
         # 있음 → 강제 무효화. enabled=False 면 entry 만 있고 scene 노드는 없음.
         self._last_state.clear()
+
+    def set_style(self, *, size_px: int | None = None,
+                  unit_size_px: int | None = None,
+                  z_offset_m: float | None = None,
+                  x_offset_m: float | None = None,
+                  y_offset_m: float | None = None) -> None:
+        """라벨 스타일 instance override. None 인 인자는 변경 없음.
+
+        scenario 별 viz_scenario_config 의 force_label_size /
+        force_label_unit_size / force_label_{x,y,z}_offset 가 csv_replayer 를 통해 push.
+        하나라도 실제 변경되면 dirty cache 비워서 enabled 인 entry 들이 다음
+        update 때 새 스타일로 rebuild 되게 한다.
+        """
+        changed = False
+        if size_px is not None:
+            try:
+                v = int(size_px)
+                if v > 0 and v != self._size_px:
+                    self._size_px = v
+                    changed = True
+            except (TypeError, ValueError):
+                pass
+        if unit_size_px is not None:
+            try:
+                v = int(unit_size_px)
+                if v > 0 and v != self._unit_size_px:
+                    self._unit_size_px = v
+                    changed = True
+            except (TypeError, ValueError):
+                pass
+        if x_offset_m is not None:
+            try:
+                v = float(x_offset_m)
+                if v != self._x_offset_m:
+                    self._x_offset_m = v
+                    changed = True
+            except (TypeError, ValueError):
+                pass
+        if y_offset_m is not None:
+            try:
+                v = float(y_offset_m)
+                if v != self._y_offset_m:
+                    self._y_offset_m = v
+                    changed = True
+            except (TypeError, ValueError):
+                pass
+        if z_offset_m is not None:
+            try:
+                v = float(z_offset_m)
+                if v != self._z_offset_m:
+                    self._z_offset_m = v
+                    changed = True
+            except (TypeError, ValueError):
+                pass
+        if changed:
+            self._last_state.clear()
+            # 이미 표시 중인 라벨들 즉시 재빌드.
+            self._rebuild_all_from_state()
+
+    def reset_style(self) -> None:
+        """라벨 스타일을 모듈 default 로 되돌림 — scenario 떠날 때 호출 가능."""
+        self.set_style(
+            size_px=_LABEL_SIZE_PX,
+            unit_size_px=_LABEL_UNIT_SIZE_PX,
+            x_offset_m=_LABEL_X_OFFSET,
+            y_offset_m=_LABEL_Y_OFFSET,
+            z_offset_m=_LABEL_Z_OFFSET,
+        )
+
+    def set_channel_offset(self, key: str, *, x: float | None = None,
+                           y: float | None = None,
+                           z: float | None = None) -> None:
+        """force vector 한 채널의 world offset override.
+
+        key : overlay 가 add() 받은 식별자 — force vector prim_path 와 동일.
+        x/y/z : 각 축 offset (m). None 이면 그 축은 instance global (_*_offset_m) 상속.
+        세 인자 모두 None 이면 해당 채널 override 제거.
+
+        force vector 가 아직 등록 안 됐어도 호출 가능 — 나중에 add() 될 때 이 값을 사용한다.
+        """
+        if not key:
+            return
+        if x is None and y is None and z is None:
+            if key in self._channel_offsets:
+                del self._channel_offsets[key]
+                self._last_state.pop(key, None)
+                self._rebuild_all_from_state()
+            return
+        prev = self._channel_offsets.get(key)
+        nx = (None if x is None else float(x))
+        ny = (None if y is None else float(y))
+        nz = (None if z is None else float(z))
+        if prev is None:
+            new = (nx, ny, nz)
+        else:
+            new = (prev[0] if x is None else nx,
+                   prev[1] if y is None else ny,
+                   prev[2] if z is None else nz)
+        if prev == new:
+            return
+        self._channel_offsets[key] = new
+        self._last_state.pop(key, None)
+        self._rebuild_all_from_state()
+
+    def clear_channel_offsets(self) -> None:
+        """모든 per-channel offset 제거 — scenario 떠날 때 호출."""
+        if not self._channel_offsets:
+            return
+        keys = list(self._channel_offsets.keys())
+        self._channel_offsets.clear()
+        for k in keys:
+            self._last_state.pop(k, None)
+        self._rebuild_all_from_state()
 
     def set_enabled(self, enabled: bool) -> None:
         """master toggle. OFF 면 모든 entry 제거 + scene_view 해제."""
@@ -127,7 +259,7 @@ class ForceLabelOverlay:
         if not self._ensure_scene():
             return
 
-        text = f"{float(magnitude_n):.1f} [N]"
+        text = f"{float(magnitude_n):.1f}"
         try:
             px, py, pz = float(world_pos[0]), float(world_pos[1]), float(world_pos[2])
         except Exception:
@@ -289,9 +421,11 @@ class ForceLabelOverlay:
             pass
 
         try:
-            alignment_center = ui.Alignment.CENTER
+            alignment_right = ui.Alignment.RIGHT_CENTER
+            alignment_left = ui.Alignment.LEFT_CENTER
         except Exception:
-            alignment_center = None
+            alignment_right = None
+            alignment_left = None
 
         with self._scene_view.scene:
             for key, rec in self._entries.items():
@@ -310,21 +444,35 @@ class ForceLabelOverlay:
                 if not state.get("visible", False):
                     continue
                 pos = state["pos"]
+                # per-channel override (있으면) else instance global. 각 축 독립 상속.
+                chan = self._channel_offsets.get(key)
+                if chan is None:
+                    ox, oy, oz = (self._x_offset_m, self._y_offset_m,
+                                  self._z_offset_m)
+                else:
+                    cx, cy, cz = chan
+                    ox = self._x_offset_m if cx is None else cx
+                    oy = self._y_offset_m if cy is None else cy
+                    oz = self._z_offset_m if cz is None else cz
                 try:
                     tr_mat = sc.Matrix44.get_translation_matrix(
-                        float(pos[0]),
-                        float(pos[1]),
-                        float(pos[2]) + _LABEL_Z_OFFSET,
+                        float(pos[0]) + ox,
+                        float(pos[1]) + oy,
+                        float(pos[2]) + oz,
                     )
                     transform = sc.Transform(transform=tr_mat)
                     with transform:
-                        label_kwargs = {
-                            "color": state.get("color", _DEFAULT_COLOR),
-                            "size": _LABEL_SIZE_PX,
-                        }
-                        if alignment_center is not None:
-                            label_kwargs["alignment"] = alignment_center
-                        sc.Label(state["text"], **label_kwargs)
+                        color = state.get("color", _DEFAULT_COLOR)
+                        # 숫자 (큰 글씨) — anchor 좌측으로 extends (RIGHT_CENTER).
+                        num_kwargs = {"color": color, "size": self._size_px}
+                        if alignment_right is not None:
+                            num_kwargs["alignment"] = alignment_right
+                        sc.Label(state["text"], **num_kwargs)
+                        # 단위 "[N]" (작은 글씨) — anchor 우측으로 extends, 앞에 공백 1개로 gap.
+                        unit_kwargs = {"color": color, "size": self._unit_size_px}
+                        if alignment_left is not None:
+                            unit_kwargs["alignment"] = alignment_left
+                        sc.Label(" [N]", **unit_kwargs)
                     rec["transform"] = transform
                 except Exception as exc:
                     logger.debug(f"[viz] force_label_overlay node build warn: {exc}")

@@ -37,6 +37,7 @@ Usage:
 
 import argparse
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -129,12 +130,18 @@ for _hand_up, _hand_lo in (("L", "l"), ("R", "r")):
 del _hand_up, _hand_lo, _finger, _tid
 
 
-def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
+def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = "",
+               torque_source: str = "result", position_source: str = "result"):
     """bag 을 읽어 {topic_name: [(t_ns, [values])...] } 리턴.
 
     storage_id: "mcap" 또는 "sqlite3".
     namespace : bag 토픽 prefix (예: "/allex/p001"). 매칭 전 떼고 표준 토픽 이름과 비교.
                 keep / topic_meta 의 키는 원본(stripped 안 된) 이름 — reader 가 그걸 알아야 하므로.
+    torque_source  : "result" (default) → `/result/<g>/joint/torque` (필터). "outbound" →
+                     raw `/<ns>/robot_outbound_data/<g>/joint_torque`. 단위 동일 (Nm).
+    position_source: "result" (default) → `/result/<g>/joint/position` (rad, 필터).
+                     "outbound" → `/<ns>/robot_outbound_data/<g>/joint_positions_deg`. **deg
+                     단위라 read 시점에 자동으로 rad 로 변환** (consumer 는 rad 가정).
     """
     reader = rosbag2_py.SequentialReader()
     reader.open(
@@ -167,6 +174,7 @@ def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
     # 5) ext_force / contact_pos — 위 dict 매핑 그대로.
     keep = []
     topic_meta = {}  # topic(orig) → (group, suffix)
+    needs_deg_to_rad: set = set()   # topic(orig) 들 — read 시점 deg→rad 변환 적용
     # matching 은 namespace-stripped 이름으로, keep/topic_meta 의 키는 원본(orig) 이름.
     for orig in type_map:
         name = _strip_ns(orig)
@@ -174,6 +182,8 @@ def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
         # /result/<group>/joint/position (필터된 joint position [rad])
         if (len(parts) == 4 and parts[0] == "result"
                 and parts[2] == "joint" and parts[3] == "position"):
+            if position_source != "result":
+                continue   # outbound 모드 — result position 스킵
             group = parts[1]
             if group not in CSV_GROUPS:
                 continue
@@ -183,6 +193,8 @@ def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
         # /result/<group>/joint/torque (필터된 joint torque)
         if (len(parts) == 4 and parts[0] == "result"
                 and parts[2] == "joint" and parts[3] == "torque"):
+            if torque_source != "result":
+                continue   # outbound 모드 — result torque 스킵
             group = parts[1]
             if group not in CSV_GROUPS:
                 continue
@@ -206,10 +218,21 @@ def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
             if group not in CSV_GROUPS:
                 continue
             if suffix == "joint_torque":
-                # raw torque skip — 필터된 /result/<group>/joint/torque 만 쓴다.
+                if torque_source == "outbound":
+                    # raw outbound torque 채택 (비교/실험용). suffix 그대로 "joint_torque"
+                    # → torque_* 컬럼에 들어감. /result/<g>/joint/torque 와 동일 dispatch 경로.
+                    keep.append(orig)
+                    topic_meta[orig] = (group, "joint_torque")
+                # else: raw torque skip — 필터된 /result/<group>/joint/torque 만 쓴다.
                 continue
             if suffix == "joint_positions_deg":
-                # raw position skip — 필터된 /result/<group>/joint/position [rad] 만 쓴다.
+                if position_source == "outbound":
+                    # outbound deg position 채택 (비교/실험용). 내부 suffix = "joint_position"
+                    # 로 routing → consumer 는 rad 단위 가정이라 read 시점에 deg→rad 변환.
+                    keep.append(orig)
+                    topic_meta[orig] = (group, "joint_position")
+                    needs_deg_to_rad.add(orig)
+                # else: raw position skip — 필터된 /result/<group>/joint/position [rad] 만 쓴다.
                 continue
             if suffix not in TOPIC_TO_SUBDIR:
                 continue
@@ -232,7 +255,13 @@ def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
         return {}, {}
 
     # /result/ 토픽 부재 진단 — fallback 안 함, 빠진 컬럼만 경고.
-    result_groups = {g for (g, s) in topic_meta.values() if s in ("joint_position", "joint_torque", "joint_ext_torque")}
+    # outbound 모드에선 해당 채널이 outbound 에서 와도 OK 라 검사 대상에서 제외.
+    relevant = {"joint_ext_torque"}
+    if torque_source == "result":
+        relevant.add("joint_torque")
+    if position_source == "result":
+        relevant.add("joint_position")
+    result_groups = {g for (g, s) in topic_meta.values() if s in relevant}
     missing_result = [g for g in CSV_GROUPS if g not in result_groups]
     if missing_result:
         print(f"[WARN] /result/<group>/joint/* 누락 그룹: {missing_result}")
@@ -281,6 +310,9 @@ def _parse_bag(input_dir: str, storage_id: str = "mcap", namespace: str = ""):
         except Exception as exc:
             print(f"[WARN] deserialize 실패 ({topic}, kind={kind}): {exc}")
             continue
+        if topic in needs_deg_to_rad:
+            DEG2RAD = math.pi / 180.0
+            vals = [v * DEG2RAD for v in vals]
         data[topic].append((t_ns, vals))
 
     for t in data:
@@ -647,6 +679,14 @@ def main():
     parser.add_argument("--namespace", default="",
                         help="bag topic prefix (예: '/allex/p001'). 매칭 전 떼고 표준 토픽 "
                              "이름과 비교. 제어기 버전에 따라 namespace 가 다를 수 있음.")
+    parser.add_argument("--torque-source", choices=("result", "outbound"), default="result",
+                        help="torque_* 컬럼 출처. 'result' (default) = /result/<g>/joint/torque "
+                             "(필터됨). 'outbound' = /<ns>/robot_outbound_data/<g>/joint_torque "
+                             "(raw, 비교 실험용). 둘 다 동일 컬럼 (torque_*) 에 들어감.")
+    parser.add_argument("--position-source", choices=("result", "outbound"), default="result",
+                        help="pos_* 컬럼 출처. 'result' (default) = /result/<g>/joint/position "
+                             "(rad, 필터됨). 'outbound' = /<ns>/robot_outbound_data/<g>/"
+                             "joint_positions_deg (deg, 무필터 — read 시 자동 deg→rad 변환).")
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -704,12 +744,19 @@ def main():
     print(f"입력: {input_path}")
     print(f"출력: {output_dir}")
     print(f"포맷: {args.format}")
-    print(f"Storage: {storage_id}, Namespace: {args.namespace or '(없음)'}")
+    print(f"Storage: {storage_id}, Namespace: {args.namespace or '(없음)'}, "
+          f"TorqueSource: {args.torque_source}, PositionSource: {args.position_source}")
     if args.format == "trajstudio":
         print(f"재생용 Hz: {args.hz}, 분석용 Hz: {args.torque_hz}")
     print()
 
-    data, topic_meta = _parse_bag(str(bag_uri), storage_id=storage_id, namespace=args.namespace)
+    data, topic_meta = _parse_bag(
+        str(bag_uri),
+        storage_id=storage_id,
+        namespace=args.namespace,
+        torque_source=args.torque_source,
+        position_source=args.position_source,
+    )
     if not data:
         return
 

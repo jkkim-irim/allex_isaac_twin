@@ -57,7 +57,16 @@ torque ring 은 user 토글.
   "ext_joint_torque_triggers": {
     "ext_joint_torque_hand_l_index_abad":    [[0.0, 4.0]],
     "ext_joint_torque_arm_r_wrist_pitch":    [[5.0, 8.0]]
-  }
+  },
+
+  "force_label_channels": [
+    "real.arm_r",
+    "sim.R_Palm_Net_Force"
+  ],
+
+  "force_label_size":     28,
+  "force_label_unit_size":18,
+  "force_label_z_offset": 0.07
 }
 ```
 
@@ -751,6 +760,61 @@ force arrow 와 trail 을 시간 axis 로 다르게 보여주고 싶으면 force
   trail trace 점으로도 사용됨.
 - prim namespace 는 분리 (`<name>_trail` 별도 prim) — visibility / scale 등
   prim-level attribute 충돌은 없음.
+
+---
+
+## 6) `force_label_channels` — Force magnitude label 채널 화이트리스트
+
+UI 의 "Show force magnitude [N]" toggle 이 **ON 인 상태에서** 추가로 적용되는 채널
+필터. 토글 OFF 면 어차피 라벨 전부 off, 이 필드 무시.
+
+### Key 형식
+
+`force_triggers` 와 동일한 dotted form 의 list:
+
+```json
+"force_label_channels": [
+  "real.arm_r",
+  "sim.R_Palm_Net_Force",
+  "sim.L_Elbow__R_Palm_Back"
+]
+```
+
+### 동작
+
+| UI toggle | `force_label_channels` | 결과 |
+|---|---|---|
+| OFF | (무관) | 라벨 전부 off |
+| ON | 키 없음 / `null` / `[]` | **visible 한 모든 force vector** 라벨 표시 (기존 동작) |
+| ON | 채널 리스트 | 그 채널 라벨만 표시. 나머지는 arrow 는 보여도 라벨은 hide |
+
+라벨 visibility 는 화살표의 post-gain hide threshold (`FORCE_VEC_HIDE_BELOW`) 와
+**AND** 로 결합 — 즉 채널이 화이트리스트에 있어도 magnitude 가 너무 작으면 안 보임.
+
+### 코드 경로
+
+- 파싱: `csv_replayer.py::__init__` 에서 `viz_scenario.get("force_label_channels")`
+  → `force_torque_visualizer.set_force_label_filter(channels)`.
+- 적용: `force_torque_visualizer.py::_force_label_allowed(source, name)` 가
+  `add_custom_force_vector` / `set_custom_force_vector` 의 `label_visible` 계산에
+  AND 로 합쳐짐.
+- Live 변경: replay 도중 필터 push 가능 (visualizer 가 등록된 force prim 들의
+  overlay state 를 즉시 재반영). 다만 viz_scenario 는 replay 시작 시 1회 로드.
+
+### 같이 쓰는 라벨 스타일 키 (전부 optional)
+
+`force_label_overlay.py` 의 module default 를 시나리오 단위로 override.
+
+| 키 | 타입 | default | 의미 |
+|---|---|---|---|
+| `force_label_size` | int (px) | 27 | 숫자 글자 크기 |
+| `force_label_unit_size` | int (px) | 18 | `[N]` 단위 글자 크기 |
+| `force_label_z_offset` | float (m) | 0.03 | anchor 점에서 world Z 로 띄울 거리 |
+
+키 누락 / 잘못된 타입은 silently skip — 기존 값 유지. 변경되면 표시 중인 라벨이
+즉시 재빌드 (dirty cache invalidate). 다른 시나리오 로드 시 그 시나리오의 값으로
+덮어쓰므로 이전 시나리오 값이 남지 않게 하려면 매번 명시할 것 (또는 모듈 default 로
+돌리려면 키 값을 default 와 같게 적어두는 식).
 
 ---
 

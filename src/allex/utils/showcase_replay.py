@@ -23,7 +23,7 @@ from isaacsim.gui.components.element_wrappers import CollapsableFrame
 from isaacsim.gui.components.ui_utils import get_style
 
 from .ui_settings_utils import UIComponentFactory, UILayout
-from ..replay import CsvReplayer, ShowcaseReader
+from ..replay import CsvReplayer, ShowcaseReader, SimDynamicReader
 
 
 _VIZ_SCENARIO_FILE = "viz_scenario_config.json"
@@ -66,19 +66,49 @@ _TRAJECTORY_DIR = _EXT_ROOT / "trajectory"
 
 
 def _scan_group_csvs(group_dir: Path) -> tuple[Path | None, Path | None]:
-    """``(sim_csv, real_csv)`` strict-prefix match. None 이면 그쪽 채널 없음."""
-    sim = None
-    real = None
+    """``(sim_path, real_csv)`` strict-prefix match.
+
+    sim 우선순위:
+      1) ``sim_*/`` 하위 디렉토리 (long format — contact.csv + joint_position.csv + joint_torque.csv)
+      2) ``sim_*.csv`` (legacy wide format)
+
+    real: ``real_*.csv`` 만 (현 시점). None 이면 그쪽 채널 없음.
+    """
+    sim: Path | None = None
+    real: Path | None = None
     if not group_dir.is_dir():
         return None, None
+
+    # 1) sim_*/ subdir 먼저
     for p in sorted(group_dir.iterdir()):
-        if not p.is_file() or p.suffix.lower() != ".csv":
-            continue
-        if p.name.startswith("sim_") and sim is None:
+        if p.is_dir() and p.name.startswith("sim_"):
             sim = p
-        elif p.name.startswith("real_") and real is None:
+            break
+
+    # 2) subdir 없으면 sim_*.csv fallback
+    if sim is None:
+        for p in sorted(group_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() == ".csv" and p.name.startswith("sim_"):
+                sim = p
+                break
+
+    # real_*.csv
+    for p in sorted(group_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() == ".csv" and p.name.startswith("real_"):
             real = p
+            break
+
     return sim, real
+
+
+def _make_reader(path: Path):
+    """path 가 dir 면 SimDynamicReader (long format), file 이면 ShowcaseReader (wide).
+
+    SimDynamicReader 가 partial dir 일 때 FileNotFoundError 발생 — caller 가 catch.
+    """
+    if path.is_dir():
+        return SimDynamicReader(path)
+    return ShowcaseReader(path)
 
 
 class ShowcaseReplayControls:
@@ -269,15 +299,19 @@ class ShowcaseReplayControls:
         self._update_availability_label()
         self._set_status(f"Status: refreshed ({len(self._items)} group(s))")
 
+    def trigger_run(self) -> None:
+        """외부 트리거 (hotkey 등) 진입점. ▶ 버튼과 동일한 동작."""
+        self._on_run()
+
     def _on_run(self) -> None:
         group = self._get_selected_group()
         if group is None:
             self._set_status("Status: no group selected")
             return
 
-        sim_csv, real_csv = _scan_group_csvs(_TRAJECTORY_DIR / group)
-        if sim_csv is None and real_csv is None:
-            self._set_status(f"Status: '{group}' has no sim_*.csv or real_*.csv")
+        sim_path, real_csv = _scan_group_csvs(_TRAJECTORY_DIR / group)
+        if sim_path is None and real_csv is None:
+            self._set_status(f"Status: '{group}' has no sim_*/dir, sim_*.csv, or real_*.csv")
             return
 
         scenario, articulation = self._resolve_articulation()
@@ -285,26 +319,26 @@ class ShowcaseReplayControls:
             return
 
         main_src = self._get_main_source()
-        main_csv = sim_csv if main_src == "sim" else real_csv
-        sec_csv = real_csv if main_src == "sim" else sim_csv
-        if main_csv is None:
+        main_path = sim_path if main_src == "sim" else real_csv
+        sec_path = real_csv if main_src == "sim" else sim_path
+        if main_path is None:
             self._set_status(
-                f"Status: main source CSV missing — '{main_src}_*.csv' not in '{group}'"
+                f"Status: main source missing — '{main_src}_*' not in '{group}'"
             )
             return
 
         try:
-            reader_main = ShowcaseReader(main_csv)
+            reader_main = _make_reader(main_path)
         except Exception as exc:
-            self._set_status(f"Status: failed to load main CSV: {exc}")
+            self._set_status(f"Status: failed to load main source: {exc}")
             return
 
         reader_sec = None
-        if sec_csv is not None:
+        if sec_path is not None:
             try:
-                reader_sec = ShowcaseReader(sec_csv)
+                reader_sec = _make_reader(sec_path)
             except Exception as exc:
-                self._set_status(f"Status: failed to load secondary CSV: {exc}")
+                self._set_status(f"Status: failed to load secondary source: {exc}")
                 return
 
         viz = scenario.get_visualizer() if hasattr(scenario, "get_visualizer") else None
