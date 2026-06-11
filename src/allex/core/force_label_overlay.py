@@ -260,6 +260,7 @@ class ForceLabelOverlay:
             return
 
         text = f"{float(magnitude_n):.1f}"
+        # text = f"{float(magnitude_n) * 101.97162:.1f}"
         try:
             px, py, pz = float(world_pos[0]), float(world_pos[1]), float(world_pos[2])
         except Exception:
@@ -473,6 +474,7 @@ class ForceLabelOverlay:
                         if alignment_left is not None:
                             unit_kwargs["alignment"] = alignment_left
                         sc.Label(" [N]", **unit_kwargs)
+                        # sc.Label(" [gf]", **unit_kwargs)
                     rec["transform"] = transform
                 except Exception as exc:
                     logger.debug(f"[viz] force_label_overlay node build warn: {exc}")

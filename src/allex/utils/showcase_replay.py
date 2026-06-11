@@ -23,7 +23,7 @@ from isaacsim.gui.components.element_wrappers import CollapsableFrame
 from isaacsim.gui.components.ui_utils import get_style
 
 from .ui_settings_utils import UIComponentFactory, UILayout
-from ..replay import CsvReplayer, ShowcaseReader, SimDynamicReader
+from ..replay import CsvReplayer, PcReplayer, ShowcaseReader, SimDynamicReader
 
 
 _VIZ_SCENARIO_FILE = "viz_scenario_config.json"
@@ -123,6 +123,8 @@ class ShowcaseReplayControls:
         self._main_combo: ui.ComboBox | None = None
         self._status_label: ui.Label | None = None
         self._record_check: ui.CheckBox | None = None
+        self._pc_enable_check: ui.CheckBox | None = None
+        self._pc_manifest_field: ui.StringField | None = None
 
     # ------------------------------------------------------------------
     # UI build
@@ -157,6 +159,16 @@ class ShowcaseReplayControls:
                     ui.Label("Record forces (CSV):",
                              width=UILayout.LABEL_WIDTH_LARGE)
                     self._record_check = ui.CheckBox()
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Enable PC replay:",
+                             width=UILayout.LABEL_WIDTH_LARGE)
+                    self._pc_enable_check = ui.CheckBox()
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("PC manifest:",
+                             width=UILayout.LABEL_WIDTH_LARGE)
+                    self._pc_manifest_field = ui.StringField()
 
                 UIComponentFactory.create_separator(UILayout.SEPARATOR_HEIGHT)
 
@@ -201,6 +213,8 @@ class ShowcaseReplayControls:
         self._status_label = None
         self._availability_label = None
         self._record_check = None
+        self._pc_enable_check = None
+        self._pc_manifest_field = None
 
     # ------------------------------------------------------------------
     # Dropdown
@@ -366,6 +380,26 @@ class ShowcaseReplayControls:
             except Exception:
                 record_forces = False
 
+        pc_replayer = None
+        pc_enabled = False
+        if self._pc_enable_check is not None:
+            try:
+                pc_enabled = bool(self._pc_enable_check.model.get_value_as_bool())
+            except Exception:
+                pc_enabled = False
+        pc_manifest_str = ""
+        if self._pc_manifest_field is not None:
+            try:
+                pc_manifest_str = self._pc_manifest_field.model.get_value_as_string().strip()
+            except Exception:
+                pc_manifest_str = ""
+        if pc_enabled and pc_manifest_str:
+            try:
+                pc_replayer = PcReplayer(Path(pc_manifest_str))
+            except Exception as exc:
+                self._set_status(f"Status: pc_replayer init failed: {exc}")
+                return
+
         try:
             replayer = CsvReplayer(
                 reader_main=reader_main,
@@ -376,6 +410,7 @@ class ShowcaseReplayControls:
                 plotters=plotters,
                 viz_scenario=viz_scenario,
                 record_forces=record_forces,
+                pc_replayer=pc_replayer,
             )
         except Exception as exc:
             self._set_status(f"Status: replayer init failed: {exc}")

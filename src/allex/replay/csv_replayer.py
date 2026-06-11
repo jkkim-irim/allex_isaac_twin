@@ -126,6 +126,7 @@ class CsvReplayer:
         plotters: Optional[list] = None,
         viz_scenario: Optional[dict] = None,
         record_forces: bool = False,
+        pc_replayer: "Optional[object]" = None,
     ):
         if reader_main is None:
             raise ValueError("reader_main is required")
@@ -139,6 +140,7 @@ class CsvReplayer:
         self._viz = visualizer
         self._main_src = ms
         self._sec_src = _other_source(ms)
+        self._pc_replayer = pc_replayer
 
         # viz_scenario_config.json 에서 로드된 시나리오 dict. 키 (전부 optional):
         #   "force_triggers":       {"real.<topic_id>"/"sim.<channel>": [[t_on, t_off], ...]}
@@ -711,6 +713,12 @@ class CsvReplayer:
             except Exception as exc:
                 logger.debug(f"[replay] plotter replay mode set warn: {exc}")
 
+        if self._pc_replayer is not None:
+            try:
+                self._pc_replayer.start()
+            except Exception as exc:
+                logger.warning(f"[replay] pc_replayer.start warn: {exc}")
+
     def stop(self) -> None:
         # rendering tick subscription 먼저 해제 — 더 이상 advance 안 불리도록.
         if self._update_sub is not None:
@@ -801,6 +809,12 @@ class CsvReplayer:
                 logger.debug(f"[replay] clear_torque_region_gates warn: {exc}")
         self._torque_gate_prev.clear()
 
+        if self._pc_replayer is not None:
+            try:
+                self._pc_replayer.stop()
+            except Exception as exc:
+                logger.debug(f"[replay] pc_replayer.stop warn: {exc}")
+
         logger.info("[replay] stopped")
 
     def is_self_ticking(self) -> bool:
@@ -879,6 +893,13 @@ class CsvReplayer:
         # torque_ring_triggers 평가 (real CSV time 기준 상대시간 t_rel).
         if self._torque_ring_triggers:
             self._update_torque_ring_gates(idx_main, idx_sec)
+
+        if self._pc_replayer is not None:
+            try:
+                self._pc_replayer.advance(float(elapsed))
+            except Exception as exc:
+                if self._step_count % 200 == 0:
+                    logger.debug(f"[replay] pc_replayer.advance warn: {exc}")
 
         self._step_count += 1
 
