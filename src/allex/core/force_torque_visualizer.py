@@ -167,9 +167,6 @@ class ForceTorqueVisualizer:
         # dof_abbr → articulation dof idx (lazy build)
         self._abbr_to_dof_idx: dict = {}
 
-        # sim force 미구현 — 추후 동역학 수식으로 직접 계산
-        self._link_to_force_row: dict = {}  # reserved, unused
-
         # prim path → UsdGeom.XformOp(scale) 캐시 (B5)
         self._scale_op_cache: dict = {}
 
@@ -389,9 +386,6 @@ class ForceTorqueVisualizer:
             self._apply_force_scale(pair.get("real"), 0.0, FORCE_GAIN,
                                     FORCE_MIN_SCALE, FORCE_MAX_SCALE)
 
-        # --- custom user-defined force vectors ---
-        self._update_custom_force_vectors()
-
     def set_mode(self, mode: str):
         """mode in {off, real, sim, both}."""
         if mode not in ("off", "real", "sim", "both"):
@@ -576,10 +570,6 @@ class ForceTorqueVisualizer:
             return
         valid = {"sim", "real"}
         self._external_torque_sources = {str(s).lower() for s in sources if str(s).lower() in valid}
-
-    def set_torque_visibility(self, visible: bool):
-        """하위호환 — True → both, False → off."""
-        self.set_torque_mode("both" if visible else "off")
 
     def set_replay_force_visible(self, visible: bool) -> None:
         """CSV replay 가 등록한 custom force prim 을 global force mode 토글과
@@ -1040,33 +1030,6 @@ class ForceTorqueVisualizer:
                     logger.debug(f"[viz] remove_custom_force_vector warn: {e}")
         return True
 
-    def clear_custom_force_vectors(self, source: str | None = None):
-        """custom vector 제거. source=None 이면 전부, 지정 시 그 source 만."""
-        if source is not None:
-            source = str(source).lower()
-        keys_to_remove = []
-        for key, rec in self._custom_force_prims.items():
-            if source is None or rec.get("source") == source:
-                keys_to_remove.append((rec["name"], rec["source"]))
-        for name, src in keys_to_remove:
-            self.remove_custom_force_vector(name, source=src)
-        overlay = self._overlay()
-        if overlay is not None:
-            try:
-                overlay.clear(source)
-            except Exception as exc:
-                logger.debug(f"[viz] overlay clear warn: {exc}")
-
-    def list_custom_force_vectors(self, source: str | None = None):
-        """등록된 custom vector 이름 리스트. source=None 이면 (source, name) 튜플."""
-        if source is None:
-            return [(rec["source"], rec["name"])
-                    for rec in self._custom_force_prims.values()]
-        source = str(source).lower()
-        return [rec["name"]
-                for rec in self._custom_force_prims.values()
-                if rec.get("source") == source]
-
     def set_force_label_filter(self, channels) -> None:
         """magnitude label 시각화 채널 화이트리스트 설정.
 
@@ -1117,12 +1080,6 @@ class ForceTorqueVisualizer:
         if not flt:
             return True
         return (str(source).lower(), str(name)) in flt
-
-    def _update_custom_force_vectors(self):
-        """update() 훅. 현재는 set_*/add_* 가 즉시 반영하므로 no-op.
-        추후 animated / time-varying vector 지원 시 여기서 step 별 갱신.
-        """
-        return
 
     # ========================================
     # Custom trail — replay 점 누적 BasisCurves (single linear curve, 단색)
@@ -1460,14 +1417,6 @@ class ForceTorqueVisualizer:
                     logger.debug(f"[viz] remove_custom_torque_ring warn: {e}")
         return True
 
-    def clear_custom_torque_rings(self, source: str | None = None) -> None:
-        keys_to_remove = []
-        for key, rec in self._custom_torque_ring_prims.items():
-            if source is None or rec.get("source") == source:
-                keys_to_remove.append((rec["name"], rec["source"]))
-        for n, s in keys_to_remove:
-            self.remove_custom_torque_ring(n, source=s)
-
     @staticmethod
     def _normalize_axis(axis) -> tuple:
         ax, ay, az = float(axis[0]), float(axis[1]), float(axis[2])
@@ -1753,10 +1702,6 @@ class ForceTorqueVisualizer:
                 "sim": sim_prim,
             }
 
-        # contact sensor skeleton stub 호출 (TODO)
-        for entry in FORCE_VIZ_PARENT_LINKS:
-            self._create_contact_sensor_skeleton(entry["link_path"])
-
         # 초기 visibility 적용
         self._apply_visibility()
 
@@ -1967,82 +1912,6 @@ class ForceTorqueVisualizer:
             logger.warning(f"[viz] create_force_ref_xform failed for {prim_path}: {e}")
             return None
 
-    def _bind_omni_pbr_to_force_vec(self, stage, prim_path, color):
-        """Shaft/Head 메쉬에 OmniPBR 재질을 적용·바인딩한다.
-
-        - 기존 Looks/material_10000 Shader 가 있으면 diffuse_color_constant 만 session
-          layer 에서 override (빛 반사 등 기존 PBR 품질 유지).
-        - 없으면 Looks/material_0 에 OmniPBR 재질을 신규 생성.
-        - Shaft/Head 양쪽에 MaterialBindingAPI.Bind() 적용.
-
-        색상 규칙: REAL_COLOR=(1,0,0) 빨강, SIM_COLOR=(0,0.8,1) 시안.
-        """
-        from pxr import UsdShade, Sdf, Gf
-        try:
-            target_color = Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))
-
-            # --- 재질 경로 결정: 기존 재사용 vs 신규 생성 ---
-            existing_shader_prim = stage.GetPrimAtPath(
-                f"{prim_path}/Looks/material_10000/Shader"
-            )
-            if existing_shader_prim and existing_shader_prim.IsValid():
-                mat_path = f"{prim_path}/Looks/material_10000"
-                shader_prim = existing_shader_prim
-            else:
-                mat_path = f"{prim_path}/Looks/material_0"
-                looks_path = f"{prim_path}/Looks"
-                if not stage.GetPrimAtPath(looks_path).IsValid():
-                    stage.DefinePrim(looks_path, "Scope")
-                mat = UsdShade.Material.Define(stage, mat_path)
-                shader_p = stage.DefinePrim(f"{mat_path}/Shader", "Shader")
-                shader_p.CreateAttribute(
-                    "info:implementationSource", Sdf.ValueTypeNames.Token, True
-                ).Set("sourceAsset")
-                shader_p.CreateAttribute(
-                    "info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset, True
-                ).Set(Sdf.AssetPath("OmniPBR.mdl"))
-                shader_p.CreateAttribute(
-                    "info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token, True
-                ).Set("OmniPBR")
-                shader_out = UsdShade.Shader(shader_p).CreateOutput(
-                    "out", Sdf.ValueTypeNames.Token
-                )
-                mat.CreateOutput("mdl:surface", Sdf.ValueTypeNames.Token).ConnectToSource(
-                    shader_out
-                )
-                mat.CreateOutput("mdl:displacement", Sdf.ValueTypeNames.Token).ConnectToSource(
-                    shader_out
-                )
-                mat.CreateOutput("mdl:volume", Sdf.ValueTypeNames.Token).ConnectToSource(
-                    shader_out
-                )
-                shader_prim = shader_p
-
-            # --- 색상 override ---
-            shader = UsdShade.Shader(shader_prim)
-            inp = shader.GetInput("diffuse_color_constant")
-            if not inp:
-                inp = shader.CreateInput(
-                    "diffuse_color_constant", Sdf.ValueTypeNames.Color3f
-                )
-            inp.Set(target_color)
-
-            # --- Shaft / Head 에 재질 바인딩 ---
-            mat = UsdShade.Material(stage.GetPrimAtPath(mat_path))
-            if not mat:
-                return
-            for child_name in (FORCE_VEC_SHAFT_NAME, FORCE_VEC_HEAD_NAME):
-                child_prim = stage.GetPrimAtPath(f"{prim_path}/{child_name}")
-                if child_prim and child_prim.IsValid():
-                    try:
-                        UsdShade.MaterialBindingAPI.Apply(child_prim).Bind(mat)
-                    except Exception as bind_e:
-                        logger.debug(
-                            f"[viz] material bind warn ({child_name}@{prim_path}): {bind_e}"
-                        )
-        except Exception as e:
-            logger.debug(f"[viz] bind_omni_pbr_to_force_vec warn ({prim_path}): {e}")
-
     def _compute_ring_transform(self, stage, joint_name, entry=None):
         """Joint prim 을 읽어 torque ring 의 local translate + orient(quat) 계산.
 
@@ -2211,62 +2080,6 @@ class ForceTorqueVisualizer:
                     continue
         except Exception as e:
             logger.debug(f"[viz] disable_embedded_physics warn ({prim_path}): {e}")
-
-    def _apply_orient_to_existing(self, prim, orient_quat):
-        """기존 prim (ref 로 만들지 않은 원본 prim 예: real force_viz) 에
-        orient quaternion 을 반영. 기존 xform op 순서를 최대한 보존하고,
-        orient op 가 이미 있으면 Set, 없으면 AddOrientOp 를 추가한다.
-        """
-        if prim is None or orient_quat is None:
-            return
-        try:
-            from pxr import UsdGeom, Gf
-            if not prim.IsValid():
-                return
-
-            # identity 면 skip
-            if isinstance(orient_quat, Gf.Quatd):
-                q = orient_quat
-            elif isinstance(orient_quat, Gf.Quatf):
-                q = Gf.Quatd(float(orient_quat.GetReal()),
-                             Gf.Vec3d(*[float(x) for x in orient_quat.GetImaginary()]))
-            else:
-                q = Gf.Quatd(float(orient_quat[0]),
-                             Gf.Vec3d(float(orient_quat[1]),
-                                      float(orient_quat[2]),
-                                      float(orient_quat[3])))
-            im = q.GetImaginary()
-            if (abs(q.GetReal() - 1.0) < 1e-9
-                    and abs(im[0]) < 1e-9 and abs(im[1]) < 1e-9 and abs(im[2]) < 1e-9):
-                return
-
-            xformable = UsdGeom.Xformable(prim)
-            existing_orient_op = None
-            for op in xformable.GetOrderedXformOps():
-                if op.GetOpType() == UsdGeom.XformOp.TypeOrient:
-                    existing_orient_op = op
-                    break
-
-            with self._session_edit():
-                if existing_orient_op is not None:
-                    try:
-                        if existing_orient_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble:
-                            existing_orient_op.Set(q)
-                        else:
-                            existing_orient_op.Set(Gf.Quatf(
-                                float(q.GetReal()),
-                                Gf.Vec3f(float(im[0]), float(im[1]), float(im[2])),
-                            ))
-                    except Exception as e:
-                        logger.debug(f"[viz] set existing orient warn: {e}")
-                else:
-                    try:
-                        # 기존 op 순서 맨 뒤에 추가 (translate 는 유지, scale 앞)
-                        xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(q)
-                    except Exception as e:
-                        logger.debug(f"[viz] add orient op warn: {e}")
-        except Exception as e:
-            logger.debug(f"[viz] apply_orient_to_existing warn: {e}")
 
     def _euler_deg_to_quatd(self, euler_xyz_deg):
         """(rx, ry, rz) [deg] → Gf.Quatd (XYZ intrinsic 결합).
@@ -2853,11 +2666,3 @@ class ForceTorqueVisualizer:
     # ========================================
     # Contact sensor skeleton
     # ========================================
-    def _create_contact_sensor_skeleton(self, link_path):
-        """Force 화살표 부모 link 에 contact sensor 를 붙이기 위한 스텁.
-
-        TODO: isaacsim.sensors.contact / PhysxContactReportAPI 를 사용해
-              실제 contact force 를 읽어오고 real 화살표 크기에 반영.
-              현재는 no-op.
-        """
-        return None

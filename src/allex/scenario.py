@@ -267,13 +267,6 @@ class ALLEXDigitalTwin:
         except Exception as e:
             logger.warning(f"FeedforwardTorqueManager resize failed: {e}")
 
-    # 호환용 shim — 예전 코드 경로에서 호출되는 경우 대비
-    def _setup_visualizer(self):
-        if self._visualizer is None:
-            self._create_visualizer_prims()
-        if self._articulation is not None:
-            self._attach_visualizer_articulation()
-
     @staticmethod
     def _build_gravcomp_probe():
         """`physics_config.json::debug.gravcomp_probe` 설정으로 probe 생성. 비활성/오류면 None."""

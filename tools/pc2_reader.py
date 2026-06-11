@@ -1,16 +1,14 @@
 """sensor_msgs/PointCloud2 mcap bag → numpy 변환 + SE(3) extrinsic util.
 
 Isaac Sim 의존성 없음. conda env 의 mcap / mcap_ros2 만 사용.
-debug_draw 렌더는 poc_pointcloud_debug_draw 에서.
 
 사용 예 (Script Editor):
-    from tools import pc2_reader as r, poc_pointcloud_debug_draw as poc
+    from tools import pc2_reader as r
     xyz, rgb = r.read_first_pointcloud2(
         "/path/to/bag",
         topic="/camera/depth_registered/points",
     )
     # 일단 extrinsic 모르면 identity 로 → camera frame == world 로 가정
-    poc.show_array(xyz, rgb, point_size=3.0)
 
 bag 가 dir 면 dir 안 *.mcap 다 훑음. .mcap 파일 직접 줘도 됨.
 """

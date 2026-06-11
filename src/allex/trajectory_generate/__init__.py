@@ -6,7 +6,8 @@
     trajectory_player.py     — TrajectoryPlayer (재생 + 게인 이벤트 → mirror)
     motor_state_mirror.py    — MotorStateMirror (motor↔joint warp kernel host)
     motor_joint_transform.py — ground-truth 다항식 (numpy reference)
-    jk_kernel.py             — warp kernel 5종 (scalar/elbow/wrist/finger/thumb)
+    jk_kernel.py             — pd_clip warp kernel 6종
+                               (joint_nominal/scalar/elbow/wrist/finger/thumb)
     sim_state_logger.py      — SimStateLogger (q/τ/K/limit CSV 기록)
 
 데이터 흐름:

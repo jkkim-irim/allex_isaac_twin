@@ -51,7 +51,6 @@ plt.style.use("dark_background")
 # viz_config.colors.real / colors.sim 와 같은 값. plot_proc 는 독립 subprocess 라
 # viz_config import 가 안 되므로 hard-code.
 _REAL_COLOR = (1.0, 0.0, 0.0)
-# _SIM_COLOR = (0.0, 0.8, 0.0)  # green override — plot 만 적용 (subprocess hardcode)
 _SIM_COLOR = (0.0, 0.8, 1.0)
 
 

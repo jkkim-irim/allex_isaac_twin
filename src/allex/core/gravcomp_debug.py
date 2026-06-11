@@ -94,7 +94,7 @@ class GravcompTorqueProbe:
             net = qact + qgrav
             net_label = "net=qact+qgrav"
 
-        # print(
-        #     f"[ALLEX][Gravcomp][{self._joint_name}][{self._routing_label}] "
-        #     f"qact={qact:+8.3f}  qgrav={qgrav:+8.3f}  {net_label}={net:+8.3f}  N·m"
-        # )
+        print(
+            f"[ALLEX][Gravcomp][{self._joint_name}][{self._routing_label}] "
+            f"qact={qact:+8.3f}  qgrav={qgrav:+8.3f}  {net_label}={net:+8.3f}  N·m"
+        )

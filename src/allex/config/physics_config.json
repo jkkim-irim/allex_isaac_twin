@@ -1,7 +1,7 @@
 {
     "world": {
-        "physics_hz": 1000.0,
-        "rendering_dt": 0.02,
+        "physics_hz": 100.0,
+        "rendering_dt": 0.0166,
         "gravity": [
             0.0,
             0.0,
@@ -17,7 +17,7 @@
         "pd_scale": 0.017453292519943295,
         "use_cuda_graph": true,
         "contact_mu": 0.5,
-        "pd_mode": "motor_space",
+        "pd_mode": "joint_nominal",
         "_pd_mode_doc": "MotorStateMirror PD 산출 방식. 'motor_space' (Y, allex_control 과 동치): q_m=J·q 선형화 후 motor-domain PD + motor-space clip. 'joint_space_diag' (X): joint-domain diag K_j=Σ J[k,i]²·K_m[k] PD + J⁻ᵀ·motor-clip·Jᵀ. 'joint_nominal' (baseline): USD-loaded K_j / Kv_j / effort_limit 그대로 사용, joint-space scalar clip. 제조사가 적당한 자세에서 보정한 값이라 finger/thumb 의 J(0) 계산과 다름. via event / 자세 변화 모두 무시 — 가장 단순한 baseline.",
         "disable_torque_clip": ["finger", "thumb"],
         "_disable_torque_clip_doc": "디버깅용 토글. 형식: bool 또는 group 이름 list. true → 모든 group (scalar/elbow/wrist/finger/thumb) clip 무효화. false → 정상. list → 해당 group 만 무효화 (예: ['finger','thumb'] → 손가락/엄지 motor τ_m_max 만 1e6, 팔/허리는 정상 clip). 모든 모드에 적용 (motor_space/joint_space_diag 의 motor clip + joint_nominal mode 의 τ_j_max_nom). via event (set_target) 가 trq_m_target 을 줄여도 motor_step_per_ms=0.001 ramp 가 trajectory 길이보다 훨씬 길어 사실상 1e6 유지.",
@@ -163,7 +163,7 @@
             "enabled": true,
             "joint_name": "R_Shoulder_Pitch_Joint",
             "period": 100,
-            "_doc": "매 N(=period) 물리 스텝마다 qfrc_actuator / qfrc_gravcomp 를 터미널에 출력. period=200 + physics_hz=1000 → 5Hz 출력. joint_name 변경으로 다른 관절 관찰. enabled=false 면 비활성."
+            "_doc": "매 N(=period) 물리 스텝마다 qfrc_actuator / qfrc_gravcomp 를 터미널에 출력. period=N + physics_hz 로 출력 Hz 결정 (예: period=100 + physics_hz=200 → 2Hz). joint_name 변경으로 다른 관절 관찰. enabled=false 면 비활성."
         }
     },
     "allex": {

@@ -1,23 +1,22 @@
 """Motor-domain PD gain mirror — orchestrator for per-step jk_kernel launches.
 
 매 physics step 에 호출되어 모터-도메인 K_m / Kv_m / τ_m_max 와 현재 q 로
-joint-domain K_j / D_j / τ_j_max 를 계산해 Newton MuJoCo 의 PD 게인 view
-(joint_target_ke / joint_target_kd / joint_effort_limit) 에 직접 write.
+motor-space PD 식을 풀고 motor-space clip 한 뒤, joint-domain torque 를
+Newton MuJoCo 의 control.joint_f view 에 직접 write (ke/kd 는 0 으로 강제).
 
 데이터 흐름:
     nominal_motor_gains (joint_config.json)
         ↓ __init__ load
     K_m_current / Kv_m_current / trq_m_current  (host numpy + device warp)
         ↓ (set_target 시 ramp_target 갱신, update() 에서 motor_step 단위 step)
-        ↓ wp.launch(jk_kernel.compute_*)
-    joint_target_ke / joint_target_kd / joint_effort_limit  (Newton model views)
-        ↓ solver._update_joint_dof_properties()
-    actuator gainprm / biasprm  (mjw_model)
+        ↓ wp.launch(jk_kernel.pd_clip_*)
+    control.joint_f  (Newton control view)
+        ↓ solver sync
         ↓ mj_step
     sim 동작
 
 이 클래스가 trajectory_player 와 독립 — sim loop 에서 항상 호출되어 nominal
-모터 게인이 매 step Newton view 에 강제 mirror.
+모터 게인이 매 step Newton control 에 강제 mirror.
 """
 from __future__ import annotations
 

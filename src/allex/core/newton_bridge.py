@@ -611,16 +611,12 @@ def configure_newton_from_toml() -> bool:
     return True
 
 
-def _configure_newton_from_toml() -> None:
-    configure_newton_from_toml()
-
-
 def install(joint_config_path: Path) -> None:
     global _orig_finalize, _equality_table
     global _config_solref, _config_solimp, _master_joint_config_path
     global _friction_table, _gravcomp_cfg
     _install_articulation_reset_patch()
-    _configure_newton_from_toml()
+    configure_newton_from_toml()
     _master_joint_config_path = Path(joint_config_path)
 
     try:

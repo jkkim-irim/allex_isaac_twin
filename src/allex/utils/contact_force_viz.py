@@ -23,7 +23,6 @@ class ContactForceVisualizer:
         # when the scene changes (e.g. asset reload).
         self._cached_shape_count: int = -1
         self._first_render_logged: bool = False
-        self._step_count: int = 0
         # Allowlist of contact pairs (frozenset of frozenset({shape_idx_a, shape_idx_b})).
         # Resolved lazily from config/contact_config.json once shape_label is known.
         self._allowed_pair_idx = None
@@ -190,88 +189,6 @@ class ContactForceVisualizer:
         except Exception as exc:
             if not self._first_render_logged:
                 print(f"[ALLEX][ContactViz] _get_shape_origin_axis failed: {exc}")
-            return None, None
-
-    # ------------------------------------------------------------------
-    # Live body transform (kept for any future per-body needs; aggregate
-    # groups now use shape transforms via origin_shape).
-    # ------------------------------------------------------------------
-    def _resolve_body_id(self, prim_path: str, model) -> int | None:
-        cached = self._body_id_cache.get(prim_path, "MISS")
-        if cached != "MISS":
-            return cached
-        body_label = getattr(model, "body_label", None) or []
-        body_id: int | None = None
-        # 1) Exact match (preferred).
-        for i, lbl in enumerate(body_label):
-            if lbl == prim_path:
-                body_id = i
-                break
-        # No suffix fallback — too unreliable when fixed-joint links are merged
-        # into a parent body. Diagnose by dumping candidates that share a token
-        # with prim_path so the user can pick the correct origin_prim.
-        if body_id is None:
-            tokens = [t for t in prim_path.split("/") if t]
-            tail = tokens[-1] if tokens else prim_path
-            related = [(i, l) for i, l in enumerate(body_label) if tail.split("_")[0] in l or "Palm" in l or "Wrist" in l]
-            print(f"[ALLEX][ContactViz] body_label has no exact entry for '{prim_path}'")
-            print(f"  total body_label entries: {len(body_label)}")
-            print(f"  candidates that mention a related token (showing up to 20):")
-            for i, l in related[:20]:
-                print(f"    [{i}] {l}")
-            if not related:
-                print(f"  (no candidates found; first 10 entries:)")
-                for i, l in enumerate(body_label[:10]):
-                    print(f"    [{i}] {l}")
-        else:
-            print(f"[ALLEX][ContactViz] body_id resolved: '{prim_path}' → [{body_id}]")
-        self._body_id_cache[prim_path] = body_id
-        return body_id
-
-    def _get_prim_origin_axis(self, prim_path: str, axis_local, model, mjw_data):
-        """Return (origin_world, axis_world_unit) for prim_path's CURRENT pose.
-
-        Reads from MuJoCo Warp's live body state (`mjw_data.xpos` / `xmat`)
-        rather than USD, because Newton does not write transforms back to the
-        USD stage — UsdGeom.XformCache returns the initial authored pose.
-        """
-        try:
-            import numpy as np
-            body_id = self._resolve_body_id(prim_path, model)
-            if body_id is None:
-                return None, None
-            xpos_arr = getattr(mjw_data, "xpos", None)
-            xmat_arr = getattr(mjw_data, "xmat", None)
-            if xpos_arr is None or xmat_arr is None:
-                if not self._first_render_logged:
-                    print("[ALLEX][ContactViz] mjw_data has no xpos/xmat; aggregate origin will be missing")
-                return None, None
-            xpos = xpos_arr.numpy()  # (n_world, n_body, 3) or (n_body, 3)
-            xmat = xmat_arr.numpy()  # rotation, flattened 9 or (3,3)
-            # Index into world 0 if multi-world; otherwise direct.
-            if xpos.ndim == 3:
-                pos = xpos[0, body_id]
-            else:
-                pos = xpos[body_id]
-            if xmat.ndim == 4:        # (n_world, n_body, 3, 3)
-                rot = xmat[0, body_id]
-            elif xmat.ndim == 3 and xmat.shape[-1] == 9:  # (n_world, n_body, 9)
-                rot = xmat[0, body_id].reshape(3, 3)
-            elif xmat.ndim == 3:      # (n_body, 3, 3)
-                rot = xmat[body_id]
-            elif xmat.ndim == 2 and xmat.shape[-1] == 9:  # (n_body, 9)
-                rot = xmat[body_id].reshape(3, 3)
-            else:
-                return None, None
-            origin = np.asarray(pos, dtype=np.float32)
-            axis_w = np.asarray(rot, dtype=np.float32) @ np.asarray(axis_local, dtype=np.float32)
-            n = float(np.linalg.norm(axis_w))
-            if n < 1e-9:
-                return origin, np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            return origin, (axis_w / n).astype(np.float32)
-        except Exception as exc:
-            if not self._first_render_logged:
-                print(f"[ALLEX][ContactViz] _get_prim_origin_axis({prim_path}) failed: {exc}")
             return None, None
 
     # ------------------------------------------------------------------

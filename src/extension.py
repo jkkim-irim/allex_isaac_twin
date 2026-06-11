@@ -7,7 +7,6 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 #
 
-import asyncio
 import gc
 from pathlib import Path
 
@@ -195,21 +194,6 @@ class Extension(omni.ext.IExt):
         with self._window.frame:
             with ui.VStack(spacing=5, height=0):
                 self._build_extension_ui()
-
-        # async def dock_window():
-        #     await omni.kit.app.get_app().next_update_async()
-
-        #     def dock(space, name, location, pos=0.5):
-        #         window = omni.ui.Workspace.get_window(name)
-        #         if window and space:
-        #             window.dock_in(space, location, pos)
-        #         return window
-
-        #     tgt = ui.Workspace.get_window("Viewport")
-        #     dock(tgt, EXTENSION_TITLE, omni.ui.DockPosition.LEFT, 0.33)
-        #     await omni.kit.app.get_app().next_update_async()
-
-        # self._task = asyncio.ensure_future(dock_window())
 
     #################################################################
     # Functions below this point call user functions

@@ -454,12 +454,6 @@ class CsvReplayer:
         except Exception as exc:
             logger.debug(f"[replay] enumerate unpushed torque joints warn: {exc}")
 
-        # plot override 버퍼 — replayer 가 mutate, plotter 가 reference 로 read.
-        self._plot_sim_tau: Optional[np.ndarray] = (
-            np.zeros(self._num_dof, dtype=np.float32) if self._num_dof else None
-        )
-        # real channel 은 abbr keyed dict. _torque_keys_to_abbr 로 변환.
-        self._plot_real_by_abbr: dict = {}
         # joint_name → abbr (plotter LUT 활용; lazy import 로 의존성 경량화).
         self._joint_to_abbr: dict[str, str] = {}
         try:
@@ -483,21 +477,6 @@ class CsvReplayer:
         # 새로 진입한 joint 는 warning, 빠져나간 joint 는 info 로 1회 emit.
         self._ext_jtq_active: set[tuple[str, str]] = set()
         self._ext_jtq_prev_active: set[tuple[str, str]] = set()
-
-        # joint_name → frozenset[region] cache. ext_joint_torque_triggers 의
-        # (source, region) key 매칭에 사용. visualizer 의 _dof_abbr_to_regions 와
-        # 동일 룰을 csv_replayer 측에 1회 빌드 — 핫패스에서 viz private 멤버 안 만짐.
-        self._joint_to_regions: dict[str, frozenset] = {}
-        try:
-            from ..core.force_torque_visualizer import ForceTorqueVisualizer
-            for e in HAND_JOINT_TORQUE_RING_MAP:
-                jn = e["usd_joint_name"]
-                abbr = e["dof_abbr"]
-                self._joint_to_regions[jn] = (
-                    ForceTorqueVisualizer._dof_abbr_to_regions(abbr)
-                )
-        except Exception as exc:
-            logger.debug(f"[replay] build joint→regions cache warn: {exc}")
 
         # custom force vector 등록 상태 — (sanitized_pair, source) 가 add 됐는지.
         self._registered_force_keys: set[tuple[str, str]] = set()
@@ -718,6 +697,62 @@ class CsvReplayer:
                 self._pc_replayer.start()
             except Exception as exc:
                 logger.warning(f"[replay] pc_replayer.start warn: {exc}")
+
+        # 첫 접촉 프레임의 DefinePrim hitch 제거 — 알려진 모든 force/torque/trail
+        # 채널 prim 을 zero-vector(=threshold 미달, hidden) 로 미리 생성·등록.
+        self._precreate_force_prims()
+
+    def _precreate_force_prims(self) -> None:
+        """replay 시작 시 모든 알려진 force/torque/trail 채널 prim 을 warm-up.
+
+        CSV 로드 후 채널 키는 전부 확정돼 있으므로(``pair_force_vec`` /
+        ``aggregate`` / ``topic_force_vec`` / ``topic_torque_vec`` / ``force_mirror`` /
+        ``trail_triggers``), 첫 접촉 프레임 이전에 zero-vector 로 prim 을 만들어
+        ``_registered_*_keys`` 에 등록한다. zero-vector / magnitude=0 은
+        hide_below 임계 미만이라 hidden 상태로 시작하므로 collapsed mesh 가
+        visible 로 남지 않는다 (add_custom_force_vector / add_custom_torque_ring
+        내부 threshold-hide). per-step push 의 lazy add 경로는 그대로 fallback 으로
+        남아, warm-up 에서 누락된 채널이 런타임에 등장해도 동작한다.
+        """
+        viz = self._viz
+        if viz is None:
+            return
+
+        # sim: pair / aggregate / mirror force vectors.
+        sim_reader, _ = self._reader_idx_for("sim", 0, 0 if self._sec is not None else None)
+        if sim_reader is not None:
+            for sanitized_pair in sim_reader.pair_force_vec.keys():
+                self._set_or_add(viz, sanitized_pair, "sim", (0.0, 0.0, 0.0),
+                                 (0.0, 0.0, 0.0))
+                mirror = self._force_mirror.get(("sim", sanitized_pair))
+                if mirror is not None:
+                    self._set_or_add(viz, mirror[0], "sim", (0.0, 0.0, 0.0),
+                                     (0.0, 0.0, 0.0))
+            for tag in sim_reader.aggregate.keys():
+                self._set_or_add(viz, tag, "sim", (0.0, 0.0, 0.0),
+                                 (0.0, 0.0, 0.0))
+
+        # real: ext_force vectors + ext_torque rings.
+        real_reader, _ = self._reader_idx_for("real", 0, 0 if self._sec is not None else None)
+        if real_reader is not None:
+            for topic_id in real_reader.topic_force_vec.keys():
+                self._set_or_add(viz, topic_id, "real", (0.0, 0.0, 0.0),
+                                 (0.0, 0.0, 0.0))
+            for topic_id in real_reader.topic_torque_vec.keys():
+                self._set_or_add_torque_ring(viz, f"torque_{topic_id}", "real",
+                                             (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), 0.0)
+
+        # trail: trigger 설정된 채널만 (per-step lazy add 와 동일 조건).
+        if hasattr(viz, "add_custom_trail"):
+            for (source, name) in self._trail_triggers.keys():
+                key = (source, name)
+                if key in self._registered_trail_keys:
+                    continue
+                try:
+                    viz.add_custom_trail(name, source)
+                    self._registered_trail_keys.add(key)
+                except Exception as exc:
+                    logger.debug(f"[replay] precreate add_custom_trail warn: {exc}")
 
     def stop(self) -> None:
         # rendering tick subscription 먼저 해제 — 더 이상 advance 안 불리도록.
@@ -1535,47 +1570,6 @@ class CsvReplayer:
                     break
 
         self._prev_idx_main_for_plot = idx_main
-
-    def _refresh_plot_buffers(self, idx_main: int, idx_sec: Optional[int]) -> None:
-        """plotter override 버퍼를 현재 frame 기준으로 다시 채운다.
-
-        sim 채널 (`_plot_sim_tau`) 와 real 채널 (`_plot_real_by_abbr`) 둘 다
-        main / secondary 중 해당 source 값으로 갱신. plotter 는 reference 로 잡고
-        있어서 별도 push 호출 없이 매 step 최신 값을 본다.
-        """
-        # sim 채널 array (num_dof,) — sim 인 source 의 torque 만 dof index 로 채움.
-        if self._plot_sim_tau is not None:
-            self._plot_sim_tau.fill(0.0)
-        # real 채널 dict — 매 step rebuild (key 셋이 같아도 안전).
-        self._plot_real_by_abbr.clear()
-
-        def _fill_sim_from(plan: list, idx: int) -> None:
-            if self._plot_sim_tau is None or idx is None:
-                return
-            for dof_idx, arr in plan:
-                self._plot_sim_tau[dof_idx] = float(arr[idx])
-
-        def _fill_real_from(reader: ShowcaseReader, idx: int) -> None:
-            if idx is None:
-                return
-            for csv_joint, arr in reader.torque.items():
-                abbr = self._joint_to_abbr.get(csv_joint)
-                if abbr is None:
-                    continue
-                self._plot_real_by_abbr[abbr] = float(arr[idx])
-
-        # main → main_src 채널.
-        if self._main_src == "sim":
-            _fill_sim_from(self._main_torque_dof_plan, idx_main)
-        else:  # real
-            _fill_real_from(self._main, idx_main)
-
-        # secondary → sec_src 채널.
-        if self._sec is not None and idx_sec is not None:
-            if self._sec_src == "sim":
-                _fill_sim_from(self._sec_torque_dof_plan, idx_sec)
-            else:
-                _fill_real_from(self._sec, idx_sec)
 
     # ──────────────────────────────────────────────────────────────────
     # Base_Link runtime transform (Fabric API).
@@ -2829,14 +2823,8 @@ class CsvReplayer:
                     logger.debug(f"[replay] set_custom_trail warn: {exc}")
             return
 
-    def _set_or_add(self, viz, name: str, source: str, origin, vec,
-                    kind: str = "force") -> None:
-        """``set_custom_force_vector`` 호출. 첫 호출이면 ``add_custom_force_vector``.
-
-        kind: 'force' (default) 또는 'torque'. 'torque' 면 ext_torque 스케일/색이
-        적용된 화살표를 만든다. set_custom_force_vector 는 prim 의 kind 를 보고
-        자동으로 같은 스케일을 사용.
-        """
+    def _set_or_add(self, viz, name: str, source: str, origin, vec) -> None:
+        """``set_custom_force_vector`` 호출. 첫 호출이면 ``add_custom_force_vector``."""
         # NaN 방어 (CSV 빈 셀).
         try:
             ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
@@ -2852,7 +2840,6 @@ class CsvReplayer:
             try:
                 ret = viz.add_custom_force_vector(
                     name, position=(ox, oy, oz), vector=(fx, fy, fz), source=source,
-                    kind=kind,
                 )
                 logger.debug(
                     f"[replay] add_custom_force_vector(name={name!r}, src={source}) "

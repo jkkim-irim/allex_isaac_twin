@@ -5,7 +5,7 @@ ALLEX Digital Twin 초기화 및 설정 관리
 from isaacsim.core.utils.viewports import set_camera_view
 
 from ..utils.constants import (
-    TOTAL_JOINTS, EFFECTIVE_JOINTS, DEFAULT_CAMERA_EYE, DEFAULT_CAMERA_TARGET, DEFAULT_CAMERA_PRIM_PATH
+    TOTAL_JOINTS, DEFAULT_CAMERA_EYE, DEFAULT_CAMERA_TARGET, DEFAULT_CAMERA_PRIM_PATH
 )
 
 class ALLEXInitializer:
@@ -15,14 +15,9 @@ class ALLEXInitializer:
         """초기화 파라미터 설정"""
         # 🆕 59자유도 전체 지원
         self._total_joints = TOTAL_JOINTS
-        self._effective_joints = EFFECTIVE_JOINTS
-        
+
         # 관절 위치 초기화
         self._target_joint_positions = [0.0] * self._total_joints
-        self._controlled_joint_indices = list(range(self._total_joints))
-        
-        # Coupled Joint 설정
-        self._coupled_joints = {}
 
     def setup_camera_view(self):
         """카메라 뷰 설정"""
@@ -86,8 +81,3 @@ class ALLEXInitializer:
     def target_joint_positions(self):
         """목표 관절 위치 반환"""
         return self._target_joint_positions
-
-    @target_joint_positions.setter 
-    def target_joint_positions(self, positions):
-        """목표 관절 위치 설정"""
-        self._target_joint_positions = positions

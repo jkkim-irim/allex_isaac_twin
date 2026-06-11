@@ -849,23 +849,6 @@ class DataPlotter:
                         print(f"[ALLEX][DataPlot {self._subset}] "
                               f"get_joint_positions failed: {exc}")
 
-        # --- (legacy, 참고용) PD 재계산 경로 — 주석 보존 ----------------
-        # try:
-        #     view = getattr(self._articulation, "_articulation_view", None)
-        #     pos = _to_np(view.get_joint_positions())
-        #     vel = _to_np(view.get_joint_velocities())
-        #     kps, kds = view.get_gains()
-        #     kp_vec = _to_np(kps)
-        #     kd_vec = _to_np(kds)
-        #     actions = view.get_applied_actions(clone=False)
-        #     pos_tgt = _to_np(actions.joint_positions)
-        #     vel_tgt = _to_np(actions.joint_velocities)
-        # except Exception:
-        #     pass
-        # tau_pd  = kp_vec * (pos_tgt - pos) + kd_vec * (vel_tgt - vel)
-        # tau_ff_cb = self._ff_provider() if self._ff_provider else 0
-        # tau_total = (tau_pd + tau_ff_cb).astype(np.float32)
-
         effective_dt = (float(dt) if dt else (1.0 / self._physics_hz)) * self._decim
         self._sim_time += effective_dt
 
@@ -1015,10 +998,6 @@ def register_singleton(key: str, plotter: DataPlotter) -> None:
         except Exception:
             pass
     _SINGLETONS[key] = plotter
-
-
-def get_singleton(key: str = "body") -> Optional[DataPlotter]:
-    return _SINGLETONS.get(key)
 
 
 def clear_singletons() -> None:
