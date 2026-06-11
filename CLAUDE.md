@@ -1,14 +1,68 @@
 # CLAUDE.md
 
-Claude Code가 이 리포에서 작업할 때 참조할 규약. 운영/셋업 절차는 `README.md`에 있으니 여기는 **코드에서 유추 불가능한 invariant와 규약**만 기록.
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
 ---
 
-## 한 줄 요약
-
-**Real2Sim 디지털 트윈** — Isaac Sim 6.0 + Newton(MuJoCo Warp) 백엔드로 ALLEX 휴머노이드 구동. ROS2 도메인의 실제 로봇 관절을 200 Hz로 미러링하거나, `trajectory/<group>/*.csv` 그룹을 Hermite 스플라인으로 재생. Traj Studio UI 안에서 PD 게인/토크 리밋을 via 이벤트로 실시간 ramp.
-
-자세한 스펙(LOAD/RUN 절차, CSV 포맷, ROS2 토픽 매핑)은 `README.md` 참조.
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
 ---
 
@@ -64,17 +118,8 @@ ALLEX twin 의 viz prim 들은 **stage session layer** 에 authored — root lay
 ## 문서화 규칙
 
 - 중간 과정에서 기록이 필요한 결정/분석/기획은 `dvcc/` 폴더에 `.md`로 추가. 추가시 prefix를 지킬것.
-- prefix는 '00_제목.md' 십의 자리는 그룹묶음, 일의 자리는 그룹내 순서로
+- prefix는 `00_제목.md` — 십의 자리는 그룹묶음, 일의 자리는 그룹내 순서로.
 - **매 작업 시작 시 `dvcc/` 디렉토리를 먼저 확인할 것.** 기존 문서 맥락을 반영하고, 내용이 낡았으면 수정, 더 이상 유효하지 않거나 불필요하면 **파일 삭제도 허용**. `dvcc/`는 살아있는 노트 폴더로 관리.
 - `README.md`는 사용자용 매뉴얼 — 직접 요청 없으면 수정 금지.
-
+- `dvcc/00_overview.md`의 **불변식** 섹션 변경은 사용자 확인 필수.
 ---
-
-## 참고
-
-- `README.md` — 사용자용 운영 매뉴얼 + Newton 설정·CSV 포맷·ROS2 토픽 매핑 표
-- `dvcc/` — 프로젝트 메타 문서 (리팩토링 원칙, 커밋 컨벤션 등)
-- `src/allex/config/physics_settings.py` — 물리 오버라이드 단일 진입점
-- `src/allex/core/newton_bridge.py` — equality 주입 + gravcomp 적용 finalize 후크
-- `tools/regen_joint_config.py` — MJCF → joint_config.json 재생성
-- `data/_plot_torque_compare*.py` — 토크 비교 플롯 스크립트 (sim CSV vs rosbag)

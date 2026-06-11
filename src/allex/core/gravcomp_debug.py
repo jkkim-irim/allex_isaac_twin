@@ -33,6 +33,8 @@ class GravcompTorqueProbe:
         self._dof_idx: int | None = None
         self._warned_no_dof = False
         self._warned_no_data = False
+        # actuator_gravcomp 상태 캐싱 (매 스텝 JSON 다시 읽지 않도록)
+        self._routing_label: str | None = None
 
     def step(self, articulation) -> None:
         self._step += 1
@@ -73,7 +75,26 @@ class GravcompTorqueProbe:
                 self._warned_no_data = True
             return
 
-        print(
-            f"[ALLEX][Gravcomp][{self._joint_name}] "
-            f"PD={qact:+8.3f}  Grav={qgrav:+8.3f}  Sum={qact + qgrav:+8.3f}  N·m"
-        )
+        if self._routing_label is None:
+            try:
+                from ..utils.sim_settings_utils import _load
+                routing = _load().get("newton", {}).get("gravcomp", {}).get("actuator_gravcomp", False)
+                if isinstance(routing, dict):
+                    routing = bool(routing.get("enabled", False))
+                self._routing_label = "actuator" if routing else "passive"
+            except Exception:
+                self._routing_label = "?"
+
+        # passive 일 때 net = qact + qgrav (두 개가 분리 적용됨).
+        # actuator 일 때 net ≈ qact (qgrav 는 raw 계산만 — 이미 qact 에 포함).
+        if self._routing_label == "actuator":
+            net = qact
+            net_label = "net≈qact"
+        else:
+            net = qact + qgrav
+            net_label = "net=qact+qgrav"
+
+        # print(
+        #     f"[ALLEX][Gravcomp][{self._joint_name}][{self._routing_label}] "
+        #     f"qact={qact:+8.3f}  qgrav={qgrav:+8.3f}  {net_label}={net:+8.3f}  N·m"
+        # )

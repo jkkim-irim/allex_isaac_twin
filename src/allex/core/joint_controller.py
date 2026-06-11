@@ -233,8 +233,10 @@ class ALLEXJointController:
     # ========================================
     def create_joint_control_generator(self, articulation, get_target_positions_func,
                                         is_external_active_fn=None,
-                                        torque_plot_fn=None):
-        """관절 제어 제너레이터 — 매 physics step마다 목표 위치 적용.
+                                        torque_plot_fn=None,
+                                        pre_step_fn=None,
+                                        get_target_velocities_func=None):
+        """관절 제어 제너레이터 — 매 physics step마다 목표 위치 + (옵션) 속도 적용.
 
         is_external_active_fn: optional callable returning True when an external
         driver (e.g. trajectory playback) wants to push targets even if the ROS2
@@ -243,6 +245,20 @@ class ALLEXJointController:
         target has been applied so the FF snapshot reflects the state that
         will be integrated on the next Newton step. Used by
         ``DataPlotter.apply_step`` (wrapped to supply dt).
+        pre_step_fn: optional callable invoked every step AFTER target write —
+        used by MotorStateMirror to compute motor-space PD from the just-pushed
+        q_target / q̇_target (control.joint_target_pos / vel). Runs regardless
+        of `active` state so motor mirror keeps applying motor-clipped torque
+        during idle / ROS2 teleop / trajectory playback uniformly.
+        (이전: BEFORE target write — 단순 K_j gain refresh 용. motor-space
+        torque clip 도입 이후 fresh target 가 필요해 AFTER 로 이동.)
+        get_target_velocities_func: kept for signature backward-compat;
+        **현재 미사용**. 이유: Isaac Sim 6 의 `articulation_controller.apply_action`
+        이 joint_velocities 를 CUDA tensor 로 wrap 한 뒤 `np.isnan(...)` 직접
+        호출 (to_numpy wrapper 누락 — joint_positions 만 wrapping 정상) 해서
+        터짐. 우회: ArticulationAction 에서 joint_velocities 제거. q̇_target 은
+        scenario → MotorStateMirror 로 직접 callback 라우팅 (Newton 의 control
+        layer 미경유).
         """
         while True:
             active = self._ros2_subscriber_active
@@ -250,12 +266,16 @@ class ALLEXJointController:
                 active = bool(is_external_active_fn())
             if articulation is not None and active:
                 target_positions = get_target_positions_func()
-                articulation.apply_action(ArticulationAction(target_positions))
+                articulation.apply_action(
+                    ArticulationAction(joint_positions=target_positions)
+                )
             if torque_plot_fn is not None:
                 try:
                     torque_plot_fn()
                 except Exception as exc:
                     print(f"[ALLEX][TorquePlot] hook failed: {exc}")
+            if pre_step_fn is not None:
+                pre_step_fn()
             yield
 
     def get_coupled_joints_info(self):
