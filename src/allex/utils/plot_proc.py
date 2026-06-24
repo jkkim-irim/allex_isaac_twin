@@ -231,8 +231,6 @@ def _stdin_reader_loop(
                         real_dqs[j].append(nan)
             cursor += count
         received += 1
-        if received % 200 == 0:
-            _log(f"recv={received} t_last={t:.3f}")
     stop_event.set()
 
 
@@ -347,12 +345,12 @@ def main() -> int:
             sim_col = _shade(_SIM_COLOR, j_idx, n_joints)
             if has_real:
                 (ln_real,) = ax.plot(
-                    [], [], color=real_col, label=f"Real/{jname}", linewidth=0.8,
+                    [], [], color=real_col, label=f"Real/{jname}", linewidth=1.0,
                 )
                 real_lines.append(ln_real)
                 labeled_lines_ax.append(ln_real)
                 (ln_sim,) = ax.plot(
-                    [], [], color=sim_col, linestyle="--", linewidth=0.8,
+                    [], [], color=sim_col, linestyle="--", linewidth=1.0,
                     label=f"Sim/{jname}",
                 )
                 sim_lines.append(ln_sim)
@@ -360,20 +358,20 @@ def main() -> int:
             else:
                 # No real channel — sim is the sole solid line with the label.
                 (ln_sim,) = ax.plot(
-                    [], [], color=sim_col, label=str(jname), linewidth=0.8,
+                    [], [], color=sim_col, label=str(jname), linewidth=1.0,
                 )
                 sim_lines.append(ln_sim)
                 labeled_lines_ax.append(ln_sim)
-        ax.set_title(str(grp.get("name", "")))
+        ax.set_title(str(grp.get("name", "")), fontsize=16)
         ax_channel = str(grp.get("channel", "torque"))
         if ax_channel not in ("torque", "pos"):
             ax_channel = "torque"
-        ax.set_ylabel("position [deg]" if ax_channel == "pos" else "torque [N m]")
+        ax.set_ylabel("position [deg]" if ax_channel == "pos" else "torque [N m]", fontsize=14)
         ax.grid(True, alpha=0.3)
         # ncol=2 로 real/sim 페어가 같은 row 에 묶여 보이게. Legend 가 너무 커서
         # plot 영역을 가리면 viz_config.json::torque_plot.subsets 에서 joint 수를
         # 줄이는 식으로 해결.
-        leg = ax.legend(loc="upper left", fontsize="x-small", ncol=2)
+        leg = ax.legend(loc="upper left", fontsize=10, ncol=2)
         for leg_line, orig_line in zip(leg.get_lines(), labeled_lines_ax):
             leg_line.set_picker(True)
             leg_line.set_pickradius(5)
@@ -404,7 +402,7 @@ def main() -> int:
                     kw["linewidth"] = 0.0
                 ax.axvspan(float(t0), float(t1), **kw)
         axis_specs.append((ax, sim_lines, real_lines, leg, ax_y_lim, ax_channel))
-    axes[-1].set_xlabel("time [s]")
+    axes[-1].set_xlabel("time [s]", fontsize=14)
     # rect=[left, bottom, right, top] — 위 strip 은 Hide/Show 버튼, 아래는 x-label,
     # 왼쪽은 y-label, 오른쪽도 숨 좀 트이게 작은 여백. 0(=가장자리 붙임) 이면 figure
     # 가 좁을 때 라벨이나 마지막 tick 이 잘림.
