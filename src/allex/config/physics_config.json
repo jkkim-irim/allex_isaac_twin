@@ -78,7 +78,7 @@
             "actuator_gravcomp": {
                 "enabled": false
             },
-            "_actuator_gravcomp_doc": "MuJoCo mjc:actuatorgravcomp 의 alias. false = qfrc_gravcomp 별도 (passive). true = qfrc_actuator 합산. motor-space torque clip 도입 후 전체 passive 로 통일: 우리 kernel 이 joint_f (qfrc_applied) 에 PD+gravcomp 합산-clip-차감을 처리하므로 MuJoCo 의 actuator-route gravcomp 가 켜져 있으면 qfrc_actuator 에 gravcomp 가 또 들어가 double-count. 기구적 중력보상 (Waist_Lower_Pitch, Neck_Pitch) 도 동일한 passive route 사용 — kernel 측에서 motor clip 단계에서만 gravcomp 합산을 skip.",
+            "_actuator_gravcomp_doc": "actuator-gravcomp routing 의 단일 스위치 (이제 이 키 하나뿐 — 중복이던 allex.actuator_gravcomp 경로는 제거됨). false = qfrc_gravcomp 별도 (passive, 기본/현재값). true = qfrc_actuator 합산 (apply_actuator_gravcomp_runtime 이 finalize 후 mjw_model.jnt_actgravcomp 에 직접 1 을 stamp). motor-space torque clip 도입 후 전체 passive 로 통일: 우리 kernel 이 joint_f = tau_clip − gravcomp 로 PD+gravcomp 합산-clip-차감을 처리하므로 passive (false) 가 정합 — MuJoCo 의 actuator-route gravcomp 를 켜면 qfrc_actuator 에 gravcomp 가 또 들어가 double-count. 기구적 중력보상 (Waist_Lower_Pitch, Neck_Pitch) 도 동일한 passive route 사용 — kernel 측에서 motor clip 단계의 is_mech_comp 로 gravcomp 합산을 skip.",
             "bodies": [
                 "Base_Link",
                 "Waist_Yaw_Link",
@@ -158,19 +158,7 @@
             "_doc": "실 제어기의 motor-domain ramp step (per 1ms). 모든 카테고리(kp/kv/tlp/tln) 동일 글로벌 값. MotorStateMirror 가 매 physics step 이 값으로 K_m_current 를 ramp 하고 jk_kernel.compute_*_K_j 로 joint-domain 으로 변환해 view 에 직접 write. (디버그: 0.001 → 0.01 로 10x 빠르게 — transient 스파이크 감소 검증용. real 의 실제 값과 다를 수 있으므로 비교 끝나면 복원 검토.)"
         }
     },
-    "debug": {
-        "gravcomp_probe": {
-            "enabled": true,
-            "joint_name": "R_Shoulder_Pitch_Joint",
-            "period": 100,
-            "_doc": "매 N(=period) 물리 스텝마다 qfrc_actuator / qfrc_gravcomp 를 터미널에 출력. period=N + physics_hz 로 출력 Hz 결정 (예: period=100 + physics_hz=200 → 2Hz). joint_name 변경으로 다른 관절 관찰. enabled=false 면 비활성."
-        }
-    },
     "allex": {
-        "actuator_gravcomp": {
-            "enabled": true,
-            "joints": []
-        },
         "armature": {
             "default_armature": 0.00,
             "armature_overrides": {

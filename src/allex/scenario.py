@@ -55,7 +55,6 @@ class ALLEXDigitalTwin:
         self._trajectory_player = None
         self._csv_replayer = None
         self._visualizer = None
-        self._gravcomp_probe = self._build_gravcomp_probe()
         # actuator_gravcomp routing 은 finalize 후 mjw_model 이 준비돼야 적용 가능 →
         # 매 step 호출하다 첫 성공 시 True 로 막음 (CUDA graph 재기록 방지).
         self._actuator_gravcomp_applied = False
@@ -195,13 +194,6 @@ class ALLEXDigitalTwin:
                 print(f"[ALLEX][Gravcomp] runtime apply error: {exc}")
                 self._actuator_gravcomp_applied = True  # 재시도 안 함
 
-        if self._gravcomp_probe is not None and self._articulation is not None:
-            try:
-                self._gravcomp_probe.step(self._articulation)
-            except Exception as exc:
-                print(f"[ALLEX][Gravcomp] probe.step error: {exc}")
-                self._gravcomp_probe = None  # 한 번 실패하면 비활성
-
         done = self._simulation_loop.update(step)
         # csv_replayer 는 기본적으로 omni.kit.app update stream (rendering tick) 으로
         # 자체 진행한다 (kinematic replay 는 physics 와 무관). subscription 등록 실패 시
@@ -266,23 +258,6 @@ class ALLEXDigitalTwin:
                 self._ff_manager.set_num_dof(ndof)
         except Exception as e:
             logger.warning(f"FeedforwardTorqueManager resize failed: {e}")
-
-    @staticmethod
-    def _build_gravcomp_probe():
-        """`physics_config.json::debug.gravcomp_probe` 설정으로 probe 생성. 비활성/오류면 None."""
-        try:
-            from .utils.sim_settings_utils import _load
-            cfg = _load().get("debug", {}).get("gravcomp_probe", {}) or {}
-            if not bool(cfg.get("enabled", False)):
-                return None
-            from .core.gravcomp_debug import GravcompTorqueProbe
-            joint = str(cfg.get("joint_name", "R_Shoulder_Pitch_Joint"))
-            period = int(cfg.get("period", 200))
-            print(f"[ALLEX][Gravcomp] probe enabled: joint={joint}, period={period}")
-            return GravcompTorqueProbe(joint_name=joint, period=period)
-        except Exception as exc:
-            print(f"[ALLEX][Gravcomp] probe init failed: {exc}")
-            return None
 
     # ========================================
     # 내부 헬퍼

@@ -8,7 +8,6 @@
     simulation_loop.py  — ALLEXSimulationLoop (Isaac Sim physics step 콜백 등록)
     newton_bridge.py    — Newton ModelBuilder finalize 후크
                           (MJCF equality 주입, mjc:gravcomp 인증, actuator routing)
-    gravcomp_debug.py   — GravcompTorqueProbe (PD/Grav/Sum 분리 출력 진단)
 
 호출 방향:
     scenario.py → core/* (단방향). UI 는 core 직접 import 금지.

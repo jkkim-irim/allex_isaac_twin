@@ -40,10 +40,6 @@ _master_joint_config_path: Path | None = None
 # Per-DOF static/dynamic friction loaded from joint_config.json::joint_friction.
 _friction_table: dict[str, float] = {}
 
-# Per-joint actuator-gravcomp toggle config (mujoco:jnt_actgravcomp custom attr).
-# Independent from the body-level mujoco:gravcomp set by sim_settings_utils.
-_gravcomp_cfg: dict = {"enabled": False, "joints": []}
-
 _orig_on_post_reset = None
 
 
@@ -165,64 +161,6 @@ def _inject_friction(builder) -> None:
             joint_fric[qd] = val
             applied += 1
     print(f"[ALLEX][Friction] injected friction on {applied}/{len(_friction_table)} joint(s) at builder level")
-
-
-def _inject_actuator_gravcomp(builder) -> None:
-    """builder 의 mujoco:jnt_actgravcomp custom-attribute 값을 셋팅.
-
-    finalize 직전에 호출되어야 builder 가 MuJoCo-Warp actuator 생성 시
-    actgravcomp=True 를 읽음. 런타임 on/off 는 불가 — 값 바꿨으면 stage
-    reload (확장 disable/enable) 필요.
-
-    NOTE: 켜진 joint 는 qfrc_actuator 에 PD + 중력 토크가 **합산**되어 나옴.
-    body 레벨 mujoco:gravcomp (sim_settings_utils.apply_gravcomp_to_builder) 와는
-    별개의 경로다.
-    """
-    if not _gravcomp_cfg.get("enabled", False):
-        return
-
-    # builder 의 CustomAttribute 찾기. namespace 포함 key 우선, fallback.
-    attr = None
-    cust = getattr(builder, "custom_attributes", None)
-    if cust is not None:
-        attr = cust.get("mujoco:jnt_actgravcomp") or cust.get("jnt_actgravcomp")
-    if attr is None:
-        print("[ALLEX][GravComp] mujoco:jnt_actgravcomp custom attribute not found. "
-              "MuJoCo solver not loaded? — skip")
-        return
-
-    joint_labels = list(builder.joint_label or [])
-    joint_qd_start = list(getattr(builder, "joint_qd_start", []) or [])
-    total_dof = int(getattr(builder, "joint_dof_count", 0) or 0)
-    if not joint_labels or not joint_qd_start:
-        print("[ALLEX][GravComp] builder missing joint_label / qd_start; skip")
-        return
-
-    target_names = set(_gravcomp_cfg.get("joints", []) or [])
-    all_joints = not target_names
-
-    if attr.values is None:
-        attr.values = {}
-
-    applied_joints = 0
-    applied_dofs = 0
-    for ji, label in enumerate(joint_labels):
-        short = label.rsplit("/", 1)[-1]
-        if not all_joints and short not in target_names:
-            continue
-        if ji >= len(joint_qd_start):
-            continue
-        qd_start = int(joint_qd_start[ji])
-        qd_end = int(joint_qd_start[ji + 1]) if ji + 1 < len(joint_qd_start) else total_dof
-        if qd_end <= qd_start:
-            continue  # fixed/zero-DOF joint
-        for qd in range(qd_start, qd_end):
-            attr.values[qd] = True
-            applied_dofs += 1
-        applied_joints += 1
-    print(f"[ALLEX][GravComp] actuator-gravcomp enabled on {applied_joints} joint(s) "
-          f"/ {applied_dofs} DOF(s). NOTE: qfrc_actuator 값이 PD+중력 합산임 "
-          "(torque plot 해석 주의)")
 
 
 def _find_joint_idx(builder, short_name: str) -> int | None:
@@ -614,7 +552,7 @@ def configure_newton_from_toml() -> bool:
 def install(joint_config_path: Path) -> None:
     global _orig_finalize, _equality_table
     global _config_solref, _config_solimp, _master_joint_config_path
-    global _friction_table, _gravcomp_cfg
+    global _friction_table
     _install_articulation_reset_patch()
     configure_newton_from_toml()
     _master_joint_config_path = Path(joint_config_path)
@@ -647,17 +585,6 @@ def install(joint_config_path: Path) -> None:
         _friction_table = {}
     print(f"[ALLEX] loaded {len(_friction_table)} friction entries from {joint_config_path}")
 
-    try:
-        from ..utils import sim_settings_utils as _ps
-        _gravcomp_cfg = _ps.get_actuator_gravcomp_cfg()
-    except Exception as exc:
-        print(f"[ALLEX] failed to load actuator_gravcomp cfg: {exc}")
-        _gravcomp_cfg = {"enabled": False, "joints": []}
-    print(
-        f"[ALLEX] actuator_gravcomp: enabled={_gravcomp_cfg.get('enabled')}, "
-        f"joints={len(_gravcomp_cfg.get('joints', []))} target(s)"
-    )
-
     if already_patched:
         # 이미 patched 인 finalize — 같은 sentinel 발견 시 _orig_finalize 만 복원해서
         # uninstall 이 정상 동작하게 두고 재설치는 skip. equality table 등은 위에서
@@ -685,10 +612,6 @@ def install(joint_config_path: Path) -> None:
             _inject_friction(self)
         except Exception as exc:
             print(f"[ALLEX] friction injection raised: {exc}")
-        try:
-            _inject_actuator_gravcomp(self)
-        except Exception as exc:
-            print(f"[ALLEX] actuator gravcomp injection raised: {exc}")
         try:
             _force_position_velocity_mode(self)
         except Exception as exc:

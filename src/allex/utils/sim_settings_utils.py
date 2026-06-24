@@ -497,33 +497,6 @@ def apply_actuator_gravcomp_runtime() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-joint actuator-gravcomp (mujoco:jnt_actgravcomp)
-# ---------------------------------------------------------------------------
-
-def get_actuator_gravcomp_cfg() -> dict[str, Any]:
-    """Return [allex.actuator_gravcomp] section with safe defaults.
-
-    Independent from body-level mujoco:gravcomp (apply_gravcomp_to_builder).
-    This drives MuJoCo's per-actuator gravity-comp toggle, which makes the
-    qfrc_actuator value carry PD + gravity torques summed.
-
-    Keys:
-        enabled (bool): 전역 on/off. 변경 후 stage reload 필요.
-        joints (list[str]): 대상 joint short-name 목록. 빈 리스트 → 모든 active joint.
-    """
-    cfg = (
-        _load().get("allex", {}).get("actuator_gravcomp", {}) or {}
-    )
-    enabled = bool(cfg.get("enabled", False))
-    joints_raw = cfg.get("joints", []) or []
-    try:
-        joints = [str(x) for x in joints_raw]
-    except Exception:
-        joints = []
-    return {"enabled": enabled, "joints": joints}
-
-
-# ---------------------------------------------------------------------------
 # Equality-joint armature floor (allex.armature)
 # ---------------------------------------------------------------------------
 

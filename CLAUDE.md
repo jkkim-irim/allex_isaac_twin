@@ -76,7 +76,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - **Equality constraint는 `newton_bridge.py`가 finalize 후크에서 주입.** Newton USD importer가 MJCF `<equality>`를 누락하므로, `src/allex/config/joint_config.json::equality_constraints`에서 follower/master/polycoef 세트로 보강. JSON은 `tools/regen_joint_config.py`로 MJCF에서 자동 재생성하지만 `ui`·`drive_gains` 섹션은 손작업으로 보존.
 - **`active_joints` (joint_config.json) 순서는 trajectory CSV의 joint_1..N 인덱스와 직결**. 재정렬은 모든 trajectory CSV 재생성을 강제하는 파괴적 변경.
 - **단위 변환은 경계 레이어에서만**: trajectory CSV position=deg → 내부 rad 변환은 `joint_controller`/`trajectory_player`. PD 게인·토크 리밋은 CSV 원본 단위(SI) 그대로 통과. ROS2 outbound `joint_positions_deg`는 deg, 내부는 rad.
-- **Showcase CSV `torque_*` 컬럼 = `qfrc_actuator + qfrc_gravcomp`** (PD + 중력보상 합산). rosbag `joint_torque`(컨트롤러 내부 보상 포함된 모터 명령)와 같은 reference frame. 단독 PD/단독 보상 보고 싶으면 `core/gravcomp_debug.py::GravcompTorqueProbe`.
+- **Showcase CSV `torque_*` 컬럼 = `qfrc_actuator + qfrc_gravcomp`** (PD + 중력보상 합산). rosbag `joint_torque`(컨트롤러 내부 보상 포함된 모터 명령)와 같은 reference frame.
 
 ---
 
