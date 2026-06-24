@@ -20,6 +20,7 @@ icon = "data/icon.png"
 "omni.kit.uiapp" = {}
 "isaacsim.gui.components" = {}
 "isaacsim.core.api" = {}
+"omni.kit.capture.viewport" = {}
 
 [[python.module]]
 name = "src"

@@ -126,6 +126,10 @@ class CsvReplayer:
         plotters: Optional[list] = None,
         viz_scenario: Optional[dict] = None,
         record_forces: bool = False,
+        record_video: bool = False,
+        rec_width: int = 3840,
+        rec_height: int = 2160,
+        rec_fps: int = 60,
         pc_replayer: "Optional[object]" = None,
     ):
         if reader_main is None:
@@ -536,6 +540,16 @@ class CsvReplayer:
         self._record_forces_enabled: bool = bool(record_forces)
         self._force_record_buf: list[tuple] = []
 
+        # render-to-file (record video) 설정. record_video=True 면 start() 에서
+        # realtime self-tick 대신 deterministic 고정-dt 캡처 루프 (asyncio task) 를
+        # 돈다. realtime 경로는 record_video=False 일 때 기존과 100% 동일.
+        self._record_video_enabled: bool = bool(record_video)
+        self._rec_width: int = int(rec_width)
+        self._rec_height: int = int(rec_height)
+        self._rec_fps: int = int(rec_fps)
+        self._record_task = None
+        self._record_cancel: bool = False
+
         # contact-local CSV export 버퍼 (flag on 일 때만).
         self._export_records: Optional[list[dict]] = None
         self._export_pair_to_links: dict[str, list[str]] = {}
@@ -626,23 +640,33 @@ class CsvReplayer:
                     setattr(self, _attr, False)
         self._rt_stage = None
 
-        # rendering tick (= 매 frame) subscription. 성공하면 scenario.update() 의
-        # physics-step driven advance 호출은 skip 됨 (is_self_ticking() 이 True).
-        try:
-            import omni.kit.app
-            stream = omni.kit.app.get_app().get_update_event_stream()
-            self._update_sub = stream.create_subscription_to_pop(
-                self._on_render_tick, name="allex.replay.csv.tick"
-            )
-            self._self_ticking = True
-            logger.info("[replay] subscribed to omni.kit.app update stream (rendering tick)")
-        except Exception as exc:
-            logger.warning(
-                f"[replay] rendering tick subscribe failed: {exc} — "
-                f"falling back to physics-step driven advance"
-            )
+        if self._record_video_enabled:
+            # record 모드: realtime self-tick 미구독 (wall-clock 무관). 캡처 루프가
+            # 가상시계로 _apply_at_elapsed 를 호출하며 매 프레임 viewport 를 PNG 로
+            # 저장하고, 끝나면 mp4 합성. self-tick 으로 advance 가 또 돌면 이중 진행
+            # 되므로 구독 안 함 — is_self_ticking() True 로 두어 physics-step advance
+            # 도 막는다.
             self._update_sub = None
-            self._self_ticking = False
+            self._self_ticking = True
+            logger.info("[replay] record-video mode — capture loop (no realtime tick)")
+        else:
+            # rendering tick (= 매 frame) subscription. 성공하면 scenario.update() 의
+            # physics-step driven advance 호출은 skip 됨 (is_self_ticking() 이 True).
+            try:
+                import omni.kit.app
+                stream = omni.kit.app.get_app().get_update_event_stream()
+                self._update_sub = stream.create_subscription_to_pop(
+                    self._on_render_tick, name="allex.replay.csv.tick"
+                )
+                self._self_ticking = True
+                logger.info("[replay] subscribed to omni.kit.app update stream (rendering tick)")
+            except Exception as exc:
+                logger.warning(
+                    f"[replay] rendering tick subscribe failed: {exc} — "
+                    f"falling back to physics-step driven advance"
+                )
+                self._update_sub = None
+                self._self_ticking = False
 
         # CSV replay 동안 viz.update() 가 자체 qfrc 로 sim/real ring 을 덮어쓰지 않도록
         # 채널 lock — kinematic replay 는 actuator force 가 0 이라 그대로 두면 push 한
@@ -702,6 +726,19 @@ class CsvReplayer:
         # 채널 prim 을 zero-vector(=threshold 미달, hidden) 로 미리 생성·등록.
         self._precreate_force_prims()
 
+        # record 모드: 캡처 루프를 asyncio task 로 실행 (Isaac Sim async_engine).
+        if self._record_video_enabled:
+            self._record_cancel = False
+            try:
+                import omni.kit.async_engine
+                self._record_task = omni.kit.async_engine.run_coroutine(
+                    self._record_loop()
+                )
+                logger.info("[replay] record-video capture loop scheduled")
+            except Exception as exc:
+                logger.warning(f"[replay] record loop schedule failed: {exc}")
+                self._record_task = None
+
     def _precreate_force_prims(self) -> None:
         """replay 시작 시 모든 알려진 force/torque/trail 채널 prim 을 warm-up.
 
@@ -755,6 +792,8 @@ class CsvReplayer:
                     logger.debug(f"[replay] precreate add_custom_trail warn: {exc}")
 
     def stop(self) -> None:
+        # record 캡처 루프에 취소 신호 — 다음 frame 경계에서 루프 탈출 + 해상도 복원.
+        self._record_cancel = True
         # rendering tick subscription 먼저 해제 — 더 이상 advance 안 불리도록.
         if self._update_sub is not None:
             try:
@@ -865,6 +904,170 @@ class CsvReplayer:
         except Exception as exc:
             logger.warning(f"[replay] render-tick advance warn: {exc}")
 
+    # RTX 누적/TAA 안정화용 settle 프레임 수 (캡처 직전 펌핑).
+    _RECORD_SETTLE_FRAMES: int = 4
+
+    async def _record_loop(self) -> None:
+        """render-to-file 캡처 루프. wall-clock 무시, 가상시계 t=i/fps 로 매 프레임을
+        deterministic 하게 적용·캡처한 뒤 mp4 합성.
+
+        고정-dt 라 realtime 이 느려도(예: 4K 28fps) 결과 영상은 rec_fps 로 정확히
+        나온다 (wall-clock 만 느림). 모든 heavy import 는 이 시점 지역 import —
+        미설치/미로드 환경에서 extension load 가 깨지지 않게.
+        """
+        import math as _math
+        import omni.kit.app
+        from omni.kit.viewport.utility import (
+            get_active_viewport, capture_viewport_to_file,
+        )
+        # 캡처 파일명을 encoder 의 frame-path builder 와 동일 규칙으로 생성해야
+        # mp4 합성 시 frame 을 빠짐없이 찾는다 (get_num_pattern_file_path 가
+        # prefix + num_pattern + ext 를 '.' 로 join — %05d 는 5자리 zero-pad 라
+        # i=0 이면 frame_.00000.png 형태).
+        # import 실패해도 캡처 자체는 진행 (mp4 합성만 fallback).
+        try:
+            from omni.kit.capture.viewport.helper import (
+                get_num_pattern_file_path as _frame_path,
+            )
+        except Exception:
+            _frame_path = None
+
+        _PREFIX = "frame_"
+        _NUM_PATTERN = "%05d"
+        _IMG_TYPE = ".png"
+
+        fps = self._rec_fps if self._rec_fps > 0 else 60
+        duration = float(self._main.duration_s)
+        # floor + 1 — 마지막 가상시각이 duration 을 포함하도록 (realtime 경로가
+        # _apply_at(num_samples-1) 로 끝 자세를 명시 적용하는 것과 길이·끝자세 일관).
+        n_frames = int(_math.floor(duration * fps)) + 1
+        stem = self._main.path.stem
+        out_dir = self._main.path.parent / f"recordings_{stem}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        def _capture_path(i: int) -> str:
+            if _frame_path is not None:
+                return _frame_path(str(out_dir), _PREFIX, _NUM_PATTERN, i, _IMG_TYPE)
+            # fallback (encoder 없을 때) — 사람이 읽기 쉬운 zero-pad.
+            return str(out_dir / f"frame_{i:05d}.png")
+
+        vp = get_active_viewport()
+        if vp is None:
+            logger.warning("[replay] record: no active viewport — abort")
+            return
+
+        saved_res = None
+        rec_res = (self._rec_width, self._rec_height)
+        try:
+            saved_res = vp.resolution
+            vp.resolution = rec_res
+            logger.info(
+                f"[replay] record start: {n_frames} frames @ {fps}fps, "
+                f"res={self._rec_width}x{self._rec_height}, out={out_dir}"
+            )
+            for i in range(n_frames):
+                if self._record_cancel or not self.is_active():
+                    logger.info(f"[replay] record cancelled at frame {i}/{n_frames}")
+                    return
+                # 가상시계 자세 + viz 적용. 마지막 frame 은 duration 으로 클램프 —
+                # i/fps 가 duration 을 넘어 index_at 가 over-run 하지 않게.
+                self._apply_at_elapsed(min(i / fps, duration))
+                self._step_count += 1
+                # RTX 누적/TAA 안정화를 위해 settle 프레임 펌핑.
+                for _ in range(self._RECORD_SETTLE_FRAMES):
+                    await omni.kit.app.get_app().next_update_async()
+                # encoder frame-path 규칙과 동일한 파일명으로 캡처.
+                cap = capture_viewport_to_file(vp, file_path=_capture_path(i))
+                await cap.wait_for_result(completion_frames=0)
+                if (i + 1) % 30 == 0 or (i + 1) == n_frames:
+                    print(f"[ALLEX][Record] {i + 1}/{n_frames}")
+        except Exception as exc:
+            logger.warning(f"[replay] record loop error: {exc}")
+            return
+        finally:
+            # 해상도 복원 (정상 종료/취소/예외 모두). 단, 빠른 재-Run 으로 new task 가
+            # 이미 녹화 해상도를 다시 set 한 경우 그걸 덮어쓰지 않도록 — 현재 vp.resolution
+            # 이 내가 set 한 rec_res 와 같을 때만 원복.
+            if saved_res is not None:
+                try:
+                    if tuple(vp.resolution) == tuple(rec_res):
+                        vp.resolution = saved_res
+                except Exception as exc:
+                    logger.debug(f"[replay] record resolution restore warn: {exc}")
+
+        # 캡처 완료 — mp4 합성 (Isaac 내장 encoder, video_encoding plugin).
+        helper = self._encode_video(out_dir, stem, n_frames, fps)
+        # encode 가 background thread 로 시작됐으면 완료를 비차단 폴링해 안내.
+        if helper is not None:
+            for _ in range(6000):  # 최대 ~100s (next_update_async ~60fps 가정)
+                if helper.encoding_done:
+                    logger.info(f"[replay] mp4 encode done: {out_dir / f'{stem}.mp4'}")
+                    print(f"[ALLEX][Record] mp4 합성 완료: {out_dir / f'{stem}.mp4'}")
+                    break
+                await omni.kit.app.get_app().next_update_async()
+        # replay 자동 종료.
+        try:
+            self.stop()
+        except Exception as exc:
+            logger.debug(f"[replay] record post-stop warn: {exc}")
+
+    def _encode_video(self, out_dir: Path, stem: str, n_frames: int, fps: int):
+        """캡처한 PNG 시퀀스를 mp4 로 합성. import/플러그인 부재 시 graceful 안내.
+
+        성공적으로 background encode 가 시작됐으면 VideoGenerationHelper 를 리턴
+        (caller 가 encoding_done 폴링), 아니면 None. generating_video 는 video_encoding
+        plugin 부재 시 예외 없이 False 를 반환하므로 반드시 반환값을 검사한다.
+        """
+        try:
+            from omni.kit.capture.viewport.video_generation import (
+                VideoGenerationHelper,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[replay] video encoder unavailable ({exc}); "
+                f"PNG 시퀀스는 {out_dir} 에 저장됨, mp4 합성 실패"
+            )
+            print(f"[ALLEX][Record] mp4 합성 실패 — PNG 시퀀스는 {out_dir} 에 저장됨")
+            return None
+        try:
+            helper = VideoGenerationHelper()
+            ok = helper.generating_video(
+                video_name=str(out_dir / f"{stem}.mp4"),
+                frames_dir=str(out_dir),
+                filename_prefix="frame_",
+                filename_num_pattern="%05d",
+                start_number=0,
+                total_frames=n_frames,
+                frame_rate=fps,
+                image_type=".png",
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[replay] mp4 encode failed ({exc}); "
+                f"PNG 시퀀스는 {out_dir} 에 저장됨"
+            )
+            print(f"[ALLEX][Record] mp4 합성 실패 — PNG 시퀀스는 {out_dir} 에 저장됨")
+            return None
+        if not ok:
+            # video_encoding plugin 미가용 또는 frame 못 찾음 → False.
+            logger.warning(
+                f"[replay] video encoder unavailable (generating_video=False); "
+                f"PNG 시퀀스는 {out_dir} 에 저장됨"
+            )
+            print(
+                f"[ALLEX][Record] video encoder 미가용 — "
+                f"PNG 시퀀스만 {out_dir} 에 저장됨"
+            )
+            return None
+        logger.info(
+            f"[replay] mp4 encode started (background): {out_dir / f'{stem}.mp4'}"
+        )
+        print(
+            f"[ALLEX][Record] mp4 합성 시작 (백그라운드): "
+            f"{out_dir / f'{stem}.mp4'}"
+        )
+        return helper
+
     # ------------------------------------------------------------------
     # Per-step
     # ------------------------------------------------------------------
@@ -918,6 +1121,19 @@ class CsvReplayer:
             self.stop()
             return
 
+        # 주어진 elapsed(초) 한 프레임 적용 — realtime 경로 (wall-clock) 와
+        # record 경로 (가상시계) 가 공유하는 코어.
+        self._apply_at_elapsed(elapsed)
+
+        self._step_count += 1
+
+    def _apply_at_elapsed(self, elapsed: float) -> None:
+        """주어진 elapsed(초) 에 해당하는 한 프레임을 적용한다.
+
+        index_at → _apply_at(kinematic write/viz/plot) → torque_ring gates →
+        pc_replayer.advance 를 한 묶음으로 수행. realtime 경로는 wall-clock 으로
+        계산한 elapsed 를, record 경로는 가상시계 ``i / rec_fps`` 를 넘긴다.
+        """
         # CSV t축이 0에서 시작하지 않을 수도 있으므로 t0 offset 가산.
         idx_main = self._main.index_at(self._csv_t0_main + elapsed)
         idx_sec: Optional[int] = None
@@ -935,8 +1151,6 @@ class CsvReplayer:
             except Exception as exc:
                 if self._step_count % 200 == 0:
                     logger.debug(f"[replay] pc_replayer.advance warn: {exc}")
-
-        self._step_count += 1
 
     def _maybe_substitute_ext_torque(
         self,

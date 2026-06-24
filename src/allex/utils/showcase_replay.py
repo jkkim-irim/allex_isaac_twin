@@ -123,6 +123,10 @@ class ShowcaseReplayControls:
         self._main_combo: ui.ComboBox | None = None
         self._status_label: ui.Label | None = None
         self._record_check: ui.CheckBox | None = None
+        self._record_video_check: ui.CheckBox | None = None
+        self._rec_w_model: ui.SimpleIntModel | None = None
+        self._rec_h_model: ui.SimpleIntModel | None = None
+        self._rec_fps_model: ui.SimpleIntModel | None = None
         self._pc_enable_check: ui.CheckBox | None = None
         self._pc_manifest_field: ui.StringField | None = None
 
@@ -159,6 +163,21 @@ class ShowcaseReplayControls:
                     ui.Label("Record forces (CSV):",
                              width=UILayout.LABEL_WIDTH_LARGE)
                     self._record_check = ui.CheckBox()
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Record video:",
+                             width=UILayout.LABEL_WIDTH_LARGE)
+                    self._record_video_check = ui.CheckBox()
+
+                with ui.HStack(height=UILayout.BUTTON_HEIGHT):
+                    ui.Label("Video W/H/fps:",
+                             width=UILayout.LABEL_WIDTH_LARGE)
+                    self._rec_w_model = ui.SimpleIntModel(3840)
+                    ui.IntField(self._rec_w_model)
+                    self._rec_h_model = ui.SimpleIntModel(2160)
+                    ui.IntField(self._rec_h_model)
+                    self._rec_fps_model = ui.SimpleIntModel(60)
+                    ui.IntField(self._rec_fps_model)
 
                 with ui.HStack(height=UILayout.BUTTON_HEIGHT):
                     ui.Label("Enable PC replay:",
@@ -213,6 +232,10 @@ class ShowcaseReplayControls:
         self._status_label = None
         self._availability_label = None
         self._record_check = None
+        self._record_video_check = None
+        self._rec_w_model = None
+        self._rec_h_model = None
+        self._rec_fps_model = None
         self._pc_enable_check = None
         self._pc_manifest_field = None
 
@@ -380,6 +403,31 @@ class ShowcaseReplayControls:
             except Exception:
                 record_forces = False
 
+        record_video = False
+        if self._record_video_check is not None:
+            try:
+                record_video = bool(
+                    self._record_video_check.model.get_value_as_bool()
+                )
+            except Exception:
+                record_video = False
+        rec_width, rec_height, rec_fps = 3840, 2160, 60
+        if self._rec_w_model is not None:
+            try:
+                rec_width = int(self._rec_w_model.as_int)
+            except Exception:
+                rec_width = 3840
+        if self._rec_h_model is not None:
+            try:
+                rec_height = int(self._rec_h_model.as_int)
+            except Exception:
+                rec_height = 2160
+        if self._rec_fps_model is not None:
+            try:
+                rec_fps = int(self._rec_fps_model.as_int)
+            except Exception:
+                rec_fps = 60
+
         pc_replayer = None
         pc_enabled = False
         if self._pc_enable_check is not None:
@@ -410,6 +458,10 @@ class ShowcaseReplayControls:
                 plotters=plotters,
                 viz_scenario=viz_scenario,
                 record_forces=record_forces,
+                record_video=record_video,
+                rec_width=rec_width,
+                rec_height=rec_height,
+                rec_fps=rec_fps,
                 pc_replayer=pc_replayer,
             )
         except Exception as exc:
@@ -435,9 +487,12 @@ class ShowcaseReplayControls:
             scen_parts.append(f"ext_jtq={len(viz_scenario['ext_joint_torque_triggers'])}ch")
         scen_tag = (", scenario={" + ",".join(scen_parts) + "}") if scen_parts else ""
         rec_tag = ", rec=on" if record_forces else ""
+        vid_tag = (
+            f", video={rec_width}x{rec_height}@{rec_fps}" if record_video else ""
+        )
         self._set_status(
             f"Status: Playing main={main_src} ({reader_main.duration_s:.2f}s, "
-            f"sec={sec_tag}{scen_tag}{rec_tag})"
+            f"sec={sec_tag}{scen_tag}{rec_tag}{vid_tag})"
         )
 
     def _on_stop(self) -> None:
