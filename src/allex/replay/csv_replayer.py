@@ -508,6 +508,14 @@ class CsvReplayer:
         self._t0: Optional[float] = None
         self._finished: bool = False
         self._step_count: int = 0
+        # pre-roll warm-up 상태 (realtime 경로). start() 직후 첫 render tick 의 shader
+        # 컴파일/fabric warm-up hitch 동안 wall-clock 이 흘러 t0 가 앞으로 점프하는 걸
+        # 막는다. warming_up 동안엔 frame 0 을 hold, 프레임 간격이 고르게 안정화된 뒤
+        # 에야 t0 를 박고 timed playback 시작 → 박자 손실 없음.
+        self._warming_up: bool = False
+        self._warmup_ticks: int = 0
+        self._warmup_dts: list[float] = []
+        self._warmup_last_t: Optional[float] = None
         self._csv_t0_main = float(self._main.t[0]) if self._main.num_samples else 0.0
         self._csv_t0_sec = (
             float(self._sec.t[0]) if (self._sec is not None and self._sec.num_samples) else 0.0
@@ -574,7 +582,9 @@ class CsvReplayer:
     # Lifecycle
     # ------------------------------------------------------------------
     def is_active(self) -> bool:
-        return self._t0 is not None and not self._finished
+        # warming_up 동안엔 아직 _t0 가 None 이지만 advance() 가 호출되어 frame 0 hold +
+        # 안정화 판정을 돌려야 하므로 active 로 친다. (warm-up 종료 시 _t0 가 박힘.)
+        return (self._t0 is not None or self._warming_up) and not self._finished
 
     @property
     def duration_s(self) -> float:
@@ -588,7 +598,13 @@ class CsvReplayer:
             except Exception as exc:
                 logger.debug(f"[replay] start() reset-stop warn: {exc}")
 
-        self._t0 = time.monotonic()
+        # _t0 는 여기서 즉시 박지 않는다 — realtime 경로는 warm-up 종료 시점에 박는다
+        # (record 경로는 가상시계라 _t0 미사용). warm-up 상태도 일단 초기화.
+        self._t0 = None
+        self._warming_up = False
+        self._warmup_ticks = 0
+        self._warmup_dts = []
+        self._warmup_last_t = None
         self._finished = False
         self._step_count = 0
         n_pairs = len(self._main.pair_force_vec)
@@ -648,6 +664,10 @@ class CsvReplayer:
             # 도 막는다.
             self._update_sub = None
             self._self_ticking = True
+            # record 경로는 가상시계라 _t0 로 timing 하지 않지만, is_active() 가
+            # _t0/warming_up 에 의존하므로 캡처 루프의 is_active() 체크가 True 가
+            # 되도록 _t0 를 박아둔다 (warm-up 은 realtime 전용).
+            self._t0 = time.monotonic()
             logger.info("[replay] record-video mode — capture loop (no realtime tick)")
         else:
             # rendering tick (= 매 frame) subscription. 성공하면 scenario.update() 의
@@ -659,6 +679,12 @@ class CsvReplayer:
                     self._on_render_tick, name="allex.replay.csv.tick"
                 )
                 self._self_ticking = True
+                # pre-roll warm-up 진입 — 첫 render tick hitch 동안 frame 0 을 hold.
+                # frame 0 apply 는 prim precreate 이후(아래)에 한 번 수행.
+                self._warming_up = True
+                self._warmup_ticks = 0
+                self._warmup_dts = []
+                self._warmup_last_t = None
                 logger.info("[replay] subscribed to omni.kit.app update stream (rendering tick)")
             except Exception as exc:
                 logger.warning(
@@ -667,6 +693,9 @@ class CsvReplayer:
                 )
                 self._update_sub = None
                 self._self_ticking = False
+                # fallback (physics-step driven advance): warm-up self-tick 이 없으므로
+                # 시계를 즉시 박는다 (기존 동작 유지). is_active() 도 _t0 로 True.
+                self._t0 = time.monotonic()
 
         # CSV replay 동안 viz.update() 가 자체 qfrc 로 sim/real ring 을 덮어쓰지 않도록
         # 채널 lock — kinematic replay 는 actuator force 가 0 이라 그대로 두면 push 한
@@ -725,6 +754,12 @@ class CsvReplayer:
         # 첫 접촉 프레임의 DefinePrim hitch 제거 — 알려진 모든 force/torque/trail
         # 채널 prim 을 zero-vector(=threshold 미달, hidden) 로 미리 생성·등록.
         self._precreate_force_prims()
+
+        # realtime warm-up: frame 0 을 한 번 적용해 화면에 첫 자세를 띄운다 (이후 advance
+        # 의 warm-up 분기가 ready 까지 frame 0 을 계속 hold). prim precreate 후라
+        # force/pose 가 frame 0 으로 함께 세팅됨.
+        if self._warming_up:
+            self._apply_at_elapsed(0.0)
 
         # record 모드: 캡처 루프를 asyncio task 로 실행 (Isaac Sim async_engine).
         if self._record_video_enabled:
@@ -812,6 +847,11 @@ class CsvReplayer:
         # 항상 실행되어야 (이전 run 이 어떤 단계에서 중단됐든) stale state 남지 않음.
         self._t0 = None
         self._finished = True
+        # pre-roll warm-up 상태도 초기화 — 다음 start() 가 깨끗이 재진입하도록.
+        self._warming_up = False
+        self._warmup_ticks = 0
+        self._warmup_dts = []
+        self._warmup_last_t = None
 
         # 모든 custom force vector 제거 — main + secondary 둘 다.
         viz = self._viz
@@ -965,6 +1005,16 @@ class CsvReplayer:
                 f"[replay] record start: {n_frames} frames @ {fps}fps, "
                 f"res={self._rec_width}x{self._rec_height}, out={out_dir}"
             )
+            # pre-roll warm-up: frame 0 을 적용한 뒤 첫-프레임 shader 컴파일 hitch 를
+            # frame_0 캡처 전에 끝낸다. 이 구간 프레임은 캡처하지 않고 render 만 펌핑 —
+            # frame 0 의 품질/타이밍 보장. 녹화 해상도(예: 4K)로 바꾼 직후라 컴파일이
+            # 새로 일어나므로 고정 N 회(=_WARMUP_MAX_TICKS) 펌핑.
+            self._apply_at_elapsed(0.0)
+            for _ in range(self._WARMUP_MAX_TICKS):
+                if self._record_cancel or not self.is_active():
+                    logger.info("[replay] record cancelled during warm-up")
+                    return
+                await omni.kit.app.get_app().next_update_async()
             for i in range(n_frames):
                 if self._record_cancel or not self.is_active():
                     logger.info(f"[replay] record cancelled at frame {i}/{n_frames}")
@@ -1084,6 +1134,11 @@ class CsvReplayer:
     # 외부에서 토글 가능한 pause flag — True 면 advance 가 idx 진행 멈춤 (현재 frame 유지).
     _paused: bool = False
 
+    # pre-roll warm-up 판정 상수. MIN_TICKS 이전엔 절대 ready 안 함 (최소 몇 프레임은
+    # 돌려야 hitch 가 측정됨), MAX_TICKS 는 안전 상한 (절대 안 멈추는 일 방지).
+    _WARMUP_MIN_TICKS: int = 3
+    _WARMUP_MAX_TICKS: int = 120
+
     def set_time_scale(self, scale: float) -> None:
         """0.1 = 10x 느리게. 1.0 = 정속. <0 또는 0 은 무시."""
         if scale > 0:
@@ -1102,9 +1157,48 @@ class CsvReplayer:
         self._pause_t = None
         logger.warning("[replay] resumed")
 
+    def _warmup_ready(self) -> bool:
+        """render 안정화(첫-프레임 컴파일 hitch 통과) 판정.
+
+        절대 fps 임계는 쓰지 않는다 — 4K steady-state 도 ~35ms 라 절대값으론 영원히
+        미충족. 대신 최근 3개 프레임 간격(dt)의 max 가 min 의 1.3배 이내인지(=큰
+        hitch 가 사라져 간격이 고름)로 **상대 안정화**를 본다. 머신/해상도 무관.
+        """
+        if self._warmup_ticks >= self._WARMUP_MAX_TICKS:
+            return True
+        if self._warmup_ticks < self._WARMUP_MIN_TICKS:
+            return False
+        if len(self._warmup_dts) < 3:
+            return False
+        recent = self._warmup_dts[-3:]
+        lo = min(recent)
+        hi = max(recent)
+        if lo <= 0.0:
+            return False
+        return hi <= lo * 1.3
+
     def advance(self) -> None:
         """Per render tick (or physics step in fallback) — kinematic write + viz/plot push."""
         if not self.is_active():
+            return
+
+        if self._warming_up:
+            # pre-roll: frame 0 을 hold 하며 프레임 간격이 안정화될 때까지 시계 미시작.
+            now = time.monotonic()
+            if self._warmup_last_t is not None:
+                self._warmup_dts.append(now - self._warmup_last_t)
+            self._warmup_last_t = now
+            self._warmup_ticks += 1
+            self._apply_at_elapsed(0.0)
+            if self._warmup_ready():
+                self._warming_up = False
+                # warmed 상태에서 시계 시작 — elapsed 가 0 부터 자라 frame 0 부터
+                # 박자 손실 없이 재생.
+                self._t0 = time.monotonic()
+                logger.info(
+                    f"[replay] warm-up done after {self._warmup_ticks} ticks — "
+                    f"timed playback start"
+                )
             return
 
         if self._paused:
